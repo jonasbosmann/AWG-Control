@@ -105,14 +105,15 @@ class LabGUI:
                      values=["1", "8", "16", "64", "256", "512"],
                      width=8, state='readonly').grid(row=4, column=1, padx=4, pady=2)
 
-        ttk.Label(p, text="Freq accuracy").grid(row=5, column=0, sticky='w', pady=2)
-        self._acc_var = tk.StringVar(value="±2 MHz  (fast)")
+        ttk.Label(p, text="Freq mode").grid(row=5, column=0, sticky='w', pady=2)
+        self._acc_var = tk.StringVar(value="Exact (adjust rate)")
         acc_box = ttk.Combobox(p, textvariable=self._acc_var,
-                               values=["±2 MHz  (fast)",
-                                       "±550 kHz",
-                                       "±70 kHz",
-                                       "±35 kHz  (slow)"],
-                               width=14, state='readonly')
+                               values=["Exact (adjust rate)",
+                                       "±2 MHz  (fixed rate, fast)",
+                                       "±550 kHz (fixed rate)",
+                                       "±70 kHz  (fixed rate)",
+                                       "±35 kHz  (fixed rate, slow)"],
+                               width=22, state='readonly')
         acc_box.grid(row=5, column=1, padx=4, pady=2)
         acc_box.bind("<<ComboboxSelected>>", self._on_buf_change)
 
@@ -164,13 +165,17 @@ class LabGUI:
     def _thread(self, fn):
         threading.Thread(target=fn, daemon=True).start()
 
-    # Maps accuracy label → buffer size (all multiples of 64 as required by Proteus)
+    # Maps freq mode label → buffer size (multiples of 64 as required by Proteus)
     _ACC_TO_BUF = {
-        "±2 MHz  (fast)":  2_048,
-        "±550 kHz":        8_192,
-        "±70 kHz":        65_536,
-        "±35 kHz  (slow)": 131_072,
+        "Exact (adjust rate)":          2_048,   # small buffer; sample rate adjusted instead
+        "±2 MHz  (fixed rate, fast)":   2_048,
+        "±550 kHz (fixed rate)":        8_192,
+        "±70 kHz  (fixed rate)":       65_536,
+        "±35 kHz  (fixed rate, slow)": 131_072,
     }
+
+    def _exact_freq(self):
+        return self._acc_var.get() == "Exact (adjust rate)"
 
     def _on_buf_change(self, _=None):
         n = self._ACC_TO_BUF.get(self._acc_var.get(), 2048)
@@ -244,19 +249,22 @@ class LabGUI:
         if not self._need_awg(): return
         freq, amp, ch = self._params()
         self._sync_buf()
-        self._thread(lambda: self.awg.send_sine(freq, amp, channel=ch))
+        exact = self._exact_freq()
+        self._thread(lambda: self.awg.send_sine(freq, amp, channel=ch, exact=exact))
 
     def _run_square(self):
         if not self._need_awg(): return
         freq, amp, ch = self._params()
         self._sync_buf()
-        self._thread(lambda: self.awg.send_square(freq, amp, channel=ch))
+        exact = self._exact_freq()
+        self._thread(lambda: self.awg.send_square(freq, amp, channel=ch, exact=exact))
 
     def _run_ramp(self):
         if not self._need_awg(): return
         freq, amp, ch = self._params()
         self._sync_buf()
-        self._thread(lambda: self.awg.send_ramp(freq, amp, channel=ch))
+        exact = self._exact_freq()
+        self._thread(lambda: self.awg.send_ramp(freq, amp, channel=ch, exact=exact))
 
     def _stop(self):
         self._sweep_stop.set()

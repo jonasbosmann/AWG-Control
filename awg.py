@@ -36,12 +36,13 @@ class AWG:
         else:
             print(f"  ERROR {c.lstrip(':')} -> {err.strip()}")
 
-    def _setup(self, channel=1, reset=True):
+    def _setup(self, channel=1, reset=True, sample_rate=None):
+        rate = sample_rate if sample_rate is not None else self.sample_rate
         if reset:
             self._dev.write("*CLS; *RST")
             time.sleep(0.5)
         self._cmd(f":INST:CHAN {channel}")
-        self._cmd(f":FREQ:RAST {self.sample_rate:.0f}")
+        self._cmd(f":FREQ:RAST {rate:.0f}")
         if reset:
             self._cmd(":TRAC:DEL:ALL")
         self._cmd(":INIT:CONT ON")
@@ -85,46 +86,64 @@ class AWG:
     def _cycles(self, frequency_hz):
         return max(round(frequency_hz * self.n_samples / self.sample_rate), 1)
 
-    def send_sine(self, frequency_hz=100e6, amplitude_vpp=0.5, channel=1, reset=True):
+    def _resolve(self, frequency_hz, exact=False):
+        """Return (cycles, effective_sample_rate, actual_frequency).
+
+        exact=False: keep self.sample_rate, round cycles → frequency error ≤ freq_step/2
+        exact=True:  keep cycles integer, back-calculate sample rate → zero frequency error
+                     (requires hardware to accept a non-standard clock rate)
+        """
         cycles = self._cycles(frequency_hz)
-        actual = cycles * self.sample_rate / self.n_samples
-        print(f"[CH{channel}] Sine {frequency_hz/1e6:.3f} MHz -> {actual/1e6:.6f} MHz "
-              f"({cycles} cycles, step {self.freq_step_hz/1e3:.1f} kHz)")
+        if exact:
+            rate = frequency_hz * self.n_samples / cycles
+            # If the required rate exceeds hardware max, try one more cycle
+            if rate > SAMPLE_RATE_SINGLE:
+                cycles += 1
+                rate = frequency_hz * self.n_samples / cycles
+        else:
+            rate = self.sample_rate
+        actual = cycles * rate / self.n_samples
+        return cycles, rate, actual
+
+    def send_sine(self, frequency_hz=100e6, amplitude_vpp=0.5, channel=1, reset=True, exact=False):
+        cycles, rate, actual = self._resolve(frequency_hz, exact)
+        err_hz = actual - frequency_hz
+        print(f"[CH{channel}] Sine {frequency_hz/1e6:.6f} MHz -> {actual/1e6:.6f} MHz "
+              f"(err {err_hz:+.1f} Hz, Fs={rate/1e9:.6f} GS/s)")
         seg = channel
         with self._lock:
-            self._setup(channel, reset)
+            self._setup(channel, reset, sample_rate=rate)
             self._upload(self._sine_u16(cycles), segnum=seg)
             self._play(amplitude_vpp, segnum=seg)
             self._active_seg[channel] = seg
         return actual
 
-    def update_sine(self, frequency_hz, amplitude_vpp=0.5, channel=1):
-        cycles = self._cycles(frequency_hz)
-        actual = cycles * self.sample_rate / self.n_samples
+    def update_sine(self, frequency_hz, amplitude_vpp=0.5, channel=1, exact=False):
+        cycles, rate, actual = self._resolve(frequency_hz, exact)
         with self._lock:
             cur = self._active_seg.get(channel, channel)
             next_seg = channel + 20 if cur == channel + 10 else channel + 10
             self._cmd(f":INST:CHAN {channel}")
+            if rate != self.sample_rate:
+                self._cmd(f":FREQ:RAST {rate:.0f}")
             self._upload(self._sine_u16(cycles), segnum=next_seg)
             self._play(amplitude_vpp, segnum=next_seg)
             self._active_seg[channel] = next_seg
         return actual
 
-    def send_ramp(self, frequency_hz=None, amplitude_vpp=0.5, channel=1, reset=True):
-        cycles = self._cycles(frequency_hz) if frequency_hz else 1
-        actual = cycles * self.sample_rate / self.n_samples
-        print(f"[CH{channel}] Ramp -> {actual/1e6:.6f} MHz")
+    def send_ramp(self, frequency_hz=None, amplitude_vpp=0.5, channel=1, reset=True, exact=False):
+        cycles, rate, actual = self._resolve(frequency_hz, exact) if frequency_hz else (1, self.sample_rate, self.sample_rate / self.n_samples)
+        print(f"[CH{channel}] Ramp -> {actual/1e6:.6f} MHz (err {actual - (frequency_hz or actual):+.1f} Hz)")
         with self._lock:
-            self._setup(channel, reset)
+            self._setup(channel, reset, sample_rate=rate)
             self._upload(self._ramp_u16(cycles), segnum=channel)
             self._play(amplitude_vpp, segnum=channel)
 
-    def send_square(self, frequency_hz=None, amplitude_vpp=0.5, channel=1, reset=True):
-        cycles = self._cycles(frequency_hz) if frequency_hz else 1
-        actual = cycles * self.sample_rate / self.n_samples
-        print(f"[CH{channel}] Square -> {actual/1e6:.6f} MHz")
+    def send_square(self, frequency_hz=None, amplitude_vpp=0.5, channel=1, reset=True, exact=False):
+        cycles, rate, actual = self._resolve(frequency_hz, exact) if frequency_hz else (1, self.sample_rate, self.sample_rate / self.n_samples)
+        print(f"[CH{channel}] Square -> {actual/1e6:.6f} MHz (err {actual - (frequency_hz or actual):+.1f} Hz)")
         with self._lock:
-            self._setup(channel, reset)
+            self._setup(channel, reset, sample_rate=rate)
             self._upload(self._square_u16(cycles), segnum=channel)
             self._play(amplitude_vpp, segnum=channel)
 
