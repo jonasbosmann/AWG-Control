@@ -131,6 +131,67 @@ class AWG:
             self._active_seg[channel] = next_seg
         return actual
 
+    def _chirp_windowed_u16(self, f_start, f_stop, n_active, n_total, rate, window_frac=0.05):
+        t = np.arange(n_active, dtype=np.float64)
+        phase = 2 * np.pi * (f_start / rate * t +
+                              (f_stop - f_start) / (2 * rate * max(n_active - 1, 1)) * t ** 2)
+        sig = np.sin(phase)
+        n_win = max(int(window_frac * n_active), 1)
+        sigma = n_win / 3.0
+        idx = np.arange(n_win, dtype=np.float64)
+        win = np.ones(n_active)
+        win[:n_win]  = np.exp(-0.5 * ((idx - n_win) / sigma) ** 2)
+        win[-n_win:] = np.exp(-0.5 * (idx           / sigma) ** 2)
+        sig *= win
+        full = np.zeros(n_total)
+        full[:n_active] = sig
+        return ((full + 1.0) * 32767.5).clip(0, 65535).astype(np.uint16)
+
+    def _cw_sine_u16(self, cycles, n_samples):
+        t = np.arange(n_samples)
+        wave = np.sin(2 * np.pi * cycles * t / n_samples)
+        return ((wave + 1.0) * 32767.5).clip(0, 65535).astype(np.uint16)
+
+    def send_chirp_with_lo(self, f_start_hz, f_stop_hz, chirp_us, dead_us,
+                            f_lo_hz, cw_buf_us, amplitude_vpp=0.5, window_frac=0.05):
+        """CH1: Gaussian-windowed linear chirp + zero-padded dead time.
+           CH2: long CW sine at f_lo_hz for fine frequency accuracy.
+           Both channels at SAMPLE_RATE_DUAL (2.5 GS/s)."""
+        rate = SAMPLE_RATE_DUAL
+
+        # CH1
+        n_active = round(chirp_us * 1e-6 * rate)
+        n_dead   = round(dead_us  * 1e-6 * rate)
+        n_total  = max(int(np.ceil((n_active + n_dead) / 64)) * 64, 128)
+        chirp_buf = self._chirp_windowed_u16(f_start_hz, f_stop_hz, n_active, n_total,
+                                              rate, window_frac)
+
+        # CH2
+        n_cw      = max(int(round(cw_buf_us * 1e-6 * rate / 64)) * 64, 64)
+        cycles_lo = max(round(f_lo_hz * n_cw / rate), 1)
+        actual_lo = cycles_lo * rate / n_cw
+        lo_buf    = self._cw_sine_u16(cycles_lo, n_cw)
+
+        print(f"[CH1] chirp {f_start_hz/1e6:.3f}→{f_stop_hz/1e6:.3f} MHz  "
+              f"active {n_active/rate*1e6:.3f} µs  dead {(n_total-n_active)/rate*1e6:.3f} µs  "
+              f"period {n_total/rate*1e6:.3f} µs  ({n_total:,} samp)")
+        print(f"[CH2] LO {f_lo_hz/1e6:.3f} MHz → {actual_lo/1e6:.6f} MHz  "
+              f"err {actual_lo-f_lo_hz:+.0f} Hz  step {rate/n_cw/1e3:.2f} kHz  "
+              f"buf {n_cw/rate*1e6:.1f} µs  ({n_cw:,} samp)")
+
+        with self._lock:
+            self._setup(channel=1, reset=True, sample_rate=rate)
+            self._upload(chirp_buf, segnum=1)
+            self._play(amplitude_vpp, segnum=1)
+            self._active_seg[1] = 1
+
+            self._setup(channel=2, reset=False, sample_rate=rate)
+            self._upload(lo_buf, segnum=2)
+            self._play(amplitude_vpp, segnum=2)
+            self._active_seg[2] = 2
+
+        return n_active / rate, actual_lo
+
     def send_iq_sine(self, frequency_hz=100e6, amplitude_vpp=0.5, exact=False):
         """Output I (sine) on CH1 and Q (cosine, 90° shifted) on CH2 simultaneously.
 
