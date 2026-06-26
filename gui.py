@@ -115,13 +115,13 @@ class LabGUI:
         f.pack(fill='x', pady=(0, 6))
 
         chirp_fields = [
-            ("Chirp start (MHz)", "c_start",  "10"),
-            ("Chirp stop  (MHz)", "c_stop",   "500"),
-            ("Chirp dur   (µs)",  "c_dur",    "1.0"),
-            ("Dead time   (µs)",  "c_dead",   "0.1"),
-            ("CH2 LO      (MHz)", "c_lo",     "100"),
-            ("CW buf      (µs)",  "c_cw_buf", "100"),
-            ("Amplitude   (Vpp)", "c_amp",    "0.5"),
+            ("Chirp start (MHz)", "c_start",   "10"),
+            ("Chirp stop  (MHz)", "c_stop",    "500"),
+            ("Chirp dur   (µs)",  "c_dur",     "1.0"),
+            ("Dead time   (µs)",  "c_dead",    "0.1"),
+            ("CH2 LO      (MHz)", "c_lo",      "100"),
+            ("Detect win  (µs)",  "c_detect",  "10.0"),
+            ("Amplitude   (Vpp)", "c_amp",     "0.5"),
         ]
         for row, (lbl, attr, default) in enumerate(chirp_fields):
             ttk.Label(f, text=lbl).grid(row=row, column=0, sticky='w', pady=1)
@@ -150,26 +150,20 @@ class LabGUI:
             rate      = SAMPLE_RATE_DUAL
             chirp_us  = float(self._c_dur_var.get())
             dead_us   = float(self._c_dead_var.get())
-            cw_buf_us = float(self._c_cw_buf_var.get())
-            f_lo      = float(self._c_lo_var.get()) * 1e6
+            detect_us = float(self._c_detect_var.get())
 
-            n_active = round(chirp_us * 1e-6 * rate)
-            n_dead   = round(dead_us  * 1e-6 * rate)
-            n_total  = max(int(np.ceil((n_active + n_dead) / 64)) * 64, 128)
-            t_dead_actual = (n_total - n_active) / rate * 1e6
-
-            n_cw      = max(int(round(cw_buf_us * 1e-6 * rate / 64)) * 64, 64)
-            cycles_lo = max(round(f_lo * n_cw / rate), 1)
-            actual_lo = cycles_lo * rate / n_cw
-            step_khz  = rate / n_cw / 1e3
-            err_hz    = actual_lo - f_lo
+            n_chirp  = round(chirp_us  * 1e-6 * rate)
+            n_dead   = round(dead_us   * 1e-6 * rate)
+            n_detect = round(detect_us * 1e-6 * rate)
+            n_total  = max(int(np.ceil((n_chirp + n_dead + n_detect) / 64)) * 64, 128)
+            t_dead_actual = (n_total - n_chirp - n_detect) / rate * 1e6
 
             self._ch1_info.config(
-                text=f"CH1  {n_active:,}+{n_total-n_active:,} samp  "
-                     f"active {n_active/rate*1e6:.3f} µs  dead {t_dead_actual:.3f} µs")
+                text=f"CH1  {n_chirp:,} samp  active {n_chirp/rate*1e6:.3f} µs  "
+                     f"period {n_total/rate*1e6:.3f} µs")
             self._ch2_info.config(
-                text=f"CH2  {n_cw:,} samp  {actual_lo/1e6:.4f} MHz  "
-                     f"err {err_hz:+.0f} Hz  step {step_khz:.2f} kHz")
+                text=f"CH2  {n_detect:,} samp detect  dead {t_dead_actual:.3f} µs  "
+                     f"LO freq exact")
         except (ValueError, AttributeError, ZeroDivisionError):
             pass
 
@@ -312,9 +306,9 @@ class LabGUI:
             f_stop   = float(self._c_stop_var.get())   * 1e6
             chirp_us = float(self._c_dur_var.get())
             dead_us  = float(self._c_dead_var.get())
-            f_lo     = float(self._c_lo_var.get())     * 1e6
-            cw_buf   = float(self._c_cw_buf_var.get())
-            amp      = float(self._c_amp_var.get())
+            f_lo      = float(self._c_lo_var.get())     * 1e6
+            detect_us = float(self._c_detect_var.get())
+            amp       = float(self._c_amp_var.get())
         except ValueError as e:
             print(f"Invalid chirp parameter: {e}\n")
             return
@@ -323,7 +317,7 @@ class LabGUI:
         def run():
             try:
                 self.awg.send_chirp_with_lo(f_start, f_stop, chirp_us, dead_us,
-                                             f_lo, cw_buf, amplitude_vpp=amp)
+                                             f_lo, detect_us, amplitude_vpp=amp)
             except Exception as e:
                 print(f"Chirp error: {e}\n")
             finally:
