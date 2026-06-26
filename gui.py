@@ -79,8 +79,9 @@ class LabGUI:
         p.pack(fill='x', pady=(0, 6))
 
         fields = [
-            ("Frequency (MHz)", "freq", "100"),
-            ("Amplitude (Vpp)", "amp",  "0.5"),
+            ("Frequency (MHz)", "freq",     "100"),
+            ("Amplitude (Vpp)", "amp",      "0.5"),
+            ("Chirp dur. (µs)", "chirp_us", "1.0"),
         ]
         for row, (label, attr, default) in enumerate(fields):
             ttk.Label(p, text=label).grid(row=row, column=0, sticky='w', pady=2)
@@ -93,10 +94,10 @@ class LabGUI:
         ttk.Combobox(p, textvariable=self._chan_var, values=["1", "2"],
                      width=8, state='readonly').grid(row=2, column=1, padx=4, pady=2)
 
-        ttk.Label(p, text="Sample rate").grid(row=3, column=0, sticky='w', pady=2)
-        self._rate_var = tk.StringVar(value="Single (9 GS/s)")
+        ttk.Label(p, text="Channels").grid(row=3, column=0, sticky='w', pady=2)
+        self._rate_var = tk.StringVar(value="1 ch  →  9 GS/s")
         ttk.Combobox(p, textvariable=self._rate_var,
-                     values=["Single (9 GS/s)", "Dual (2.5 GS/s)"],
+                     values=["1 ch  →  9 GS/s", "2 ch  →  2.5 GS/s"],
                      width=14, state='readonly').grid(row=3, column=1, padx=4, pady=2)
 
         ttk.Label(p, text="Averages").grid(row=4, column=0, sticky='w', pady=2)
@@ -105,17 +106,24 @@ class LabGUI:
                      values=["1", "8", "16", "64", "256", "512"],
                      width=8, state='readonly').grid(row=4, column=1, padx=4, pady=2)
 
-        ttk.Label(p, text="Freq mode").grid(row=5, column=0, sticky='w', pady=2)
-        self._acc_var = tk.StringVar(value="Exact (adjust rate)")
+        ttk.Label(p, text="Freq accuracy").grid(row=5, column=0, sticky='w', pady=2)
+        self._acc_var = tk.StringVar(value="±2 MHz  (2 k samples)")
         acc_box = ttk.Combobox(p, textvariable=self._acc_var,
-                               values=["Exact (adjust rate)",
-                                       "±2 MHz  (fixed rate, fast)",
-                                       "±550 kHz (fixed rate)",
-                                       "±70 kHz  (fixed rate)",
-                                       "±35 kHz  (fixed rate, slow)"],
+                               values=["±2 MHz  (2 k samples)",
+                                       "±550 kHz (8 k samples)",
+                                       "±70 kHz  (64 k samples)",
+                                       "±35 kHz  (128 k samples)"],
                                width=22, state='readonly')
         acc_box.grid(row=5, column=1, padx=4, pady=2)
         acc_box.bind("<<ComboboxSelected>>", self._on_buf_change)
+
+        ttk.Label(p, text="→ samples").grid(row=6, column=0, sticky='w', pady=2)
+        self._nsamples_lbl = ttk.Label(p, text="", foreground='gray')
+        self._nsamples_lbl.grid(row=6, column=1, sticky='w', padx=4)
+        # Update label whenever duration or sample rate changes
+        self._chirp_us_var.trace_add('write', lambda *_: self._update_nsamples_lbl())
+        self._rate_var.trace_add('write', lambda *_: self._update_nsamples_lbl())
+        self._update_nsamples_lbl()
 
         # Waveform
         w = ttk.LabelFrame(ctrl, text="Waveform", padding=8)
@@ -167,16 +175,31 @@ class LabGUI:
         threading.Thread(target=fn, daemon=True).start()
 
     # Maps freq mode label → buffer size (multiples of 64 as required by Proteus)
-    _ACC_TO_BUF = {
-        "Exact (adjust rate)":          2_048,   # small buffer; sample rate adjusted instead
-        "±2 MHz  (fixed rate, fast)":   2_048,
-        "±550 kHz (fixed rate)":        8_192,
-        "±70 kHz  (fixed rate)":       65_536,
-        "±35 kHz  (fixed rate, slow)": 131_072,
+    _MODE_TO_RATE = {
+        "1 ch  →  9 GS/s":   SAMPLE_RATE_SINGLE,
+        "2 ch  →  2.5 GS/s": SAMPLE_RATE_DUAL,
     }
 
-    def _exact_freq(self):
-        return self._acc_var.get() == "Exact (adjust rate)"
+    def _rate(self):
+        return self._MODE_TO_RATE.get(self._rate_var.get(), SAMPLE_RATE_SINGLE)
+
+    _ACC_TO_BUF = {
+        "±2 MHz  (2 k samples)":   2_048,
+        "±550 kHz (8 k samples)":  8_192,
+        "±70 kHz  (64 k samples)": 65_536,
+        "±35 kHz  (128 k samples)":131_072,
+    }
+
+    def _update_nsamples_lbl(self):
+        try:
+            rate = self._rate()
+            t_us = float(self._chirp_us_var.get())
+            n_raw = t_us * 1e-6 * rate
+            n = max(int(round(n_raw / 64)) * 64, 64)
+            t_actual = n / rate * 1e6
+            self._nsamples_lbl.config(text=f"{n:,}  ({t_actual:.3f} µs)")
+        except (ValueError, AttributeError):
+            pass
 
     def _on_buf_change(self, _=None):
         n = self._ACC_TO_BUF.get(self._acc_var.get(), 2048)
@@ -224,8 +247,7 @@ class LabGUI:
     def _connect_awg(self):
         def connect():
             try:
-                rate = SAMPLE_RATE_SINGLE if "Single" in self._rate_var.get() else SAMPLE_RATE_DUAL
-                self.awg = AWG(sample_rate=rate)
+                self.awg = AWG(sample_rate=self._rate())
                 self._status(self._awg_lbl, "AWG: connected", "green")
             except Exception as e:
                 print(f"AWG connection failed: {e}\n")
@@ -250,30 +272,26 @@ class LabGUI:
         if not self._need_awg(): return
         freq, amp, ch = self._params()
         self._sync_buf()
-        exact = self._exact_freq()
-        self._thread(lambda: self.awg.send_sine(freq, amp, channel=ch, exact=exact))
+        self._thread(lambda: self.awg.send_sine(freq, amp, channel=ch))
 
     def _run_iq_sine(self):
         if not self._need_awg(): return
-        freq, amp, _ = self._params()   # channel ignored — always CH1=I, CH2=Q
+        freq, amp, _ = self._params()
         self._sync_buf()
-        exact = self._exact_freq()
-        print(f"IQ sine: {freq/1e6:.3f} MHz, {amp:.3f} Vpp — ensure dual-channel mode (2.5 GS/s)\n")
-        self._thread(lambda: self.awg.send_iq_sine(freq, amp, exact=exact))
+        print(f"IQ sine: {freq/1e6:.3f} MHz, {amp:.3f} Vpp\n")
+        self._thread(lambda: self.awg.send_iq_sine(freq, amp))
 
     def _run_square(self):
         if not self._need_awg(): return
         freq, amp, ch = self._params()
         self._sync_buf()
-        exact = self._exact_freq()
-        self._thread(lambda: self.awg.send_square(freq, amp, channel=ch, exact=exact))
+        self._thread(lambda: self.awg.send_square(freq, amp, channel=ch))
 
     def _run_ramp(self):
         if not self._need_awg(): return
         freq, amp, ch = self._params()
         self._sync_buf()
-        exact = self._exact_freq()
-        self._thread(lambda: self.awg.send_ramp(freq, amp, channel=ch, exact=exact))
+        self._thread(lambda: self.awg.send_ramp(freq, amp, channel=ch))
 
     def _stop(self):
         self._sweep_stop.set()
