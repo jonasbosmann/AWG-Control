@@ -160,8 +160,7 @@ if __name__ == "__main__":
     #   "both"   -- sine on CH1, square on CH2
     #   "sweep"  -- bandwidth sweep on CH1
     #   "stop"   -- silence all outputs
-    MODE = "stop"
-
+  
     if MODE == "sine":
         send_sine(frequency_hz=500e6, amplitude_vpp=0.5, channel=1)
     elif MODE == "square":
