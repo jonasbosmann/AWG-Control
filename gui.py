@@ -66,47 +66,89 @@ class LabGUI:
         self._build_right(main)
 
     def _build_controls(self, parent):
-        ctrl = ttk.Frame(parent, width=270)
-        ctrl.pack(side='left', fill='y', padx=(0, 8))
-        ctrl.pack_propagate(False)
+        outer = ttk.Frame(parent, width=310)
+        outer.pack(side='left', fill='y', padx=(0, 8))
+        outer.pack_propagate(False)
+
+        vsb = ttk.Scrollbar(outer, orient='vertical')
+        vsb.pack(side='right', fill='y')
+        canvas = tk.Canvas(outer, yscrollcommand=vsb.set, highlightthickness=0)
+        canvas.pack(side='left', fill='both', expand=True)
+        vsb.config(command=canvas.yview)
+
+        ctrl = ttk.Frame(canvas)
+        win_id = canvas.create_window((0, 0), window=ctrl, anchor='nw')
+
+        ctrl.bind('<Configure>', lambda _: canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.bind('<Configure>', lambda e: canvas.itemconfig(win_id, width=e.width))
+        canvas.bind_all('<MouseWheel>',
+                        lambda e: canvas.yview_scroll(int(-1 * e.delta / 120), 'units'))
 
         self._build_std_waveform(ctrl)
         self._build_chirp_panel(ctrl)
-        self._build_actions(ctrl)
+        self._build_scope_panel(ctrl)
+        self._build_sweep_panel(ctrl)
 
     # ── Standard Waveform panel ───────────────────────────────────
 
     def _build_std_waveform(self, parent):
         f = ttk.LabelFrame(parent, text="Standard Waveform", padding=8)
         f.pack(fill='x', pady=(0, 6))
+        f.columnconfigure(1, weight=1)
+        f.columnconfigure(2, weight=1)
 
-        fields = [("Frequency (MHz)", "freq", "100"),
-                  ("Amplitude (Vpp)", "amp",  "0.5")]
-        for row, (lbl, attr, default) in enumerate(fields):
-            ttk.Label(f, text=lbl).grid(row=row, column=0, sticky='w', pady=2)
-            var = tk.StringVar(value=default)
-            setattr(self, f"_{attr}_var", var)
-            ttk.Entry(f, textvariable=var, width=10).grid(row=row, column=1, padx=4, pady=2)
-
-        ttk.Label(f, text="Channel").grid(row=2, column=0, sticky='w', pady=2)
-        self._chan_var = tk.StringVar(value="1")
-        ttk.Combobox(f, textvariable=self._chan_var, values=["1", "2"],
-                     width=8, state='readonly').grid(row=2, column=1, padx=4, pady=2)
-
-        ttk.Label(f, text="Channels").grid(row=3, column=0, sticky='w', pady=2)
-        self._rate_var = tk.StringVar(value="1 ch  →  9 GS/s")
+        ttk.Label(f, text="Sample rate").grid(row=0, column=0, columnspan=3, sticky='w')
+        self._rate_var = tk.StringVar(value="9 GS/s  (CH1)")
         ttk.Combobox(f, textvariable=self._rate_var,
-                     values=["1 ch  →  9 GS/s", "2 ch  →  2.5 GS/s"],
-                     width=14, state='readonly').grid(row=3, column=1, padx=4, pady=2)
+                     values=["9 GS/s  (CH1)", "2.5 GS/s  (CH1+2)"],
+                     width=14, state='readonly').grid(row=1, column=0, columnspan=3,
+                                                       sticky='ew', pady=(0, 6))
+        self._rate_var.trace_add('write', lambda *_: self._on_rate_change())
 
-        ttk.Label(f, text="Waveform").grid(row=4, column=0, sticky='w', pady=2)
-        self._wave_var = tk.StringVar(value="Sine")
-        ttk.Combobox(f, textvariable=self._wave_var, values=["Sine", "Square", "Ramp"],
-                     width=8, state='readonly').grid(row=4, column=1, padx=4, pady=2)
+        ttk.Label(f, text="CH1", font=('', 9, 'bold')).grid(row=2, column=1, pady=1)
+        ch2_hdr = ttk.Label(f, text="CH2", font=('', 9, 'bold'))
+        ch2_hdr.grid(row=2, column=2, pady=1)
+        self._ch2_std_widgets = [ch2_hdr]
 
-        btn = ttk.Button(f, text="Generate", command=self._run_std_wave)
-        btn.grid(row=5, column=0, columnspan=2, sticky='ew', pady=(6, 2))
-        self._action_btns.append(btn)
+        rows = [
+            ("Waveform",   "wave1", "wave2", "Sine", "Sine", "combo"),
+            ("Freq (MHz)", "freq1", "freq2", "100",  "100",  "entry"),
+            ("Amp  (Vpp)", "amp1",  "amp2",  "0.5",  "0.5",  "entry"),
+        ]
+        for gr, (lbl, a1, a2, d1, d2, kind) in enumerate(rows, start=3):
+            ttk.Label(f, text=lbl).grid(row=gr, column=0, sticky='w', pady=1)
+            v1, v2 = tk.StringVar(value=d1), tk.StringVar(value=d2)
+            setattr(self, f'_{a1}_var', v1)
+            setattr(self, f'_{a2}_var', v2)
+            if kind == "combo":
+                w1 = ttk.Combobox(f, textvariable=v1, values=["Sine", "Square", "Ramp"],
+                                   width=6, state='readonly')
+                w2 = ttk.Combobox(f, textvariable=v2, values=["Sine", "Square", "Ramp"],
+                                   width=6, state='readonly')
+            else:
+                w1 = ttk.Entry(f, textvariable=v1, width=7)
+                w2 = ttk.Entry(f, textvariable=v2, width=7)
+            w1.grid(row=gr, column=1, sticky='ew', padx=2, pady=1)
+            w2.grid(row=gr, column=2, sticky='ew', padx=2, pady=1)
+            self._ch2_std_widgets.append(w2)
+
+        btn1 = ttk.Button(f, text="Send CH1", command=lambda: self._run_std_wave(1))
+        btn1.grid(row=gr+1, column=0, columnspan=2, sticky='ew', pady=(6, 2), padx=(0, 2))
+        btn2 = ttk.Button(f, text="Send CH2", command=lambda: self._run_std_wave(2))
+        btn2.grid(row=gr+1, column=2, sticky='ew', pady=(6, 2))
+        self._action_btns.extend([btn1, btn2])
+        self._ch2_std_widgets.append(btn2)
+
+        self._on_rate_change()
+
+    def _on_rate_change(self):
+        dual = "2.5" in self._rate_var.get()
+        for w in self._ch2_std_widgets:
+            new_state = ('readonly' if isinstance(w, ttk.Combobox) else 'normal') if dual else 'disabled'
+            try:
+                w.config(state=new_state)
+            except tk.TclError:
+                pass
 
     # ── Chirp + CW panel ──────────────────────────────────────────
 
@@ -123,12 +165,13 @@ class LabGUI:
             ("Detect win  (µs)",  "c_detect",  "10.0"),
             ("Amplitude   (Vpp)", "c_amp",     "0.5"),
         ]
+        f.columnconfigure(1, weight=1)
         for row, (lbl, attr, default) in enumerate(chirp_fields):
             ttk.Label(f, text=lbl).grid(row=row, column=0, sticky='w', pady=1)
             var = tk.StringVar(value=default)
             setattr(self, f"_{attr}_var", var)
-            e = ttk.Entry(f, textvariable=var, width=10)
-            e.grid(row=row, column=1, padx=4, pady=1)
+            e = ttk.Entry(f, textvariable=var, width=8)
+            e.grid(row=row, column=1, sticky='ew', padx=(4, 0), pady=1)
             var.trace_add('write', lambda *_: self._update_chirp_info())
 
         r = len(chirp_fields)
@@ -167,32 +210,45 @@ class LabGUI:
         except (ValueError, AttributeError, ZeroDivisionError):
             pass
 
-    # ── Actions panel ─────────────────────────────────────────────
+    # ── Scope Monitor panel ────────────────────────────────────────
 
-    def _build_actions(self, parent):
-        a = ttk.LabelFrame(parent, text="Actions", padding=8)
-        a.pack(fill='x', pady=(0, 6))
+    def _build_scope_panel(self, parent):
+        s = ttk.LabelFrame(parent, text="Scope Monitor", padding=8)
+        s.pack(fill='x', pady=(0, 6))
 
-        ttk.Label(a, text="Averages").grid(row=0, column=0, sticky='w', pady=2)
+        ttk.Label(s, text="Scope CH").grid(row=0, column=0, sticky='w', pady=2)
+        self._chan_var = tk.StringVar(value="1")
+        ttk.Combobox(s, textvariable=self._chan_var, values=["1", "2"],
+                     width=4, state='readonly').grid(row=0, column=1, padx=4, pady=2)
+
+        ttk.Label(s, text="Averages").grid(row=1, column=0, sticky='w', pady=2)
         self._avg_var = tk.StringVar(value="1")
-        ttk.Combobox(a, textvariable=self._avg_var,
+        ttk.Combobox(s, textvariable=self._avg_var,
                      values=["1", "8", "16", "64", "256", "512"],
-                     width=6, state='readonly').grid(row=0, column=1, padx=4, pady=2)
+                     width=6, state='readonly').grid(row=1, column=1, padx=4, pady=2)
 
         for row, (lbl, cmd) in enumerate([
-                ("Frequency Sweep", self._run_sweep),
-                ("Plot Waveform",   self._plot_waveform),
-                ("Live View: OFF",  self._toggle_live)], start=1):
-            btn = ttk.Button(a, text=lbl, command=cmd)
+                ("Plot Waveform",  self._plot_waveform),
+                ("Live View: OFF", self._toggle_live)], start=2):
+            btn = ttk.Button(s, text=lbl, command=cmd)
             btn.grid(row=row, column=0, columnspan=2, sticky='ew', pady=2)
             if lbl == "Live View: OFF":
                 self._live_btn = btn
-            elif lbl == "Frequency Sweep":
-                self._sweep_btn = btn
             self._action_btns.append(btn)
 
-        ttk.Button(a, text="Stop", command=self._stop).grid(
+        ttk.Button(s, text="Stop", command=self._stop).grid(
             row=4, column=0, columnspan=2, sticky='ew', pady=2)
+
+    # ── Sweep panel ────────────────────────────────────────────────
+
+    def _build_sweep_panel(self, parent):
+        w = ttk.LabelFrame(parent, text="Sweep", padding=8)
+        w.pack(fill='x', pady=(0, 6))
+
+        btn = ttk.Button(w, text="Frequency Sweep", command=self._run_sweep)
+        btn.pack(fill='x')
+        self._sweep_btn = btn
+        self._action_btns.append(btn)
 
     def _build_right(self, parent):
         right = ttk.Frame(parent)
@@ -217,8 +273,8 @@ class LabGUI:
         threading.Thread(target=fn, daemon=True).start()
 
     _MODE_TO_RATE = {
-        "1 ch  →  9 GS/s":   SAMPLE_RATE_SINGLE,
-        "2 ch  →  2.5 GS/s": SAMPLE_RATE_DUAL,
+        "9 GS/s  (CH1)":    SAMPLE_RATE_SINGLE,
+        "2.5 GS/s  (CH1+2)": SAMPLE_RATE_DUAL,
     }
 
     def _rate(self):
@@ -236,9 +292,9 @@ class LabGUI:
         self.root.after(0, lambda: label.config(text=text, foreground=color))
 
     def _std_params(self):
-        return (float(self._freq_var.get()) * 1e6,
-                float(self._amp_var.get()),
-                int(self._chan_var.get()))
+        return (float(self._freq1_var.get()) * 1e6,
+                float(self._amp1_var.get()),
+                1)
 
     def _need_awg(self):
         if self.awg is None:
@@ -278,19 +334,27 @@ class LabGUI:
 
     # ── Standard waveform commands ────────────────────────────────
 
-    def _run_std_wave(self):
+    def _run_std_wave(self, channel=1):
         if not self._need_awg(): return
-        freq, amp, ch = self._std_params()
-        wave = self._wave_var.get()
+        try:
+            freq = float(getattr(self, f'_freq{channel}_var').get()) * 1e6
+            amp  = float(getattr(self, f'_amp{channel}_var').get())
+            wave = getattr(self, f'_wave{channel}_var').get()
+        except ValueError as e:
+            print(f"Invalid parameter: {e}\n")
+            return
+        rate = self._rate()
+        reset = (channel == 1)
         self._set_busy(True)
         def run():
             try:
+                self.awg.sample_rate = rate
                 if wave == "Sine":
-                    self.awg.send_sine(freq, amp, channel=ch)
+                    self.awg.send_sine(freq, amp, channel=channel, reset=reset)
                 elif wave == "Square":
-                    self.awg.send_square(freq, amp, channel=ch)
+                    self.awg.send_square(freq, amp, channel=channel, reset=reset)
                 elif wave == "Ramp":
-                    self.awg.send_ramp(freq, amp, channel=ch)
+                    self.awg.send_ramp(freq, amp, channel=channel, reset=reset)
             except Exception as e:
                 print(f"Waveform error: {e}\n")
             finally:
@@ -449,29 +513,34 @@ class LabGUI:
         while self._live_running and self._live_gen == gen:
             try:
                 t, v = self.scope.get_waveform(channel=ch)
+
+                n, dt = len(v), t[1] - t[0]
+                freqs    = np.fft.rfftfreq(n, dt)
+                spectrum = 20 * np.log10(np.abs(np.fft.rfft(v)) * 2 / n + 1e-12)
+
+                self._fig.clear()
+                ax1 = self._fig.add_subplot(211)
+                ax1.plot(t * 1e9, v * 1e3)
+                ax1.set_xlabel("Time (ns)"); ax1.set_ylabel("Voltage (mV)"); ax1.grid(True)
+
+                ax2 = self._fig.add_subplot(212)
+                ax2.plot(freqs * 1e-6, spectrum)
+                ax2.set_xlabel("Frequency (MHz)"); ax2.set_ylabel("Amplitude (dBV)")
+                ax2.grid(True)
+
+                self._fig.tight_layout()
+                self._redraw()
+
             except Exception as e:
-                print(f"Live view: {e}\n")
-                for _ in range(5):
-                    if not self._live_running or self._live_gen != gen:
-                        break
-                    threading.Event().wait(0.1)
-                continue
+                print(f"Live view error: {e}\n")
+                self._fig.clear()
+                ax = self._fig.add_subplot(111)
+                ax.text(0.5, 0.5, str(e), transform=ax.transAxes,
+                        ha='center', va='center', color='red', fontsize=9,
+                        wrap=True)
+                self._redraw()
 
-            n, dt = len(v), t[1] - t[0]
-            freqs    = np.fft.rfftfreq(n, dt)
-            spectrum = 20 * np.log10(np.abs(np.fft.rfft(v)) * 2 / n + 1e-12)
-
-            self._fig.clear()
-            ax1 = self._fig.add_subplot(211)
-            ax1.plot(t * 1e9, v * 1e3)
-            ax1.set_xlabel("Time (ns)"); ax1.set_ylabel("Voltage (mV)"); ax1.grid(True)
-
-            ax2 = self._fig.add_subplot(212)
-            ax2.plot(freqs * 1e-6, spectrum)
-            ax2.set_xlabel("Frequency (MHz)"); ax2.set_ylabel("Amplitude (dBV)"); ax2.grid(True)
-
-            self._fig.tight_layout()
-            self._redraw()
+            threading.Event().wait(0.2)
 
         if self._live_gen == gen:
             self._live_running = False

@@ -11,13 +11,20 @@ class Scope:
         self._lock = threading.Lock()
         rm = pyvisa.ResourceManager()
         self._dev = rm.open_resource(_RESOURCE)
-        self._dev.timeout = 10000
+        self._dev.timeout = 30000
         self._dev.read_termination = '\n'
         self._dev.write_termination = '\n'
+        try:
+            self._dev.clear()   # flush stale bytes left in USB buffer from prior session
+        except Exception:
+            pass
+        time.sleep(0.2)
+        self._dev.write("*CLS")
+        time.sleep(0.1)
         print("Scope:", self._dev.query("*IDN?").strip())
 
     def setup(self, channel=1, n_averages=1):
-        """Set 50 Ohm input, acquisition mode, and immediate Vpp measurement.
+        """Set 50 Ohm input, acquisition mode, immediate Vpp measurement, and start acquisition.
 
         n_averages=1 → SAMPLE mode (instant display update).
         n_averages>1 → AVERAGE mode (slower convergence, lower noise floor).
@@ -31,6 +38,8 @@ class Scope:
                 self._dev.write("ACQuire:MODe SAMple")
             self._dev.write(f"MEASUrement:IMMed:SOUrce1 CH{channel}")
             self._dev.write("MEASUrement:IMMed:TYPE PK2PK")
+            self._dev.write("TRIGger:A:MODe AUTO")
+            self._dev.write("ACQuire:STATE RUN")
         mode = f"{n_averages}× avg" if n_averages > 1 else "sample"
         print(f"Scope: CH{channel} @ 50 Ω, {mode}, Vpp (IMMed)")
 
@@ -46,15 +55,18 @@ class Scope:
                         for _ in range(n_readings)]
         return sum(readings) / len(readings)
 
-    def get_waveform(self, channel=1):
-        """Transfer the current waveform from CH<channel>; return (time_s, voltage_v)."""
+    def get_waveform(self, channel=1, max_points=10000):
+        """Transfer the current waveform from CH<channel>; return (time_s, voltage_v).
+
+        max_points caps the transfer length to keep USB latency manageable.
+        Sets DATA:STOP before querying preamble so NR_PT reflects the actual transfer window.
+        """
         with self._lock:
             self._dev.write(f"DATa:SOUrce CH{channel}")
             self._dev.write("DATa:ENCdg SRIbinary")
             self._dev.write("DATa:WIDth 2")
             self._dev.write("DATa:STARt 1")
-            n_points = int(self._dev.query("WFMOutpre:NR_Pt?"))
-            self._dev.write(f"DATa:STOP {n_points}")
+            self._dev.write(f"DATa:STOP {max_points}")
 
             xincr = float(self._dev.query("WFMOutpre:XINcr?"))
             xzero = float(self._dev.query("WFMOutpre:XZEro?"))
@@ -63,7 +75,10 @@ class Scope:
             yzero = float(self._dev.query("WFMOutpre:YZEro?"))
 
             raw = self._dev.query_binary_values("CURVe?", datatype='h', is_big_endian=False,
-                                                container=np.array)
+                                                container=np.array, expect_termination=False)
+
+        if len(raw) == 0:
+            raise RuntimeError("Scope returned empty waveform — check ACQ state and channel")
         time_s    = xzero + np.arange(len(raw)) * xincr
         voltage_v = (raw - yoff) * ymult + yzero
         return time_s, voltage_v
