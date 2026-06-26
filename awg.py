@@ -11,8 +11,9 @@ _RESOURCE = "TCPIP0::141.51.196.111::5025::SOCKET"
 
 
 class AWG:
-    def __init__(self, sample_rate=SAMPLE_RATE_SINGLE):
+    def __init__(self, sample_rate=SAMPLE_RATE_SINGLE, n_samples=N_SAMPLES):
         self.sample_rate = sample_rate
+        self.n_samples = n_samples   # buffer length; must be multiple of 64
         self._active_seg = {}
         self._lock = threading.Lock()
         rm = pyvisa.ResourceManager()
@@ -61,18 +62,34 @@ class AWG:
         self._cmd(f":VOLT {amplitude_vpp:.3f}")
         self._cmd(":OUTP ON")
 
+    @property
+    def freq_step_hz(self):
+        """Smallest achievable frequency increment at the current buffer size."""
+        return self.sample_rate / self.n_samples
+
     def _sine_u16(self, cycles):
-        t = np.arange(N_SAMPLES)
-        wave = np.sin(2 * np.pi * cycles * t / N_SAMPLES)
+        t = np.arange(self.n_samples)
+        wave = np.sin(2 * np.pi * cycles * t / self.n_samples)
         return ((wave + 1.0) * 32767.5).clip(0, 65535).astype(np.uint16)
 
+    def _square_u16(self, cycles):
+        t = np.arange(self.n_samples)
+        wave = np.where(np.sin(2 * np.pi * cycles * t / self.n_samples) >= 0, 65535, 0)
+        return wave.astype(np.uint16)
+
+    def _ramp_u16(self, cycles):
+        t = np.arange(self.n_samples)
+        wave = (t * cycles / self.n_samples) % 1.0
+        return (wave * 65535).astype(np.uint16)
+
     def _cycles(self, frequency_hz):
-        return max(round(frequency_hz * N_SAMPLES / self.sample_rate), 1)
+        return max(round(frequency_hz * self.n_samples / self.sample_rate), 1)
 
     def send_sine(self, frequency_hz=100e6, amplitude_vpp=0.5, channel=1, reset=True):
         cycles = self._cycles(frequency_hz)
-        actual = cycles * self.sample_rate / N_SAMPLES
-        print(f"[CH{channel}] Sine {frequency_hz/1e6:.1f} MHz -> {actual/1e6:.3f} MHz ({cycles} cycles)")
+        actual = cycles * self.sample_rate / self.n_samples
+        print(f"[CH{channel}] Sine {frequency_hz/1e6:.3f} MHz -> {actual/1e6:.6f} MHz "
+              f"({cycles} cycles, step {self.freq_step_hz/1e3:.1f} kHz)")
         seg = channel
         with self._lock:
             self._setup(channel, reset)
@@ -83,7 +100,7 @@ class AWG:
 
     def update_sine(self, frequency_hz, amplitude_vpp=0.5, channel=1):
         cycles = self._cycles(frequency_hz)
-        actual = cycles * self.sample_rate / N_SAMPLES
+        actual = cycles * self.sample_rate / self.n_samples
         with self._lock:
             cur = self._active_seg.get(channel, channel)
             next_seg = channel + 20 if cur == channel + 10 else channel + 10
@@ -93,22 +110,22 @@ class AWG:
             self._active_seg[channel] = next_seg
         return actual
 
-    def send_ramp(self, amplitude_vpp=0.5, channel=1, reset=True):
-        print(f"[CH{channel}] Ramp")
+    def send_ramp(self, frequency_hz=None, amplitude_vpp=0.5, channel=1, reset=True):
+        cycles = self._cycles(frequency_hz) if frequency_hz else 1
+        actual = cycles * self.sample_rate / self.n_samples
+        print(f"[CH{channel}] Ramp -> {actual/1e6:.6f} MHz")
         with self._lock:
             self._setup(channel, reset)
-            self._upload(np.linspace(0, 65535, N_SAMPLES, dtype=np.uint16), segnum=channel)
+            self._upload(self._ramp_u16(cycles), segnum=channel)
             self._play(amplitude_vpp, segnum=channel)
 
     def send_square(self, frequency_hz=None, amplitude_vpp=0.5, channel=1, reset=True):
         cycles = self._cycles(frequency_hz) if frequency_hz else 1
-        actual = cycles * self.sample_rate / N_SAMPLES
-        print(f"[CH{channel}] Square {cycles} cycle(s) -> {actual/1e6:.3f} MHz")
-        spc = N_SAMPLES // cycles
-        one_cycle = np.array([0xFFFF] * (spc // 2) + [0] * (spc - spc // 2), dtype=np.uint16)
+        actual = cycles * self.sample_rate / self.n_samples
+        print(f"[CH{channel}] Square -> {actual/1e6:.6f} MHz")
         with self._lock:
             self._setup(channel, reset)
-            self._upload(np.tile(one_cycle, cycles)[:N_SAMPLES], segnum=channel)
+            self._upload(self._square_u16(cycles), segnum=channel)
             self._play(amplitude_vpp, segnum=channel)
 
     def stop(self):

@@ -42,8 +42,8 @@ class LabGUI:
         self.root.geometry("1100x720")
         self.awg = None
         self.scope = None
-        self._live_stop = threading.Event()
         self._live_running = False
+        self._live_gen = 0       # increments each start; loop exits when gen mismatches
         self._sweep_stop = threading.Event()
         self._build_ui()
 
@@ -105,6 +105,17 @@ class LabGUI:
                      values=["1", "8", "16", "64", "256", "512"],
                      width=8, state='readonly').grid(row=4, column=1, padx=4, pady=2)
 
+        ttk.Label(p, text="Freq accuracy").grid(row=5, column=0, sticky='w', pady=2)
+        self._acc_var = tk.StringVar(value="±2 MHz  (fast)")
+        acc_box = ttk.Combobox(p, textvariable=self._acc_var,
+                               values=["±2 MHz  (fast)",
+                                       "±550 kHz",
+                                       "±70 kHz",
+                                       "±35 kHz  (slow)"],
+                               width=14, state='readonly')
+        acc_box.grid(row=5, column=1, padx=4, pady=2)
+        acc_box.bind("<<ComboboxSelected>>", self._on_buf_change)
+
         # Waveform
         w = ttk.LabelFrame(ctrl, text="Waveform", padding=8)
         w.pack(fill='x', pady=(0, 6))
@@ -152,6 +163,24 @@ class LabGUI:
 
     def _thread(self, fn):
         threading.Thread(target=fn, daemon=True).start()
+
+    # Maps accuracy label → buffer size (all multiples of 64 as required by Proteus)
+    _ACC_TO_BUF = {
+        "±2 MHz  (fast)":  2_048,
+        "±550 kHz":        8_192,
+        "±70 kHz":        65_536,
+        "±35 kHz  (slow)": 131_072,
+    }
+
+    def _on_buf_change(self, _=None):
+        n = self._ACC_TO_BUF.get(self._acc_var.get(), 2048)
+        if self.awg is not None:
+            self.awg.n_samples = n
+
+    def _sync_buf(self):
+        """Push the selected buffer size to the AWG before waveform generation."""
+        if self.awg is not None:
+            self.awg.n_samples = self._ACC_TO_BUF.get(self._acc_var.get(), 2048)
 
     def _set_busy(self, busy):
         state = 'disabled' if busy else 'normal'
@@ -214,22 +243,26 @@ class LabGUI:
     def _run_sine(self):
         if not self._need_awg(): return
         freq, amp, ch = self._params()
+        self._sync_buf()
         self._thread(lambda: self.awg.send_sine(freq, amp, channel=ch))
 
     def _run_square(self):
         if not self._need_awg(): return
         freq, amp, ch = self._params()
+        self._sync_buf()
         self._thread(lambda: self.awg.send_square(freq, amp, channel=ch))
 
     def _run_ramp(self):
         if not self._need_awg(): return
-        _, amp, ch = self._params()
-        self._thread(lambda: self.awg.send_ramp(amp, channel=ch))
+        freq, amp, ch = self._params()
+        self._sync_buf()
+        self._thread(lambda: self.awg.send_ramp(freq, amp, channel=ch))
 
     def _stop(self):
-        self._sweep_stop.set()   # signal any running sweep to abort
-        self._live_stop.set()    # signal live view to stop too
-        self._live_running = False
+        self._sweep_stop.set()
+        self._live_running = False      # signals live loop to exit
+        self._live_gen += 1             # invalidates any running loop generation
+        self._set_busy(False)
         self.root.after(0, lambda: self._live_btn.config(text="Live View: OFF"))
         if not self._need_awg(): return
         self._thread(self.awg.stop)
@@ -335,23 +368,29 @@ class LabGUI:
     def _toggle_live(self):
         if not self._need_scope(): return
         if self._live_running:
-            self._live_stop.set()
             self._live_running = False
+            self._live_gen += 1
             self.root.after(0, lambda: self._live_btn.config(text="Live View: OFF"))
         else:
-            self._live_stop.clear()
             self._live_running = True
+            self._live_gen += 1
             self.root.after(0, lambda: self._live_btn.config(text="Live View: ON"))
-            self._thread(self._live_loop)
+            gen = self._live_gen
+            self._thread(lambda: self._live_loop(gen))
 
-    def _live_loop(self):
+    def _live_loop(self, gen):
         ch = int(self._chan_var.get())
-        while not self._live_stop.is_set():
+        while self._live_running and self._live_gen == gen:
             try:
                 t, v = self.scope.get_waveform(channel=ch)
             except Exception as e:
-                print(f"Live view error: {e}\n")
-                break
+                print(f"Live view: {e}\n")
+                # pause then retry — don't exit on a transient error
+                for _ in range(5):
+                    if not self._live_running or self._live_gen != gen:
+                        break
+                    threading.Event().wait(0.1)
+                continue
 
             n, dt = len(v), t[1] - t[0]
             freqs    = np.fft.rfftfreq(n, dt)
@@ -369,8 +408,9 @@ class LabGUI:
             self._fig.tight_layout()
             self._redraw()
 
-        self._live_running = False
-        self.root.after(0, lambda: self._live_btn.config(text="Live View: OFF"))
+        if self._live_gen == gen:
+            self._live_running = False
+            self.root.after(0, lambda: self._live_btn.config(text="Live View: OFF"))
 
 
 if __name__ == "__main__":
