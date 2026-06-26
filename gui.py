@@ -122,6 +122,7 @@ class LabGUI:
         w.pack(fill='x', pady=(0, 6))
         self._waveform_btns = []
         for label, cmd in [("Sine", self._run_sine),
+                            ("IQ Sine (CH1=I, CH2=Q)", self._run_iq_sine),
                             ("Square", self._run_square),
                             ("Ramp", self._run_ramp)]:
             btn = ttk.Button(w, text=label, command=cmd)
@@ -251,6 +252,14 @@ class LabGUI:
         self._sync_buf()
         exact = self._exact_freq()
         self._thread(lambda: self.awg.send_sine(freq, amp, channel=ch, exact=exact))
+
+    def _run_iq_sine(self):
+        if not self._need_awg(): return
+        freq, amp, _ = self._params()   # channel ignored — always CH1=I, CH2=Q
+        self._sync_buf()
+        exact = self._exact_freq()
+        print(f"IQ sine: {freq/1e6:.3f} MHz, {amp:.3f} Vpp — ensure dual-channel mode (2.5 GS/s)\n")
+        self._thread(lambda: self.awg.send_iq_sine(freq, amp, exact=exact))
 
     def _run_square(self):
         if not self._need_awg(): return

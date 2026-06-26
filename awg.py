@@ -131,6 +131,37 @@ class AWG:
             self._active_seg[channel] = next_seg
         return actual
 
+    def send_iq_sine(self, frequency_hz=100e6, amplitude_vpp=0.5, exact=False):
+        """Output I (sine) on CH1 and Q (cosine, 90° shifted) on CH2 simultaneously.
+
+        Both channels share the same DAC clock so they are always phase-locked.
+        The rate is computed once from CH1 and reused for CH2 — no mismatch possible.
+        Requires dual-channel mode (sample_rate <= SAMPLE_RATE_DUAL = 2.5 GS/s).
+        """
+        cycles, rate, actual = self._resolve(frequency_hz, exact)
+        err_hz = actual - frequency_hz
+        print(f"[IQ] {frequency_hz/1e6:.6f} MHz -> {actual/1e6:.6f} MHz "
+              f"(err {err_hz:+.1f} Hz, Fs={rate/1e9:.6f} GS/s)")
+
+        t = np.arange(self.n_samples)
+        i_wave = ((np.sin(2 * np.pi * cycles * t / self.n_samples) + 1.0) * 32767.5).clip(0, 65535).astype(np.uint16)
+        q_wave = ((np.cos(2 * np.pi * cycles * t / self.n_samples) + 1.0) * 32767.5).clip(0, 65535).astype(np.uint16)
+
+        with self._lock:
+            # Reset and configure CH1 (sets the shared clock rate for both channels)
+            self._setup(channel=1, reset=True, sample_rate=rate)
+            self._upload(i_wave, segnum=1)
+            self._play(amplitude_vpp, segnum=1)
+            self._active_seg[1] = 1
+
+            # Configure CH2 without reset — clock rate already set
+            self._setup(channel=2, reset=False, sample_rate=rate)
+            self._upload(q_wave, segnum=2)
+            self._play(amplitude_vpp, segnum=2)
+            self._active_seg[2] = 2
+
+        return actual
+
     def send_ramp(self, frequency_hz=None, amplitude_vpp=0.5, channel=1, reset=True, exact=False):
         cycles, rate, actual = self._resolve(frequency_hz, exact) if frequency_hz else (1, self.sample_rate, self.sample_rate / self.n_samples)
         print(f"[CH{channel}] Ramp -> {actual/1e6:.6f} MHz (err {actual - (frequency_hz or actual):+.1f} Hz)")
