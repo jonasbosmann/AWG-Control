@@ -11,17 +11,25 @@ class Scope:
         self._lock = threading.Lock()
         rm = pyvisa.ResourceManager()
         self._dev = rm.open_resource(_RESOURCE)
-        self._dev.timeout = 30000
         self._dev.read_termination = '\n'
         self._dev.write_termination = '\n'
-        try:
-            self._dev.clear()   # flush stale bytes left in USB buffer from prior session
-        except Exception:
-            pass
-        time.sleep(0.2)
-        self._dev.write("*CLS")
-        time.sleep(0.1)
-        print("Scope:", self._dev.query("*IDN?").strip())
+        self._dev.timeout = 3000   # short timeout just for the initial handshake
+        idn = None
+        for attempt in range(2):
+            try:
+                self._dev.clear()
+            except Exception:
+                pass
+            self._dev.write("*CLS")
+            try:
+                idn = self._dev.query("*IDN?").strip()
+                break
+            except Exception:
+                if attempt == 1:
+                    raise
+                time.sleep(0.3)   # endpoint settling time before retry
+        print("Scope:", idn)
+        self._dev.timeout = 30000  # restore long timeout for waveform transfers
 
     def setup(self, channel=1, n_averages=1):
         """Set 50 Ohm input, acquisition mode, immediate Vpp measurement, and start acquisition.
@@ -39,21 +47,38 @@ class Scope:
             self._dev.write(f"MEASUrement:IMMed:SOUrce1 CH{channel}")
             self._dev.write("MEASUrement:IMMed:TYPE PK2PK")
             self._dev.write("TRIGger:A:MODe AUTO")
+            self._dev.write("TRIGger:A:LEVEL 0.0")
+            # Continuous-run mode: scope keeps acquiring without blocking the USB
+            # interface between shots (single-sequence mode blocks for ~30 s waiting
+            # for the auto-trigger, which stalls every subsequent SCPI write).
+            self._dev.write("ACQuire:STOPAfter RUNSTop")
             self._dev.write("ACQuire:STATE RUN")
         mode = f"{n_averages}× avg" if n_averages > 1 else "sample"
-        print(f"Scope: CH{channel} @ 50 Ω, {mode}, Vpp (IMMed)")
+        print(f"Scope: CH{channel} @ 50 Ω, {mode}, Vpp (IMMed)\n")
 
-    def measure_vpp(self, settle=0.5, n_readings=1):
-        """Read Vpp via immediate measurement.
+    def set_timebase(self, freq_hz, n_cycles=8):
+        """Set horizontal scale so ~n_cycles of freq_hz fit on screen (10 divisions)."""
+        scale = max(1e-10, min(n_cycles / (freq_hz * 10), 1.0))
+        with self._lock:
+            self._dev.write(f"HORizontal:SCAle {scale:.3e}")
 
-        n_readings > 1: takes multiple readings in SAMPLE mode and averages them
-        in Python — avoids scope-side averaging that doesn't reset between steps.
+    def measure_vpp(self, channel=1, settle=0.05):
+        """Arm a single acquisition, force-trigger it immediately, read Vpp.
+
+        Uses *TRG (IEEE 488.2 software trigger) so the scope fires at once
+        instead of waiting up to 30 s for the hardware auto-trigger fallback.
         """
         time.sleep(settle)
         with self._lock:
-            readings = [float(self._dev.query("MEASUrement:IMMed:VALue?"))
-                        for _ in range(n_readings)]
-        return sum(readings) / len(readings)
+            self._dev.write("ACQuire:STATE STOP")
+            self._dev.write(f"MEASUrement:IMMed:SOUrce1 CH{channel}")
+            self._dev.write("MEASUrement:IMMed:TYPE PK2PK")
+            self._dev.write("ACQuire:STATE RUN")
+            self._dev.write("*TRG")        # fire immediately — no 30 s auto-trigger wait
+            time.sleep(0.05)               # 50 ms >> 200 ns acquisition time
+            val = float(self._dev.query("MEASUrement:IMMed:VALue?"))
+            self._dev.write("ACQuire:STATE RUN")  # restart continuous for live view
+        return val
 
     def get_waveform(self, channel=1, max_points=10000):
         """Transfer the current waveform from CH<channel>; return (time_s, voltage_v).

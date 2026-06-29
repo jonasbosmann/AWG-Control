@@ -244,9 +244,20 @@ class LabGUI:
     def _build_sweep_panel(self, parent):
         w = ttk.LabelFrame(parent, text="Sweep", padding=8)
         w.pack(fill='x', pady=(0, 6))
+        w.columnconfigure(1, weight=1)
+
+        ttk.Label(w, text="Settle (ms)").grid(row=0, column=0, sticky='w', pady=2)
+        self._settle_var = tk.StringVar(value="50")
+        ttk.Entry(w, textvariable=self._settle_var, width=6).grid(
+            row=0, column=1, sticky='ew', padx=(4, 0), pady=2)
+
+        ttk.Label(w, text="Cycles shown").grid(row=1, column=0, sticky='w', pady=2)
+        self._cycles_var = tk.StringVar(value="8")
+        ttk.Entry(w, textvariable=self._cycles_var, width=6).grid(
+            row=1, column=1, sticky='ew', padx=(4, 0), pady=2)
 
         btn = ttk.Button(w, text="Frequency Sweep", command=self._run_sweep)
-        btn.pack(fill='x')
+        btn.grid(row=2, column=0, columnspan=2, sticky='ew', pady=(6, 2))
         self._sweep_btn = btn
         self._action_btns.append(btn)
 
@@ -400,16 +411,31 @@ class LabGUI:
     # ── Sweep ──────────────────────────────────────────────────────
 
     def _run_sweep(self):
+        print("Sweep clicked\n")
         if not self._need_awg(): return
-        _, amp, ch = self._std_params()
-        n_avg = int(self._avg_var.get())
+        self._set_busy(True)   # disable buttons immediately — prevents double-click second thread
+        try:
+            _, amp, awg_ch = self._std_params()
+            settle_s = float(self._settle_var.get()) / 1000.0
+            n_cycles = int(self._cycles_var.get())
+        except Exception as e:
+            print(f"Sweep param error: {e}\n")
+            self._set_busy(False)
+            return
 
         def sweep():
             self._sweep_stop.clear()
-            self._set_busy(True)
             try:
-                if self.scope is not None:
-                    self.scope.setup(channel=ch, n_averages=1)
+                # Pre-load all segments once; the sweep loop then just switches
+                import time as _time
+                print("Pre-loading waveform segments…\n")
+                t_pre0 = _time.perf_counter()
+                self.awg.send_sine(DEFAULT_FREQS[0], amp, channel=awg_ch, reset=True)
+                t_pre1 = _time.perf_counter()
+                print(f"  send_sine: {(t_pre1-t_pre0):.1f} s\n")
+                segments = self.awg.sweep_preload(DEFAULT_FREQS, channel=awg_ch)
+                t_pre2 = _time.perf_counter()
+                print(f"  sweep_preload: {(t_pre2-t_pre1):.1f} s\n")
 
                 ref_vpp = None
                 freqs_plot, losses_plot = [], []
@@ -417,17 +443,26 @@ class LabGUI:
                 print(f"\n{'Target (MHz)':>14}  {'Actual (MHz)':>14}  {'Vpp (mV)':>10}  {'Loss (dB)':>10}")
                 print("-" * 56)
 
-                self.awg.send_sine(DEFAULT_FREQS[0], amp, channel=ch, reset=True)
-
-                for f in DEFAULT_FREQS:
+                for (actual, segnum), f in zip(segments, DEFAULT_FREQS):
                     if self._sweep_stop.is_set():
                         print("Sweep aborted.\n")
                         break
 
-                    actual = self.awg.update_sine(f, amp, channel=ch)
+                    import time as _time
+                    t0 = _time.perf_counter()
+                    self.awg.sweep_step(segnum, amp, channel=awg_ch)
+                    t1 = _time.perf_counter()
+                    print(f"  sweep_step: {(t1-t0)*1000:.0f} ms\n")
 
                     if self.scope is not None:
-                        vpp = self.scope.measure_vpp(settle=0.3, n_readings=n_avg)
+                        t2 = _time.perf_counter()
+                        self.scope.set_timebase(actual, n_cycles=n_cycles)
+                        t3 = _time.perf_counter()
+                        print(f"  set_timebase: {(t3-t2)*1000:.0f} ms\n")
+                        vpp = self.scope.measure_vpp(channel=int(self._chan_var.get()),
+                                                          settle=settle_s)
+                        t4 = _time.perf_counter()
+                        print(f"  measure_vpp: {(t4-t3)*1000:.0f} ms\n")
                         if ref_vpp is None:
                             ref_vpp = vpp
                         loss = 20 * np.log10(vpp / ref_vpp) if vpp > 0 else float('-inf')
@@ -459,6 +494,7 @@ class LabGUI:
     # ── Waveform capture ───────────────────────────────────────────
 
     def _plot_waveform(self):
+        print("Plot waveform clicked\n")
         if not self._need_scope(): return
         ch = int(self._chan_var.get())
 
@@ -496,6 +532,7 @@ class LabGUI:
     # ── Live view ──────────────────────────────────────────────────
 
     def _toggle_live(self):
+        print("Live view clicked\n")
         if not self._need_scope(): return
         if self._live_running:
             self._live_running = False

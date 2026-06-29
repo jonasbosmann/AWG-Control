@@ -131,6 +131,37 @@ class AWG:
             self._active_seg[channel] = next_seg
         return actual
 
+    def sweep_preload(self, freqs_hz, channel=1):
+        """Upload one sine segment per frequency (segments 30, 31, …).
+        Returns list of (actual_hz, segnum). Call once before the sweep loop."""
+        results = []
+        with self._lock:
+            for i, f in enumerate(freqs_hz):
+                segnum = 30 + i
+                cycles, _, actual = self._resolve(f)
+                self._dev.write(f":INST:CHAN {channel}")
+                wave = self._sine_u16(cycles)
+                n = len(wave)
+                self._dev.write(f":TRAC:DEF {segnum},{n}")
+                self._dev.write(f":TRAC:SEL {segnum}")
+                data = wave.tobytes()
+                nb_str = str(len(data))
+                self._dev.write_raw(
+                    f":TRAC:DATA #{len(nb_str)}{nb_str}".encode() + data + b"\n")
+                time.sleep(0.15)
+                results.append((actual, segnum))
+                print(f"  preload seg {segnum}: {actual/1e6:.3f} MHz")
+        return results
+
+    def sweep_step(self, segnum, amplitude_vpp=0.5, channel=1):
+        """Switch to a pre-loaded segment using direct writes (no _cmd overhead)."""
+        with self._lock:
+            self._dev.write(f":INST:CHAN {channel}")
+            self._dev.write(f":FUNC:MODE:SEGM {segnum}")
+            self._dev.write(f":VOLT {amplitude_vpp:.3f}")
+            self._dev.write(f":OUTP ON")
+            self._active_seg[channel] = segnum
+
     def _chirp_windowed_u16(self, f_start, f_stop, n_active, n_total, rate, window_frac=0.05):
         t = np.arange(n_active, dtype=np.float64)
         phase = 2 * np.pi * (f_start / rate * t +
