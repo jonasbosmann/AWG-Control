@@ -47,6 +47,18 @@ class LabGUI:
         self._sweep_stop   = threading.Event()
         self._action_btns  = []   # all buttons disabled while busy (except Stop)
         self._build_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
+
+    def _on_closing(self):
+        self._live_running = False
+        self._sweep_stop.set()
+        if self.scope:
+            try: self.scope.close()
+            except Exception: pass
+        if self.awg:
+            try: self.awg.close()
+            except Exception: pass
+        self.root.destroy()
 
     # ── UI construction ───────────────────────────────────────────
 
