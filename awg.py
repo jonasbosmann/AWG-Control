@@ -15,6 +15,7 @@ class AWG:
         self.sample_rate = sample_rate
         self.n_samples = n_samples   # buffer length; must be multiple of 64
         self._active_seg = {}
+        self._sweep_amp  = {}        # tracks last :VOLT sent per channel during sweep
         self._lock = threading.Lock()
         rm = pyvisa.ResourceManager()
         self._dev = rm.open_resource(_RESOURCE)
@@ -134,6 +135,7 @@ class AWG:
     def sweep_preload(self, freqs_hz, channel=1):
         """Upload one sine segment per frequency (segments 30, 31, …).
         Returns list of (actual_hz, segnum). Call once before the sweep loop."""
+        self._sweep_amp.pop(channel, None)   # force :VOLT on first sweep_step
         results = []
         with self._lock:
             for i, f in enumerate(freqs_hz):
@@ -154,12 +156,19 @@ class AWG:
         return results
 
     def sweep_step(self, segnum, amplitude_vpp=0.5, channel=1):
-        """Switch to a pre-loaded segment using direct writes (no _cmd overhead)."""
+        """Switch to a pre-loaded segment using direct writes (no _cmd overhead).
+
+        Avoids re-sending :VOLT and :OUTP ON when unchanged — those commands can
+        cause brief DAC glitches even if the value hasn't changed.
+        """
         with self._lock:
             self._dev.write(f":INST:CHAN {channel}")
             self._dev.write(f":FUNC:MODE:SEGM {segnum}")
-            self._dev.write(f":VOLT {amplitude_vpp:.3f}")
-            self._dev.write(f":OUTP ON")
+            prev_amp = self._sweep_amp.get(channel)
+            if prev_amp != amplitude_vpp:
+                self._dev.write(f":VOLT {amplitude_vpp:.3f}")
+                self._dev.write(f":OUTP ON")
+                self._sweep_amp[channel] = amplitude_vpp
             self._active_seg[channel] = segnum
 
     def _chirp_windowed_u16(self, f_start, f_stop, n_active, n_total, rate, window_frac=0.05):

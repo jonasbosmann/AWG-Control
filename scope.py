@@ -84,39 +84,36 @@ class Scope:
         voltage_v = raw * self._pre['ymult'] + self._pre['yzero']
         return time_s, voltage_v
 
-    def measure_vpp(self, channel=1, settle=0.0, timeout_ms=1000):
-        """Capture one fresh acquisition (SEQuence + *OPC?) and return PK2PK voltage.
+    def measure_vpp(self, channel=1, settle=0.1):
+        """Stop scope after settle time, read buffer, restart. Returns RMS-based Vpp.
 
-        The scope is told to capture after this function is called, so the waveform
-        is guaranteed to be at the current AWG frequency — no settle-time guessing.
-        TCP command ordering ensures HORizontal:SCAle is applied before the trigger fires.
+        Strategy: let the scope run continuously during settle_s so it acquires many
+        clean waveforms at the new AWG frequency. Then STOP to freeze the last completed
+        acquisition and read it. RMS is used instead of ptp so isolated spikes (AWG
+        segment-switch transients, EMI) don't inflate the reading.
         """
         if settle > 0:
             time.sleep(settle)
         with self._lock:
-            self._dev.write("ACQuire:STOPAfter SEQuence")
-            self._dev.write("ACQuire:STATE RUN")
-            old_to = self._dev.timeout
-            self._dev.timeout = timeout_ms
-            try:
-                self._dev.query("*OPC?")   # blocks until the one acquisition completes
-            except Exception:
-                pass   # timeout = no trigger; fall through and read whatever is there
-            finally:
-                self._dev.timeout = old_to
+            self._dev.write("ACQuire:STATE STOP")
+            time.sleep(0.02)   # let STOP propagate before querying
+            if 'ymult' not in self._pre:
+                self._pre['xincr'] = float(self._dev.query("WFMOutpre:XINcr?"))
+                self._pre['ymult'] = float(self._dev.query("WFMOutpre:YMUlt?"))
+                self._pre['yzero'] = float(self._dev.query("WFMOutpre:YZEro?"))
+                self._pre['rl']    = int(self._dev.query("HORizontal:RECOrdlength?"))
             self._dev.write(f"DATa:SOUrce CH{channel}")
             self._dev.write("DATa:ENCdg ASCIi")
             self._dev.write("DATa:STARt 1")
-            pts = min(500, self._pre.get('rl', 500))
+            pts = min(2000, self._pre['rl'])
             self._dev.write(f"DATa:STOP {pts}")
             raw_str = self._dev.query("CURVe?")
-            # Restart continuous acquisition so live view keeps working
-            self._dev.write("ACQuire:STOPAfter RUNSTop")
             self._dev.write("ACQuire:STATE RUN")
         raw = np.array([int(x) for x in raw_str.split(',')])
-        ymult = self._pre.get('ymult', 1.0)
-        yzero = self._pre.get('yzero', 0.0)
-        return float(np.ptp(raw * ymult + yzero))
+        v = raw * self._pre['ymult'] + self._pre['yzero']
+        v_ac = v - np.mean(v)                                # remove DC offset
+        vrms = np.sqrt(np.mean(v_ac ** 2))
+        return float(2.0 * np.sqrt(2.0) * vrms)             # Vpp = 2√2 · Vrms for sine
 
     def close(self):
         self._dev.close()
