@@ -84,19 +84,31 @@ class Scope:
         voltage_v = raw * self._pre['ymult'] + self._pre['yzero']
         return time_s, voltage_v
 
-    def measure_vpp(self, channel=1, settle=0.1):
-        """Stop scope after settle time, read buffer, restart. Returns RMS-based Vpp.
+    def measure_vpp(self, channel=1, settle=0.1, acq_timeout=3.0):
+        """Capture one fresh acquisition and return RMS-based Vpp.
 
-        Strategy: let the scope run continuously during settle_s so it acquires many
-        clean waveforms at the new AWG frequency. Then STOP to freeze the last completed
-        acquisition and read it. RMS is used instead of ptp so isolated spikes (AWG
-        segment-switch transients, EMI) don't inflate the reading.
+        Sequence:
+          1. sleep(settle) — AWG glitch transients die away while scope runs freely
+          2. SEQuence + RUN — arm scope for exactly one acquisition
+          3. Poll ACQuire:STATE? until '0' (STOP) — guarantees the acquisition is
+             actually complete before we read (unlike *OPC? over LAN, which returns
+             as soon as the command is parsed, not when the hardware finishes)
+          4. Read CURVe?, compute AC-RMS → Vpp; RMS is robust to residual spikes
+          5. Restore continuous mode for live view
         """
         if settle > 0:
             time.sleep(settle)
         with self._lock:
-            self._dev.write("ACQuire:STATE STOP")
-            time.sleep(0.02)   # let STOP propagate before querying
+            self._dev.write("ACQuire:STOPAfter SEQuence")
+            self._dev.write("ACQuire:STATE RUN")
+            deadline = time.perf_counter() + acq_timeout
+            while time.perf_counter() < deadline:
+                state = self._dev.query("ACQuire:STATE?").strip()
+                if state in ('0', '0.0', 'STOP', 'STOPPED'):
+                    break
+                time.sleep(0.005)
+            else:
+                print("measure_vpp: acquisition timeout — reading buffer anyway\n")
             if 'ymult' not in self._pre:
                 self._pre['xincr'] = float(self._dev.query("WFMOutpre:XINcr?"))
                 self._pre['ymult'] = float(self._dev.query("WFMOutpre:YMUlt?"))
@@ -108,12 +120,13 @@ class Scope:
             pts = min(2000, self._pre['rl'])
             self._dev.write(f"DATa:STOP {pts}")
             raw_str = self._dev.query("CURVe?")
+            self._dev.write("ACQuire:STOPAfter RUNSTop")
             self._dev.write("ACQuire:STATE RUN")
         raw = np.array([int(x) for x in raw_str.split(',')])
         v = raw * self._pre['ymult'] + self._pre['yzero']
-        v_ac = v - np.mean(v)                                # remove DC offset
+        v_ac = v - np.mean(v)
         vrms = np.sqrt(np.mean(v_ac ** 2))
-        return float(2.0 * np.sqrt(2.0) * vrms)             # Vpp = 2√2 · Vrms for sine
+        return float(2.0 * np.sqrt(2.0) * vrms)   # Vpp = 2√2 · Vrms for sine
 
     def close(self):
         self._dev.close()

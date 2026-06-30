@@ -156,10 +156,11 @@ class AWG:
         return results
 
     def sweep_step(self, segnum, amplitude_vpp=0.5, channel=1):
-        """Switch to a pre-loaded segment using direct writes (no _cmd overhead).
+        """Switch to a pre-loaded segment and block until the AWG confirms.
 
-        Avoids re-sending :VOLT and :OUTP ON when unchanged — those commands can
-        cause brief DAC glitches even if the value hasn't changed.
+        *OPC? blocks until the AWG has processed the segment-switch command.
+        The physical output switches within one segment period (<1 µs) after that.
+        Avoids re-sending :VOLT/:OUTP ON when unchanged to reduce DAC glitches.
         """
         with self._lock:
             self._dev.write(f":INST:CHAN {channel}")
@@ -169,6 +170,7 @@ class AWG:
                 self._dev.write(f":VOLT {amplitude_vpp:.3f}")
                 self._dev.write(f":OUTP ON")
                 self._sweep_amp[channel] = amplitude_vpp
+            self._dev.query("*OPC?")   # block until AWG has processed the switch
             self._active_seg[channel] = segnum
 
     def _chirp_windowed_u16(self, f_start, f_stop, n_active, n_total, rate, window_frac=0.05):
