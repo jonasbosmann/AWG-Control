@@ -9,12 +9,12 @@ _RESOURCE = "TCPIP::169.254.4.20::4000::SOCKET"
 class Scope:
     def __init__(self):
         self._lock = threading.Lock()
+        self._pre = {}   # cached: xincr, ymult, yzero, rl (cleared on timebase change)
         rm = pyvisa.ResourceManager()
         self._dev = rm.open_resource(_RESOURCE)
         self._dev.read_termination = '\n'
         self._dev.write_termination = '\n'
         self._dev.timeout = 3000
-        idn = None
         for attempt in range(2):
             try:
                 self._dev.clear()
@@ -45,44 +45,59 @@ class Scope:
             self._dev.write("TRIGger:A:MODe AUTO")
             self._dev.write(f"TRIGger:A:LEVEL:CH{channel} 0.0")
             self._dev.write("ACQuire:STOPAfter RUNSTop")
-            # Do NOT send ACQuire:STATE RUN — that puts the scope into a SCPI-controlled
-            # acquisition that blocks all USB reads for up to 30 s waiting for a trigger.
-            # The scope runs continuously from the front panel; we only read its buffer.
+            self._dev.write("ACQuire:STATE RUN")
+            # PK2PK named measurement for sweep. CURRentacq:MEAN? returns immediately
+            # on LAN (ACQuire:STATE RUN only blocks USB reads, not LAN socket reads).
+            self._dev.write("MEASUrement:DELETEALL")
+            self._dev.write('MEASUrement:ADDNew "MEAS1"')
+            self._dev.write(f"MEASUrement:MEAS1:TYPe PK2PK")
+            self._dev.write(f"MEASUrement:MEAS1:SOURCE CH{channel}")
+        self._pre.clear()
         mode = f"{n_averages}× avg" if n_averages > 1 else "sample"
         print(f"Scope: CH{channel} @ 50 Ω, {mode}\n")
 
+    def set_timebase_direct(self, seconds_per_div):
+        self._pre.clear()
+        with self._lock:
+            self._dev.write(f"HORizontal:SCAle {seconds_per_div:.3e}")
+
     def set_timebase(self, freq_hz, n_cycles=8):
+        self._pre.clear()
         scale = max(1e-10, min(n_cycles / (freq_hz * 10), 1.0))
         with self._lock:
             self._dev.write(f"HORizontal:SCAle {scale:.3e}")
 
-    def get_waveform(self, channel=1, max_points=2500):
-        """Stop scope, read frozen ASCII waveform, restart."""
+    def get_waveform(self, channel=1, max_points=10000):
+        """Read current waveform buffer without stopping acquisition.
+
+        Preamble (xincr, ymult, yzero, record length) is cached and reused across
+        calls until the timebase changes — saves 4 queries per live-view frame.
+        """
         with self._lock:
             self._dev.write(f"DATa:SOUrce CH{channel}")
             self._dev.write("DATa:ENCdg ASCIi")
             self._dev.write("DATa:STARt 1")
-            self._dev.write(f"DATa:STOP {max_points}")
-            time.sleep(0.05)
-            self._dev.write("ACQuire:STATE STOP")
-            time.sleep(0.05)
-            try:
-                xincr = float(self._dev.query("WFMOutpre:XINcr?"))
-                xzero = float(self._dev.query("WFMOutpre:XZEro?"))
-                ymult = float(self._dev.query("WFMOutpre:YMUlt?"))
-                yzero = float(self._dev.query("WFMOutpre:YZEro?"))
-                raw_str = self._dev.query("CURVe?")
-            finally:
-                self._dev.write("FPAnel:PRESS RUNSTop")
+            if 'xincr' not in self._pre:
+                self._pre['xincr'] = float(self._dev.query("WFMOutpre:XINcr?"))
+                self._pre['ymult'] = float(self._dev.query("WFMOutpre:YMUlt?"))
+                self._pre['yzero'] = float(self._dev.query("WFMOutpre:YZEro?"))
+                self._pre['rl']    = int(self._dev.query("HORizontal:RECOrdlength?"))
+            pts = min(max_points, self._pre['rl'])
+            self._dev.write(f"DATa:STOP {pts}")
+            raw_str = self._dev.query("CURVe?")
         raw = np.array([int(x) for x in raw_str.split(',')])
-        time_s    = xzero + np.arange(len(raw)) * xincr
-        voltage_v = raw * ymult + yzero
+        time_s    = np.arange(len(raw)) * self._pre['xincr']
+        voltage_v = raw * self._pre['ymult'] + self._pre['yzero']
         return time_s, voltage_v
 
-    def measure_vpp(self, channel=1, settle=0.05):
+    def measure_vpp(self, channel=1, settle=0.1):
+        """Query PK2PK from MEAS1 — scope keeps running, no stop/start disruption."""
         time.sleep(settle)
-        _, v = self.get_waveform(channel=channel, max_points=500)
-        return float(np.ptp(v))
+        with self._lock:
+            val = float(self._dev.query("MEASUrement:MEAS1:RESUlts:CURRentacq:MEAN?"))
+        if val > 1e30:
+            return float('nan')
+        return val
 
     def close(self):
         self._dev.close()

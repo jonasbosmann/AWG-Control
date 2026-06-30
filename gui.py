@@ -239,9 +239,19 @@ class LabGUI:
                      values=["1", "8", "16", "64", "256", "512"],
                      width=6, state='readonly').grid(row=1, column=1, padx=4, pady=2)
 
+        ttk.Label(s, text="ns/div").grid(row=2, column=0, sticky='w', pady=2)
+        self._nsdiv_var = tk.StringVar(value="")
+        ttk.Entry(s, textvariable=self._nsdiv_var, width=7).grid(
+            row=2, column=1, sticky='ew', padx=4, pady=2)
+
+        ttk.Label(s, text="Max pts").grid(row=3, column=0, sticky='w', pady=2)
+        self._maxpts_var = tk.StringVar(value="10000")
+        ttk.Entry(s, textvariable=self._maxpts_var, width=7).grid(
+            row=3, column=1, sticky='ew', padx=4, pady=2)
+
         for row, (lbl, cmd) in enumerate([
                 ("Plot Waveform",  self._plot_waveform),
-                ("Live View: OFF", self._toggle_live)], start=2):
+                ("Live View: OFF", self._toggle_live)], start=4):
             btn = ttk.Button(s, text=lbl, command=cmd)
             btn.grid(row=row, column=0, columnspan=2, sticky='ew', pady=2)
             if lbl == "Live View: OFF":
@@ -249,7 +259,7 @@ class LabGUI:
             self._action_btns.append(btn)
 
         ttk.Button(s, text="Stop", command=self._stop).grid(
-            row=4, column=0, columnspan=2, sticky='ew', pady=2)
+            row=6, column=0, columnspan=2, sticky='ew', pady=2)
 
     # ── Sweep panel ────────────────────────────────────────────────
 
@@ -505,6 +515,21 @@ class LabGUI:
 
     # ── Waveform capture ───────────────────────────────────────────
 
+    def _apply_timebase(self):
+        """Send ns/div to scope if the field is filled in."""
+        val = self._nsdiv_var.get().strip()
+        if val and self.scope:
+            try:
+                self.scope.set_timebase_direct(float(val) * 1e-9)
+            except Exception as e:
+                print(f"Timebase error: {e}\n")
+
+    def _scope_max_pts(self):
+        try:
+            return int(self._maxpts_var.get())
+        except ValueError:
+            return 10000
+
     def _plot_waveform(self):
         print("Plot waveform clicked\n")
         if not self._need_scope(): return
@@ -513,7 +538,8 @@ class LabGUI:
         def capture():
             self._set_busy(True)
             try:
-                t, v = self.scope.get_waveform(channel=ch)
+                self._apply_timebase()
+                t, v = self.scope.get_waveform(channel=ch, max_points=self._scope_max_pts())
 
                 n, dt = len(v), t[1] - t[0]
                 freqs    = np.fft.rfftfreq(n, dt)
@@ -559,9 +585,11 @@ class LabGUI:
 
     def _live_loop(self, gen):
         ch = int(self._chan_var.get())
+        self._apply_timebase()
+        max_pts = self._scope_max_pts()
         while self._live_running and self._live_gen == gen:
             try:
-                t, v = self.scope.get_waveform(channel=ch)
+                t, v = self.scope.get_waveform(channel=ch, max_points=max_pts)
 
                 n, dt = len(v), t[1] - t[0]
                 freqs    = np.fft.rfftfreq(n, dt)
@@ -589,7 +617,7 @@ class LabGUI:
                         wrap=True)
                 self._redraw()
 
-            threading.Event().wait(0.2)
+            threading.Event().wait(0.05)
 
         if self._live_gen == gen:
             self._live_running = False
