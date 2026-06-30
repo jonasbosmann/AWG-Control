@@ -459,6 +459,12 @@ class LabGUI:
                 t_pre2 = _time.perf_counter()
                 print(f"  sweep_preload: {(t_pre2-t_pre1):.1f} s\n")
 
+                if self.scope is not None:
+                    n_avg = int(self._avg_var.get())
+                    ch    = int(self._chan_var.get())
+                    self.scope.setup(channel=ch, n_averages=n_avg)
+                    print(f"  scope: CH{ch}, {n_avg}× avg\n")
+
                 ref_vpp = None
                 freqs_plot, losses_plot = [], []
 

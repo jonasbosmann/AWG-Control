@@ -84,7 +84,7 @@ class Scope:
         voltage_v = raw * self._pre['ymult'] + self._pre['yzero']
         return time_s, voltage_v
 
-    def measure_vpp(self, channel=1, settle=0.1, acq_timeout=3.0):
+    def measure_vpp(self, channel=1, settle=0.1, acq_timeout=30.0):
         """Capture one fresh acquisition and return RMS-based Vpp.
 
         Sequence:
