@@ -117,7 +117,7 @@ class Scope:
             self._dev.write(f"DATa:SOUrce CH{channel}")
             self._dev.write("DATa:ENCdg ASCIi")
             self._dev.write("DATa:STARt 1")
-            pts = min(2000, self._pre['rl'])
+            pts = self._pre['rl']   # download full record — consistent cycle count
             self._dev.write(f"DATa:STOP {pts}")
             raw_str = self._dev.query("CURVe?")
             self._dev.write("ACQuire:STOPAfter RUNSTop")
