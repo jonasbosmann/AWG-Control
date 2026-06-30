@@ -46,12 +46,6 @@ class Scope:
             self._dev.write(f"TRIGger:A:LEVEL:CH{channel} 0.0")
             self._dev.write("ACQuire:STOPAfter RUNSTop")
             self._dev.write("ACQuire:STATE RUN")
-            # PK2PK named measurement for sweep. CURRentacq:MEAN? returns immediately
-            # on LAN (ACQuire:STATE RUN only blocks USB reads, not LAN socket reads).
-            self._dev.write("MEASUrement:DELETEALL")
-            self._dev.write('MEASUrement:ADDNew "MEAS1"')
-            self._dev.write(f"MEASUrement:MEAS1:TYPe PK2PK")
-            self._dev.write(f"MEASUrement:MEAS1:SOURCE CH{channel}")
         self._pre.clear()
         mode = f"{n_averages}× avg" if n_averages > 1 else "sample"
         print(f"Scope: CH{channel} @ 50 Ω, {mode}\n")
@@ -90,14 +84,39 @@ class Scope:
         voltage_v = raw * self._pre['ymult'] + self._pre['yzero']
         return time_s, voltage_v
 
-    def measure_vpp(self, channel=1, settle=0.1):
-        """Query PK2PK from MEAS1 — scope keeps running, no stop/start disruption."""
-        time.sleep(settle)
+    def measure_vpp(self, channel=1, settle=0.0, timeout_ms=1000):
+        """Capture one fresh acquisition (SEQuence + *OPC?) and return PK2PK voltage.
+
+        The scope is told to capture after this function is called, so the waveform
+        is guaranteed to be at the current AWG frequency — no settle-time guessing.
+        TCP command ordering ensures HORizontal:SCAle is applied before the trigger fires.
+        """
+        if settle > 0:
+            time.sleep(settle)
         with self._lock:
-            val = float(self._dev.query("MEASUrement:MEAS1:RESUlts:CURRentacq:MEAN?"))
-        if val > 1e30:
-            return float('nan')
-        return val
+            self._dev.write("ACQuire:STOPAfter SEQuence")
+            self._dev.write("ACQuire:STATE RUN")
+            old_to = self._dev.timeout
+            self._dev.timeout = timeout_ms
+            try:
+                self._dev.query("*OPC?")   # blocks until the one acquisition completes
+            except Exception:
+                pass   # timeout = no trigger; fall through and read whatever is there
+            finally:
+                self._dev.timeout = old_to
+            self._dev.write(f"DATa:SOUrce CH{channel}")
+            self._dev.write("DATa:ENCdg ASCIi")
+            self._dev.write("DATa:STARt 1")
+            pts = min(500, self._pre.get('rl', 500))
+            self._dev.write(f"DATa:STOP {pts}")
+            raw_str = self._dev.query("CURVe?")
+            # Restart continuous acquisition so live view keeps working
+            self._dev.write("ACQuire:STOPAfter RUNSTop")
+            self._dev.write("ACQuire:STATE RUN")
+        raw = np.array([int(x) for x in raw_str.split(',')])
+        ymult = self._pre.get('ymult', 1.0)
+        yzero = self._pre.get('yzero', 0.0)
+        return float(np.ptp(raw * ymult + yzero))
 
     def close(self):
         self._dev.close()
