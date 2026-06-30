@@ -481,8 +481,8 @@ class LabGUI:
                         self.scope.set_timebase(actual, n_cycles=n_cycles)
                         t3 = _time.perf_counter()
                         print(f"  set_timebase: {(t3-t2)*1000:.0f} ms\n")
-                        vpp = self.scope.measure_vpp(channel=int(self._chan_var.get()),
-                                                          settle=settle_s)
+                        vpp, wt, wv = self.scope.measure_vpp(
+                            channel=int(self._chan_var.get()), settle=settle_s)
                         t4 = _time.perf_counter()
                         print(f"  measure_vpp: {(t4-t3)*1000:.0f} ms\n")
                         if ref_vpp is None:
@@ -491,19 +491,24 @@ class LabGUI:
                         print(f"{f/1e6:>14.1f}  {actual/1e6:>14.3f}  {vpp*1e3:>10.1f}  {loss:>10.2f}")
                         freqs_plot.append(actual / 1e6)
                         losses_plot.append(loss)
+
+                        # Live per-step plot: waveform on top, loss curve on bottom
+                        self._fig.clear()
+                        ax1 = self._fig.add_subplot(211)
+                        ax1.plot(wt * 1e9, wv * 1e3)
+                        ax1.set_xlabel("Time (ns)")
+                        ax1.set_ylabel("Voltage (mV)")
+                        ax1.set_title(f"{actual/1e6:.3f} MHz — Vpp {vpp*1e3:.1f} mV")
+                        ax1.grid(True)
+                        ax2 = self._fig.add_subplot(212)
+                        ax2.plot(freqs_plot, losses_plot, 'o-')
+                        ax2.set_xlabel("Frequency (MHz)")
+                        ax2.set_ylabel("Loss (dB)")
+                        ax2.grid(True)
+                        self._fig.tight_layout()
+                        self._redraw()
                     else:
                         print(f"{f/1e6:>14.1f}  {actual/1e6:>14.3f}  {'(no scope)':>10}")
-
-                if freqs_plot:
-                    self._fig.clear()
-                    ax = self._fig.add_subplot(111)
-                    ax.plot(freqs_plot, losses_plot, 'o-')
-                    ax.set_xlabel("Frequency (MHz)")
-                    ax.set_ylabel("Loss (dB)")
-                    ax.set_title("Amplitude vs Frequency")
-                    ax.grid(True)
-                    self._fig.tight_layout()
-                    self._redraw()
 
                 print("Sweep done.\n")
             except Exception as e:

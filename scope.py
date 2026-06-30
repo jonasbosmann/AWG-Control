@@ -124,9 +124,11 @@ class Scope:
             self._dev.write("ACQuire:STATE RUN")
         raw = np.array([int(x) for x in raw_str.split(',')])
         v = raw * self._pre['ymult'] + self._pre['yzero']
+        t = np.arange(len(raw)) * self._pre['xincr']
         v_ac = v - np.mean(v)
         vrms = np.sqrt(np.mean(v_ac ** 2))
-        return float(2.0 * np.sqrt(2.0) * vrms)   # Vpp = 2√2 · Vrms for sine
+        vpp = float(2.0 * np.sqrt(2.0) * vrms)    # Vpp = 2√2 · Vrms for sine
+        return vpp, t, v
 
     def close(self):
         self._dev.close()
