@@ -1,0 +1,6 @@
+# Python bytecode cache (auto-generated)
+__pycache__/
+*.py[cod]
+
+# Local resources (Tabor manuals/PDFs, large binaries)
+resources/
