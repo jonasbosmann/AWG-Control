@@ -1,8 +1,9 @@
 import tkinter as tk
-from tkinter import ttk, scrolledtext
+from tkinter import ttk, scrolledtext, filedialog
 import threading
 import queue
 import sys
+import os
 import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
@@ -10,6 +11,7 @@ from matplotlib.figure import Figure
 from awg import AWG, SAMPLE_RATE_SINGLE, SAMPLE_RATE_DUAL
 from scope import Scope
 from measure import DEFAULT_FREQS
+import sweeplog
 
 
 class _LogRedirect:
@@ -47,6 +49,7 @@ class LabGUI:
         self._sweep_stop   = threading.Event()
         self._action_btns  = []   # all buttons disabled while busy (except Stop)
         self._live_win     = None
+        self._setup_photo  = None  # path to current microwave-chain setup photo
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
 
@@ -109,6 +112,7 @@ class LabGUI:
         self._build_chirp_panel(ctrl)
         self._build_duc_panel(ctrl)
         self._build_scope_panel(ctrl)
+        self._build_setup_panel(ctrl)
         self._build_sweep_panel(ctrl)
 
     # ── Standard Waveform panel ───────────────────────────────────
@@ -317,6 +321,67 @@ class LabGUI:
         live_btn = ttk.Button(s, text="Live View…", command=self._open_live_view)
         live_btn.grid(row=5, column=0, columnspan=2, sticky='ew', pady=2)
         self._action_btns.append(live_btn)
+
+    # ── Setup (microwave-chain configuration) panel ────────────────
+
+    def _build_setup_panel(self, parent):
+        f = ttk.LabelFrame(parent, text="Setup  (microwave chain)", padding=8)
+        f.pack(fill='x', pady=(0, 6))
+        f.columnconfigure(1, weight=1)
+
+        ttk.Label(f, text="Name").grid(row=0, column=0, sticky='w', pady=1)
+        self._setup_name_var = tk.StringVar(value="config_A")
+        ttk.Entry(f, textvariable=self._setup_name_var, width=8).grid(
+            row=0, column=1, sticky='ew', padx=(4, 0), pady=1)
+
+        ttk.Label(f, text="Description").grid(row=1, column=0, sticky='nw', pady=1)
+        self._setup_desc = tk.Text(f, width=8, height=4, wrap='word')
+        self._setup_desc.grid(row=1, column=1, sticky='ew', padx=(4, 0), pady=1)
+        self._setup_desc.insert('1.0', "AWG CH1 -> x24 AMC -> ...")
+
+        self._photo_lbl = ttk.Label(f, text="Photo: none", foreground='gray',
+                                    font=('Courier', 8), wraplength=200)
+        self._photo_lbl.grid(row=2, column=0, columnspan=2, sticky='w', pady=(4, 1))
+
+        pb = ttk.Frame(f)
+        pb.grid(row=3, column=0, columnspan=2, sticky='ew')
+        pb.columnconfigure((0, 1), weight=1)
+        ttk.Button(pb, text="Browse Photo…", command=self._browse_photo).grid(
+            row=0, column=0, sticky='ew', padx=(0, 2))
+        ttk.Button(pb, text="Show Setup", command=self._show_setup_photo).grid(
+            row=0, column=1, sticky='ew', padx=(2, 0))
+
+    def _browse_photo(self):
+        path = filedialog.askopenfilename(
+            title="Select setup photo",
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.gif"), ("All files", "*.*")])
+        if path:
+            self._setup_photo = path
+            self._photo_lbl.config(text=f"Photo: {os.path.basename(path)}",
+                                   foreground='black')
+
+    def _show_setup_photo(self):
+        if not self._setup_photo or not os.path.isfile(self._setup_photo):
+            print("No setup photo selected.\n")
+            return
+        try:
+            from PIL import Image
+            img = np.asarray(Image.open(self._setup_photo))
+            self._fig.clear()
+            ax = self._fig.add_subplot(111)
+            ax.imshow(img)
+            ax.set_title(self._setup_name_var.get())
+            ax.axis('off')
+            self._fig.tight_layout()
+            self._redraw()
+        except Exception as e:
+            print(f"Could not show setup photo: {e}\n")
+
+    def _setup_meta(self):
+        """Current setup fields as (name, description, photo_path)."""
+        return (self._setup_name_var.get(),
+                self._setup_desc.get('1.0', 'end').strip(),
+                self._setup_photo)
 
     # ── Sweep panel ────────────────────────────────────────────────
 
@@ -544,8 +609,13 @@ class LabGUI:
             self._set_busy(False)
             return
 
+        name, desc, photo = self._setup_meta()
+
         def sweep():
             self._sweep_stop.clear()
+            records = []
+            n_avg = int(self._sweep_avg_var.get())
+            scope_ch = int(self._sweep_chan_var.get())
             try:
                 # Pre-load all segments once; the sweep loop then just switches
                 import time as _time
@@ -559,10 +629,8 @@ class LabGUI:
                 print(f"  sweep_preload: {(t_pre2-t_pre1):.1f} s\n")
 
                 if self.scope is not None:
-                    n_avg = int(self._sweep_avg_var.get())
-                    ch    = int(self._sweep_chan_var.get())
-                    self.scope.setup(channel=ch, n_averages=n_avg)
-                    print(f"  scope: CH{ch}, {n_avg}× avg\n")
+                    self.scope.setup(channel=scope_ch, n_averages=n_avg)
+                    print(f"  scope: CH{scope_ch}, {n_avg}× avg\n")
 
                 ref_vpp = None
                 freqs_plot, losses_plot = [], []
@@ -587,7 +655,7 @@ class LabGUI:
                         t3 = _time.perf_counter()
                         print(f"  set_timebase: {(t3-t2)*1000:.0f} ms\n")
                         vpp, wt, wv = self.scope.measure_vpp(
-                            channel=int(self._sweep_chan_var.get()), settle=settle_s)
+                            channel=scope_ch, settle=settle_s)
                         t4 = _time.perf_counter()
                         print(f"  measure_vpp: {(t4-t3)*1000:.0f} ms\n")
                         if ref_vpp is None:
@@ -596,6 +664,13 @@ class LabGUI:
                         print(f"{f/1e6:>14.1f}  {actual/1e6:>14.3f}  {vpp*1e3:>10.1f}  {loss:>10.2f}")
                         freqs_plot.append(actual / 1e6)
                         losses_plot.append(loss)
+
+                        dt_s = float(wt[1] - wt[0]) if len(wt) > 1 else 0.0
+                        records.append({
+                            "target_hz": f, "actual_hz": actual,
+                            "vpp_v": vpp, "loss_db": loss,
+                            "dt_s": dt_s, "voltage": wv,
+                        })
 
                         # Live per-step plot: waveform on top, loss curve on bottom
                         self._fig.clear()
@@ -619,6 +694,17 @@ class LabGUI:
             except Exception as e:
                 print(f"Sweep error: {e}\n")
             finally:
+                if records:
+                    try:
+                        params = {
+                            "amplitude_vpp": amp, "awg_ch": awg_ch,
+                            "scope_ch": scope_ch, "n_averages": n_avg,
+                            "settle_ms": settle_s * 1000.0, "cycles_shown": n_cycles,
+                        }
+                        path = sweeplog.save_sweep(name, desc, photo, params, records)
+                        print(f"Saved {len(records)} points -> {path}\n")
+                    except Exception as e:
+                        print(f"Could not save sweep: {e}\n")
                 self._set_busy(False)
 
         self._thread(sweep)

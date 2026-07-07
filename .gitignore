@@ -4,3 +4,6 @@ __pycache__/
 
 # Local resources (Tabor manuals/PDFs, large binaries)
 resources/
+
+# Saved sweep measurements (experimental data)
+sweeps/
