@@ -46,12 +46,16 @@ class LabGUI:
         self._live_gen     = 0
         self._sweep_stop   = threading.Event()
         self._action_btns  = []   # all buttons disabled while busy (except Stop)
+        self._live_win     = None
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
 
     def _on_closing(self):
         self._live_running = False
         self._sweep_stop.set()
+        if self._live_win is not None:
+            try: self._live_win.destroy()
+            except Exception: pass
         if self.scope:
             try: self.scope.close()
             except Exception: pass
@@ -71,6 +75,11 @@ class LabGUI:
         ttk.Button(conn, text="Connect Scope", command=self._connect_scope).pack(side='left', padx=4)
         self._scope_lbl = ttk.Label(conn, text="Scope: disconnected", foreground='red')
         self._scope_lbl.pack(side='left', padx=(0, 16))
+
+        stop_btn = tk.Button(conn, text="STOP ALL", command=self._stop,
+                             bg='red', fg='white', font=('', 10, 'bold'),
+                             relief='raised', padx=8)
+        stop_btn.pack(side='right', padx=8)
 
         main = ttk.Frame(self.root)
         main.pack(fill='both', expand=True, padx=8, pady=4)
@@ -98,6 +107,7 @@ class LabGUI:
 
         self._build_std_waveform(ctrl)
         self._build_chirp_panel(ctrl)
+        self._build_duc_panel(ctrl)
         self._build_scope_panel(ctrl)
         self._build_sweep_panel(ctrl)
 
@@ -222,6 +232,60 @@ class LabGUI:
         except (ValueError, AttributeError, ZeroDivisionError):
             pass
 
+    # ── DUC Chirp + CW panel (upconverted, IQM ONE mode) ─────────
+
+    def _build_duc_panel(self, parent):
+        f = ttk.LabelFrame(parent, text="DUC Chirp + CW  (upconverted, IQM ONE)", padding=8)
+        f.pack(fill='x', pady=(0, 6))
+        f.columnconfigure(1, weight=1)
+
+        # Carrier = NCO frequency for CH1.  BB start/stop = baseband offsets from carrier.
+        # RF output sweeps (carrier + BB_start) → (carrier + BB_stop).
+        # DAC clock 9 GS/s (x8 interp): max carrier ~4.5 GHz (Nyquist); BB_stop ≤ ~560 MHz
+        # (Nyquist of the 1.125 GS/s complex baseband rate).
+        duc_fields = [
+            ("Carrier     (MHz)", "duc_carrier",   "2000"),
+            ("BB start    (MHz)", "duc_bb_start",  "0"),
+            ("BB stop     (MHz)", "duc_bb_stop",   "500"),
+            ("Chirp dur   (µs)",  "duc_chirp_dur", "1.0"),
+            ("Dead time   (µs)",  "duc_dead",      "0.1"),
+            ("LO freq     (MHz)", "duc_lo",        "2300"),
+            ("Detect win  (µs)",  "duc_detect",    "10.0"),
+            ("Amplitude   (Vpp)", "duc_amp",       "0.5"),
+        ]
+        for row, (lbl, attr, default) in enumerate(duc_fields):
+            ttk.Label(f, text=lbl).grid(row=row, column=0, sticky='w', pady=1)
+            var = tk.StringVar(value=default)
+            setattr(self, f"_{attr}_var", var)
+            e = ttk.Entry(f, textvariable=var, width=8)
+            e.grid(row=row, column=1, sticky='ew', padx=(4, 0), pady=1)
+            var.trace_add('write', lambda *_: self._update_duc_info())
+
+        r = len(duc_fields)
+        ttk.Separator(f, orient='horizontal').grid(row=r, column=0, columnspan=2,
+                                                    sticky='ew', pady=4)
+        self._duc_info = ttk.Label(f, text="", foreground='gray', font=('Courier', 8))
+        self._duc_info.grid(row=r+1, column=0, columnspan=2, sticky='w')
+
+        duc_btn = ttk.Button(f, text="DUC Chirp+CW",
+                             command=self._run_chirp_duc)
+        duc_btn.grid(row=r+2, column=0, columnspan=2, sticky='ew', pady=(6, 2))
+        self._action_btns.append(duc_btn)
+
+        self._update_duc_info()
+
+    def _update_duc_info(self):
+        try:
+            carrier  = float(self._duc_carrier_var.get())
+            bb_start = float(self._duc_bb_start_var.get())
+            bb_stop  = float(self._duc_bb_stop_var.get())
+            f_lo     = float(self._duc_lo_var.get())
+            self._duc_info.config(
+                text=f"CH1 RF: {carrier+bb_start:.1f} → {carrier+bb_stop:.1f} MHz"
+                     f"   CH2 LO: {f_lo:.3f} MHz (NCO exact)")
+        except (ValueError, AttributeError):
+            pass
+
     # ── Scope Monitor panel ────────────────────────────────────────
 
     def _build_scope_panel(self, parent):
@@ -233,33 +297,26 @@ class LabGUI:
         ttk.Combobox(s, textvariable=self._chan_var, values=["1", "2"],
                      width=4, state='readonly').grid(row=0, column=1, padx=4, pady=2)
 
-        ttk.Label(s, text="Averages").grid(row=1, column=0, sticky='w', pady=2)
-        self._avg_var = tk.StringVar(value="1")
-        ttk.Combobox(s, textvariable=self._avg_var,
-                     values=["1", "8", "16", "64", "256", "512"],
-                     width=6, state='readonly').grid(row=1, column=1, padx=4, pady=2)
-
-        ttk.Label(s, text="ns/div").grid(row=2, column=0, sticky='w', pady=2)
+        ttk.Label(s, text="ns/div").grid(row=1, column=0, sticky='w', pady=2)
         self._nsdiv_var = tk.StringVar(value="")
         ttk.Entry(s, textvariable=self._nsdiv_var, width=7).grid(
-            row=2, column=1, sticky='ew', padx=4, pady=2)
+            row=1, column=1, sticky='ew', padx=4, pady=2)
 
-        ttk.Label(s, text="Max pts").grid(row=3, column=0, sticky='w', pady=2)
+        ttk.Label(s, text="Max pts").grid(row=2, column=0, sticky='w', pady=2)
         self._maxpts_var = tk.StringVar(value="10000")
         ttk.Entry(s, textvariable=self._maxpts_var, width=7).grid(
-            row=3, column=1, sticky='ew', padx=4, pady=2)
+            row=2, column=1, sticky='ew', padx=4, pady=2)
 
-        for row, (lbl, cmd) in enumerate([
-                ("Plot Waveform",  self._plot_waveform),
-                ("Live View: OFF", self._toggle_live)], start=4):
-            btn = ttk.Button(s, text=lbl, command=cmd)
-            btn.grid(row=row, column=0, columnspan=2, sticky='ew', pady=2)
-            if lbl == "Live View: OFF":
-                self._live_btn = btn
-            self._action_btns.append(btn)
+        ttk.Button(s, text="Setup Scope", command=self._setup_scope).grid(
+            row=3, column=0, columnspan=2, sticky='ew', pady=2)
 
-        ttk.Button(s, text="Stop", command=self._stop).grid(
-            row=6, column=0, columnspan=2, sticky='ew', pady=2)
+        plot_btn = ttk.Button(s, text="Plot Waveform", command=self._plot_waveform)
+        plot_btn.grid(row=4, column=0, columnspan=2, sticky='ew', pady=2)
+        self._action_btns.append(plot_btn)
+
+        live_btn = ttk.Button(s, text="Live View…", command=self._open_live_view)
+        live_btn.grid(row=5, column=0, columnspan=2, sticky='ew', pady=2)
+        self._action_btns.append(live_btn)
 
     # ── Sweep panel ────────────────────────────────────────────────
 
@@ -268,18 +325,29 @@ class LabGUI:
         w.pack(fill='x', pady=(0, 6))
         w.columnconfigure(1, weight=1)
 
-        ttk.Label(w, text="Settle (ms)").grid(row=0, column=0, sticky='w', pady=2)
+        ttk.Label(w, text="Scope CH").grid(row=0, column=0, sticky='w', pady=2)
+        self._sweep_chan_var = tk.StringVar(value="1")
+        ttk.Combobox(w, textvariable=self._sweep_chan_var, values=["1", "2"],
+                     width=4, state='readonly').grid(row=0, column=1, sticky='ew', padx=(4, 0), pady=2)
+
+        ttk.Label(w, text="Averages").grid(row=1, column=0, sticky='w', pady=2)
+        self._sweep_avg_var = tk.StringVar(value="1")
+        ttk.Combobox(w, textvariable=self._sweep_avg_var,
+                     values=["1", "8", "16", "64", "256", "512"],
+                     width=6, state='readonly').grid(row=1, column=1, sticky='ew', padx=(4, 0), pady=2)
+
+        ttk.Label(w, text="Settle (ms)").grid(row=2, column=0, sticky='w', pady=2)
         self._settle_var = tk.StringVar(value="50")
         ttk.Entry(w, textvariable=self._settle_var, width=6).grid(
-            row=0, column=1, sticky='ew', padx=(4, 0), pady=2)
+            row=2, column=1, sticky='ew', padx=(4, 0), pady=2)
 
-        ttk.Label(w, text="Cycles shown").grid(row=1, column=0, sticky='w', pady=2)
+        ttk.Label(w, text="Cycles shown").grid(row=3, column=0, sticky='w', pady=2)
         self._cycles_var = tk.StringVar(value="8")
         ttk.Entry(w, textvariable=self._cycles_var, width=6).grid(
-            row=1, column=1, sticky='ew', padx=(4, 0), pady=2)
+            row=3, column=1, sticky='ew', padx=(4, 0), pady=2)
 
         btn = ttk.Button(w, text="Frequency Sweep", command=self._run_sweep)
-        btn.grid(row=2, column=0, columnspan=2, sticky='ew', pady=(6, 2))
+        btn.grid(row=4, column=0, columnspan=2, sticky='ew', pady=(6, 2))
         self._sweep_btn = btn
         self._action_btns.append(btn)
 
@@ -314,9 +382,15 @@ class LabGUI:
         return self._MODE_TO_RATE.get(self._rate_var.get(), SAMPLE_RATE_SINGLE)
 
     def _set_busy(self, busy):
+        if busy and self._live_running:
+            self._live_running = False
+            self._live_gen += 1
         state = 'disabled' if busy else 'normal'
         for btn in self._action_btns:
-            self.root.after(0, lambda b=btn: b.config(state=state))
+            try:
+                self.root.after(0, lambda b=btn: b.config(state=state))
+            except Exception:
+                pass
 
     def _redraw(self):
         self.root.after(0, self._canvas.draw)
@@ -357,8 +431,7 @@ class LabGUI:
         def connect():
             try:
                 self.scope = Scope()
-                n_avg = int(self._avg_var.get())
-                self.scope.setup(channel=int(self._chan_var.get()), n_averages=n_avg)
+                self.scope.setup(channel=int(self._chan_var.get()), n_averages=1)
                 self._status(self._scope_lbl, "Scope: connected", "green")
             except Exception as e:
                 print(f"Scope connection failed: {e}\n")
@@ -421,12 +494,38 @@ class LabGUI:
                 self._set_busy(False)
         self._thread(run)
 
+    def _run_chirp_duc(self):
+        if not self._need_awg(): return
+        try:
+            f_carrier  = float(self._duc_carrier_var.get())   * 1e6
+            f_start_bb = float(self._duc_bb_start_var.get())  * 1e6
+            f_stop_bb  = float(self._duc_bb_stop_var.get())   * 1e6
+            chirp_us   = float(self._duc_chirp_dur_var.get())
+            dead_us    = float(self._duc_dead_var.get())
+            f_lo       = float(self._duc_lo_var.get())         * 1e6
+            detect_us  = float(self._duc_detect_var.get())
+            amp        = float(self._duc_amp_var.get())
+        except ValueError as e:
+            print(f"Invalid DUC chirp parameter: {e}\n")
+            return
+
+        self._set_busy(True)
+        def run():
+            try:
+                self.awg.send_chirp_with_lo_duc(
+                    f_carrier, f_start_bb, f_stop_bb, chirp_us, dead_us,
+                    f_lo, detect_us, amplitude_vpp=amp)
+            except Exception as e:
+                print(f"DUC chirp error: {e}\n")
+            finally:
+                self._set_busy(False)
+        self._thread(run)
+
     def _stop(self):
         self._sweep_stop.set()
         self._live_running = False
         self._live_gen += 1
         self._set_busy(False)
-        self.root.after(0, lambda: self._live_btn.config(text="Live View: OFF"))
         if not self._need_awg(): return
         self._thread(self.awg.stop)
 
@@ -460,8 +559,8 @@ class LabGUI:
                 print(f"  sweep_preload: {(t_pre2-t_pre1):.1f} s\n")
 
                 if self.scope is not None:
-                    n_avg = int(self._avg_var.get())
-                    ch    = int(self._chan_var.get())
+                    n_avg = int(self._sweep_avg_var.get())
+                    ch    = int(self._sweep_chan_var.get())
                     self.scope.setup(channel=ch, n_averages=n_avg)
                     print(f"  scope: CH{ch}, {n_avg}× avg\n")
 
@@ -488,7 +587,7 @@ class LabGUI:
                         t3 = _time.perf_counter()
                         print(f"  set_timebase: {(t3-t2)*1000:.0f} ms\n")
                         vpp, wt, wv = self.scope.measure_vpp(
-                            channel=int(self._chan_var.get()), settle=settle_s)
+                            channel=int(self._sweep_chan_var.get()), settle=settle_s)
                         t4 = _time.perf_counter()
                         print(f"  measure_vpp: {(t4-t3)*1000:.0f} ms\n")
                         if ref_vpp is None:
@@ -523,6 +622,21 @@ class LabGUI:
                 self._set_busy(False)
 
         self._thread(sweep)
+
+    # ── Scope setup ────────────────────────────────────────────────
+
+    def _setup_scope(self):
+        if not self._need_scope(): return
+        ch = int(self._chan_var.get())
+        def do_setup():
+            self._set_busy(True)
+            try:
+                self.scope.setup(channel=ch, n_averages=1)
+            except Exception as e:
+                print(f"Setup error: {e}\n")
+            finally:
+                self._set_busy(False)
+        self._thread(do_setup)
 
     # ── Waveform capture ───────────────────────────────────────────
 
@@ -580,17 +694,46 @@ class LabGUI:
 
     # ── Live view ──────────────────────────────────────────────────
 
+    def _open_live_view(self):
+        if not self._need_scope(): return
+        if self._live_win is not None and self._live_win.winfo_exists():
+            self._live_win.lift()
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Scope — Live View")
+        win.geometry("900x620")
+        self._live_win = win
+
+        ctrl = ttk.Frame(win, padding=4)
+        ctrl.pack(fill='x', side='bottom')
+        self._live_start_btn = ttk.Button(ctrl, text="Start", command=self._toggle_live)
+        self._live_start_btn.pack(side='left', padx=4)
+        self._action_btns.append(self._live_start_btn)
+
+        self._live_fig = Figure(figsize=(8, 5), dpi=90)
+        self._live_canvas = FigureCanvasTkAgg(self._live_fig, master=win)
+        self._live_canvas.get_tk_widget().pack(fill='both', expand=True)
+
+        def on_close():
+            self._live_running = False
+            self._live_gen += 1
+            if self._live_start_btn in self._action_btns:
+                self._action_btns.remove(self._live_start_btn)
+            win.destroy()
+            self._live_win = None
+        win.protocol("WM_DELETE_WINDOW", on_close)
+
     def _toggle_live(self):
-        print("Live view clicked\n")
         if not self._need_scope(): return
         if self._live_running:
             self._live_running = False
             self._live_gen += 1
-            self.root.after(0, lambda: self._live_btn.config(text="Live View: OFF"))
+            self.root.after(0, lambda: self._live_start_btn.config(text="Start"))
         else:
             self._live_running = True
             self._live_gen += 1
-            self.root.after(0, lambda: self._live_btn.config(text="Live View: ON"))
+            self.root.after(0, lambda: self._live_start_btn.config(text="Stop"))
             gen = self._live_gen
             self._thread(lambda: self._live_loop(gen))
 
@@ -606,33 +749,28 @@ class LabGUI:
                 freqs    = np.fft.rfftfreq(n, dt)
                 spectrum = 20 * np.log10(np.abs(np.fft.rfft(v)) * 2 / n + 1e-12)
 
-                self._fig.clear()
-                ax1 = self._fig.add_subplot(211)
+                self._live_fig.clear()
+                ax1 = self._live_fig.add_subplot(211)
                 ax1.plot(t * 1e9, v * 1e3)
                 ax1.set_xlabel("Time (ns)"); ax1.set_ylabel("Voltage (mV)"); ax1.grid(True)
 
-                ax2 = self._fig.add_subplot(212)
+                ax2 = self._live_fig.add_subplot(212)
                 ax2.plot(freqs * 1e-6, spectrum)
                 ax2.set_xlabel("Frequency (MHz)"); ax2.set_ylabel("Amplitude (dBV)")
                 ax2.grid(True)
 
-                self._fig.tight_layout()
-                self._redraw()
+                self._live_fig.tight_layout()
+                self.root.after(0, self._live_canvas.draw_idle)
 
             except Exception as e:
                 print(f"Live view error: {e}\n")
-                self._fig.clear()
-                ax = self._fig.add_subplot(111)
-                ax.text(0.5, 0.5, str(e), transform=ax.transAxes,
-                        ha='center', va='center', color='red', fontsize=9,
-                        wrap=True)
-                self._redraw()
 
             threading.Event().wait(0.05)
 
         if self._live_gen == gen:
             self._live_running = False
-            self.root.after(0, lambda: self._live_btn.config(text="Live View: OFF"))
+            if self._live_win is not None and self._live_win.winfo_exists():
+                self.root.after(0, lambda: self._live_start_btn.config(text="Start"))
 
 
 if __name__ == "__main__":

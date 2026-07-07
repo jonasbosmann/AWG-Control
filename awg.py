@@ -246,6 +246,216 @@ class AWG:
 
         return n_chirp / rate, f_lo_hz
 
+    def send_chirp_with_lo_duc(self, f_carrier_chirp_hz, f_start_bb_hz, f_stop_bb_hz,
+                               chirp_us, dead_us, f_lo_hz, detect_us,
+                               amplitude_vpp=0.5, window_frac=0.05):
+        """DUC (IQM ONE) version: simultaneous chirp on CH1 and CW on CH2 at high frequencies.
+
+        CH1: analytic (single-sideband) Gaussian-windowed chirp.
+             NCO carrier = f_carrier_chirp_hz.
+             Baseband sweeps f_start_bb to f_stop_bb → RF output sweeps
+             f_carrier_chirp + f_start_bb to f_carrier_chirp + f_stop_bb.
+        CH2: gated CW at exactly f_lo_hz (NCO carrier = f_lo_hz, I=1 Q=0).
+
+        Both channels use IQM ONE with the DAC clock at 9 GS/s and x8 interpolation.
+        In DUC mode the DAC runs at the interpolated (high) rate while the segment
+        memory holds only the low-rate complex baseband (rate_cx = rate / interp),
+        so BOTH channels stay active (the 2.5 GS/s "dual max" is an ARB/direct-mode
+        memory limit, not a DUC limit). A 9 GS/s clock puts Nyquist at 4.5 GHz, so
+        carriers of 2.0–2.5 GHz are generated cleanly (a 2.5 GS/s clock cannot — the
+        carrier would sit above its 1.25 GHz Nyquist, near the sinc null → no output).
+        """
+        # DUC: DAC clock 9 GS/s, x8 interpolation → complex baseband 1.125 GS/s
+        # (≤ the 1.25 GS/s ONE-mode maximum, §5.9). rate/rate_cx selects :SOUR:INT below.
+        rate    = 9e9                   # DAC sample clock (:FREQ:RAST)
+        rate_cx = rate / 8.0            # 1.125 GS/s complex (baseband) sample rate
+
+        n_chirp  = round(chirp_us  * 1e-6 * rate_cx)
+        n_dead   = round(dead_us   * 1e-6 * rate_cx)
+        n_detect = round(detect_us * 1e-6 * rate_cx)
+        # Segment stores 2×n_total uint16 values; must be multiple of 64 → n_total multiple of 32
+        n_total = max(int(np.ceil((n_chirp + n_dead + n_detect) / 32)) * 32, 64)
+
+        def _gauss_win(n):
+            n_w = max(int(window_frac * n), 1)
+            sig = n_w / 3.0
+            idx = np.arange(n_w, dtype=np.float64)
+            w = np.ones(n)
+            w[:n_w]  = np.exp(-0.5 * ((idx - n_w) / sig) ** 2)
+            w[-n_w:] = np.exp(-0.5 * (idx / sig) ** 2)
+            return w
+
+        # CH1: analytic chirp — I = cos(phase)·win, Q = sin(phase)·win
+        t = np.arange(n_chirp, dtype=np.float64) / rate_cx
+        T = t[-1] if n_chirp > 1 else 1e-9
+        phase = 2 * np.pi * (f_start_bb_hz * t +
+                              (f_stop_bb_hz - f_start_bb_hz) / (2 * T) * t ** 2)
+        win1 = _gauss_win(n_chirp)
+        I1 = np.zeros(n_total);  I1[:n_chirp] = np.cos(phase) * win1
+        Q1 = np.zeros(n_total);  Q1[:n_chirp] = np.sin(phase) * win1
+
+        # CH2: gated CW — I=win during detect window, Q=0 → output at exactly f_lo_hz
+        lo_start = n_chirp + n_dead
+        win2 = _gauss_win(n_detect)
+        I2 = np.zeros(n_total);  I2[lo_start:lo_start + n_detect] = win2
+        Q2 = np.zeros(n_total)
+
+        def _to_u16(I, Q):
+            iq = np.empty(2 * len(I), dtype=np.float64)
+            iq[0::2] = I;  iq[1::2] = Q
+            # np.round before astype so midscale (0.0) maps to exactly 32768, not 32767
+            return np.round((iq + 1.0) * 32767.5).clip(0, 65535).astype(np.uint16)
+
+        ch1_u16 = _to_u16(I1, Q1)
+        ch2_u16 = _to_u16(I2, Q2)
+
+        print(f"[DUC CH1] {(f_carrier_chirp_hz+f_start_bb_hz)/1e6:.3f}→"
+              f"{(f_carrier_chirp_hz+f_stop_bb_hz)/1e6:.3f} MHz  "
+              f"carrier {f_carrier_chirp_hz/1e6:.3f} MHz  "
+              f"active {n_chirp/rate_cx*1e6:.3f} µs  ({n_chirp:,} cx samp)")
+        print(f"[DUC CH2] LO {f_lo_hz/1e6:.6f} MHz (exact NCO)  "
+              f"detect {n_detect/rate_cx*1e6:.3f} µs  "
+              f"dead {n_dead/rate_cx*1e6:.3f} µs  "
+              f"period {n_total/rate_cx*1e6:.3f} µs  ({n_total:,} cx samp)")
+
+        # Interpolation factor: ONE-mode complex (baseband) rate = DAC_rate / INT
+        # (manual §5.4/§5.9). complex rate = FREQ:RAST / INT, must be ≤ 1.25 GS/s.
+        # rate=9 GS/s, rate_cx=1.125 GS/s → INT X8.
+        int_map = {2: "X2", 4: "X4", 8: "X8"}
+        int_kw = int_map[round(rate / rate_cx)]
+
+        def _duc_ch(ch, segnum, data_u16, ncof):
+            # Ordering matches Tabor's "how to program" DUC recipe and avoids two fw
+            # traps found by readback:
+            #  - :SOUR:INT is only valid in DUC mode (err 223 "settings conflict" in DIRECT).
+            #  - :SOUR:IQM ONE validates complex rate = FREQ:RAST/INT ≤ 1.25 GS/s at the
+            #    moment it is issued (err 204 "out of range" if clock is still 9 GHz).
+            # So: set clock to the BASEBAND rate first, switch to DUC, set IQM then INT,
+            # and only then raise the clock to the interpolated (9 GHz) rate.
+            self._cmd(f":INST:CHAN {ch}")
+            self._cmd(f":FREQ:RAST {rate_cx:.0f}")   # baseband rate first
+            self._cmd(":MODE DUC")
+            self._cmd(":SOUR:IQM ONE")               # valid: complex rate = rate_cx ≤ 1.25 GS/s
+            self._cmd(f":SOUR:INT {int_kw}")         # now in DUC mode → no conflict
+            self._cmd(f":FREQ:RAST {rate:.0f}")      # raise to interpolated DAC clock (9 GHz)
+            mode = self._dev.query(":MODE?").strip()
+            iqm  = self._dev.query(":SOUR:IQM?").strip()
+            print(f"  MODE? -> {mode!r}   IQM? -> {iqm!r}")
+            self._cmd(":INIT:CONT ON")
+            self._upload(data_u16, segnum=segnum)
+            self._cmd(f":FUNC:MODE:SEGM {segnum}")
+            self._cmd(f":VOLT {amplitude_vpp:.3f}")
+            self._cmd(":NCO:SIXD1 ON")
+            self._cmd(f":NCO:CFR1 {ncof:.0f}")
+            self._cmd(":OUTP ON")
+            self._cmd(f":FREQ:RAST {rate:.0f}")
+
+        def _dump(ch):
+            # Read back the state that actually determines DUC behaviour, per channel,
+            # AFTER full setup. If IQModulation reads 'NONE' here the interleaved I/Q
+            # data is being misinterpreted (§5.9) -> wrong-frequency/garbled output.
+            self._dev.write(f":INST:CHAN {ch}")
+            print(f"  [CH{ch} state] "
+                  f"MODE={self._dev.query(':MODE?').strip()!r} "
+                  f"IQM={self._dev.query(':SOUR:IQM?').strip()!r} "
+                  f"INT={self._dev.query(':SOUR:INT?').strip()!r} "
+                  f"CFR1={self._dev.query(':NCO:CFR1?').strip()!r} "
+                  f"RAST={self._dev.query(':FREQ:RAST?').strip()!r} "
+                  f"SEGM={self._dev.query(':FUNC:MODE:SEGM?').strip()!r}")
+
+        with self._lock:
+            self._dev.write("*CLS; *RST")
+            time.sleep(0.5)
+            self._dev.query("*OPC?")
+
+            # Diagnostic: confirm the DUC/IQM option is actually installed on this unit.
+            print(f"  *OPT? -> {self._dev.query('*OPT?').strip()!r}")
+
+            # NOTE: :IQModulation must be set per-channel *after* :MODE DUC (done in
+            # _duc_ch). Setting it here, in DIRECT mode, is silently ignored.
+            self._cmd(":INST:CHAN 1")
+            self._cmd(":TRAC:DEL:ALL")
+
+            _duc_ch(1, 1, ch1_u16, f_carrier_chirp_hz)
+            self._active_seg[1] = 1
+            _duc_ch(2, 2, ch2_u16, f_lo_hz)
+            self._active_seg[2] = 2
+
+            # Diagnostic: read back final state on both channels.
+            _dump(1)
+            _dump(2)
+
+        return n_chirp / rate_cx, f_lo_hz
+
+    def send_chirp_with_lo_nco(self, f_carrier_hz, f_start_bb_hz, f_stop_bb_hz,
+                                chirp_us, dead_us, f_lo_hz, detect_us,
+                                amplitude_vpp=0.5, window_frac=0.05):
+        """NCO-mode upconversion — works when IQM ONE is not licensed.
+
+        CH1: real windowed chirp (f_start_bb → f_stop_bb) upconverted by NCO carrier.
+             Output is double-sideband:
+               upper  = f_carrier + f_start_bb  →  f_carrier + f_stop_bb
+               image  = f_carrier - f_stop_bb   →  f_carrier - f_start_bb
+        CH2: gaussian-windowed amplitude envelope gating the NCO carrier → pure
+             CW at exactly f_lo_hz during the detect window, zero elsewhere.
+
+        Both channels run at SAMPLE_RATE_DUAL (2.5 GS/s real sample rate).
+        """
+        rate = SAMPLE_RATE_DUAL
+        n_chirp  = round(chirp_us  * 1e-6 * rate)
+        n_dead   = round(dead_us   * 1e-6 * rate)
+        n_detect = round(detect_us * 1e-6 * rate)
+        n_total  = max(int(np.ceil((n_chirp + n_dead + n_detect) / 64)) * 64, 128)
+
+        # CH1: real chirp — same waveform as direct mode, NCO does the upconversion
+        ch1 = self._chirp_windowed_u16(f_start_bb_hz, f_stop_bb_hz, n_chirp, n_total,
+                                        rate, window_frac)
+
+        # CH2: gaussian-windowed amplitude envelope during detect window, zeros elsewhere.
+        # In NCO mode: output = envelope(t) × cos(2π f_lo t) → gated CW at f_lo.
+        lo_start = n_chirp + n_dead
+        n_win    = max(int(window_frac * n_detect), 1)
+        sig_     = n_win / 3.0
+        idx      = np.arange(n_win, dtype=np.float64)
+        lo_env   = np.zeros(n_total)
+        lo_env[lo_start:lo_start + n_detect]                         = 1.0
+        lo_env[lo_start:lo_start + n_win]                           *= np.exp(-0.5 * ((idx - n_win) / sig_) ** 2)
+        lo_env[lo_start + n_detect - n_win:lo_start + n_detect]     *= np.exp(-0.5 * (idx           / sig_) ** 2)
+        ch2 = np.round((lo_env + 1.0) * 32767.5).clip(0, 65535).astype(np.uint16)
+
+        print(f"[NCO CH1] USB {(f_carrier_hz+f_start_bb_hz)/1e6:.1f}→{(f_carrier_hz+f_stop_bb_hz)/1e6:.1f} MHz  "
+              f"image {(f_carrier_hz-f_stop_bb_hz)/1e6:.1f}→{(f_carrier_hz-f_start_bb_hz)/1e6:.1f} MHz  "
+              f"carrier {f_carrier_hz/1e6:.3f} MHz  active {n_chirp/rate*1e6:.3f} µs")
+        print(f"[NCO CH2] LO {f_lo_hz/1e6:.6f} MHz (NCO exact)  "
+              f"detect {n_detect/rate*1e6:.3f} µs  period {n_total/rate*1e6:.3f} µs")
+
+        def _nco_ch(ch, segnum, data_u16, ncof):
+            self._cmd(f":INST:CHAN {ch}")
+            self._cmd(":MODE NCO")
+            mode_actual = self._dev.query(":MODE?").strip()
+            print(f"  CH{ch} MODE? -> {mode_actual!r}  (expected 'NCO')")
+            self._cmd(f":FREQ:RAST {rate:.0f}")
+            self._cmd(":INIT:CONT ON")
+            self._upload(data_u16, segnum=segnum)
+            self._cmd(f":FUNC:MODE:SEGM {segnum}")
+            self._cmd(f":VOLT {amplitude_vpp:.3f}")
+            self._cmd(":NCO:SIXD1 ON")
+            self._cmd(f":NCO:CFR1 {ncof:.0f}")
+            self._cmd(":OUTP ON")
+
+        with self._lock:
+            self._dev.write("*CLS; *RST")
+            time.sleep(0.5)
+            self._dev.query("*OPC?")
+            self._cmd(":INST:CHAN 1")
+            self._cmd(":TRAC:DEL:ALL")
+            _nco_ch(1, 1, ch1, f_carrier_hz)
+            self._active_seg[1] = 1
+            _nco_ch(2, 2, ch2, f_lo_hz)
+            self._active_seg[2] = 2
+
+        return n_chirp / rate, f_lo_hz
+
     def send_iq_sine(self, frequency_hz=100e6, amplitude_vpp=0.5, exact=False):
         """Output I (sine) on CH1 and Q (cosine, 90° shifted) on CH2 simultaneously.
 

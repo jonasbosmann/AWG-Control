@@ -33,6 +33,7 @@ class Scope:
 
     def setup(self, channel=1, n_averages=1):
         with self._lock:
+            self._dev.write("MEASUrement:DELETEALL")
             self._dev.write(f"CH{channel}:TERmination 50")
             if n_averages > 1:
                 self._dev.write("ACQuire:MODe AVErage")
