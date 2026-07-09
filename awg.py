@@ -16,6 +16,7 @@ class AWG:
         self.n_samples = n_samples   # buffer length; must be multiple of 64
         self._active_seg = {}
         self._sweep_amp  = {}        # tracks last :VOLT sent per channel during sweep
+        self._rate_sent  = {}        # last :FREQ:RAST actually sent per channel
         self._lock = threading.Lock()
         rm = pyvisa.ResourceManager()
         self._dev = rm.open_resource(_RESOURCE)
@@ -42,14 +43,27 @@ class AWG:
         if reset:
             self._dev.write("*CLS; *RST")
             time.sleep(0.5)
+            self._rate_sent.clear()
         self._cmd(f":INST:CHAN {channel}")
+        # A previous DUC run leaves the channel in DUC mode (survives reset=False),
+        # where real waveforms would be misread as interleaved I/Q — force DIRect.
+        if self._dev.query(":MODE?").strip() != "DIR":
+            self._cmd(":MODE DIR")
         self._cmd(f":FREQ:RAST {rate:.0f}")
+        self._rate_sent[channel] = rate
         if reset:
             self._cmd(":TRAC:DEL:ALL")
         self._cmd(":INIT:CONT ON")
 
     def _upload(self, wave_u16, segnum=1):
         n = len(wave_u16)
+        # Proteus limits (prog. manual p.133-134, P948x): segments 1-128 are
+        # "short/fast" segments, minimum 128 points; higher segment numbers are
+        # regular segments, minimum 2048 points. Granularity is 32 points.
+        min_len = 128 if segnum <= 128 else 2048
+        if n < min_len or n % 32:
+            raise ValueError(
+                f"segment {segnum}: length {n} invalid (min {min_len}, multiple of 32)")
         self._cmd(f":TRAC:DEF {segnum},{n}")
         self._cmd(f":TRAC:SEL {segnum}")
         data = wave_u16.tobytes()
@@ -69,10 +83,29 @@ class AWG:
         """Smallest achievable frequency increment at the current buffer size."""
         return self.sample_rate / self.n_samples
 
+    @staticmethod
+    def _real_to_u16(wave):
+        """Direct-mode offset binary: [-1, 1] → 0..65535 (manual §9.1).
+        np.round so midscale (0.0) maps to exactly 32768, not truncated 32767."""
+        return np.round((np.asarray(wave) + 1.0) * 32767.5).clip(0, 65535).astype(np.uint16)
+
+    @staticmethod
+    def _gauss_win(n, frac):
+        """Gaussian-edged flat-top window of length n; edges span frac·n samples.
+        Edge span is capped at n//2 so head and tail can never overlap."""
+        w = np.ones(n)
+        if n < 2:
+            return w
+        n_w = min(max(int(frac * n), 1), n // 2)
+        sigma = n_w / 3.0
+        idx = np.arange(n_w, dtype=np.float64)
+        w[:n_w]  = np.exp(-0.5 * ((idx - n_w) / sigma) ** 2)
+        w[-n_w:] = np.exp(-0.5 * (idx / sigma) ** 2)
+        return w
+
     def _sine_u16(self, cycles):
         t = np.arange(self.n_samples)
-        wave = np.sin(2 * np.pi * cycles * t / self.n_samples)
-        return ((wave + 1.0) * 32767.5).clip(0, 65535).astype(np.uint16)
+        return self._real_to_u16(np.sin(2 * np.pi * cycles * t / self.n_samples))
 
     def _square_u16(self, cycles):
         t = np.arange(self.n_samples)
@@ -87,21 +120,37 @@ class AWG:
     def _cycles(self, frequency_hz):
         return max(round(frequency_hz * self.n_samples / self.sample_rate), 1)
 
+    MIN_RATE = 1e9   # :FREQ:RAST legal range is 1e9–9e9 (manual §5.10)
+
     def _resolve(self, frequency_hz, exact=False):
         """Return (cycles, effective_sample_rate, actual_frequency).
 
         exact=False: keep self.sample_rate, round cycles → frequency error ≤ freq_step/2
-        exact=True:  keep cycles integer, back-calculate sample rate → zero frequency error
-                     (requires hardware to accept a non-standard clock rate)
+        exact=True:  keep cycles integer, back-calculate sample rate → zero frequency error.
+                     The rate is kept within [MIN_RATE, self.sample_rate] (self.sample_rate
+                     is the max for the current channel mode — 9 GS/s single, 2.5 GS/s dual);
+                     if no integer cycle count fits, falls back to the non-exact rate.
         """
-        cycles = self._cycles(frequency_hz)
+        if frequency_hz > self.sample_rate / 2:
+            raise ValueError(
+                f"{frequency_hz/1e6:.1f} MHz is above Nyquist "
+                f"({self.sample_rate/2e6:.0f} MHz at {self.sample_rate/1e9:g} GS/s) — "
+                f"output would alias")
         if exact:
-            rate = frequency_hz * self.n_samples / cycles
-            # If the required rate exceeds hardware max, try one more cycle
-            if rate > SAMPLE_RATE_SINGLE:
-                cycles += 1
-                rate = frequency_hz * self.n_samples / cycles
+            fn = frequency_hz * self.n_samples
+            cyc_min = max(int(np.ceil(fn / self.sample_rate)), 1)   # rate ≤ mode max
+            cyc_max = min(int(fn // self.MIN_RATE), self.n_samples // 2)  # rate ≥ 1 GS/s, ≤ Nyquist
+            if cyc_min <= cyc_max:
+                cycles = cyc_min
+                rate = fn / cycles
+            else:
+                print(f"  exact mode impossible for {frequency_hz/1e6:.3f} MHz "
+                      f"(needs clock outside {self.MIN_RATE/1e9:g}-"
+                      f"{self.sample_rate/1e9:g} GS/s) — using rounded cycles")
+                cycles = self._cycles(frequency_hz)
+                rate = self.sample_rate
         else:
+            cycles = self._cycles(frequency_hz)
             rate = self.sample_rate
         actual = cycles * rate / self.n_samples
         return cycles, rate, actual
@@ -125,8 +174,11 @@ class AWG:
             cur = self._active_seg.get(channel, channel)
             next_seg = channel + 20 if cur == channel + 10 else channel + 10
             self._cmd(f":INST:CHAN {channel}")
-            if rate != self.sample_rate:
+            # Compare against the rate actually sent to the device (an earlier
+            # exact=True call may have moved the clock away from self.sample_rate).
+            if rate != self._rate_sent.get(channel):
                 self._cmd(f":FREQ:RAST {rate:.0f}")
+                self._rate_sent[channel] = rate
             self._upload(self._sine_u16(cycles), segnum=next_seg)
             self._play(amplitude_vpp, segnum=next_seg)
             self._active_seg[channel] = next_seg
@@ -177,22 +229,14 @@ class AWG:
         t = np.arange(n_active, dtype=np.float64)
         phase = 2 * np.pi * (f_start / rate * t +
                               (f_stop - f_start) / (2 * rate * max(n_active - 1, 1)) * t ** 2)
-        sig = np.sin(phase)
-        n_win = max(int(window_frac * n_active), 1)
-        sigma = n_win / 3.0
-        idx = np.arange(n_win, dtype=np.float64)
-        win = np.ones(n_active)
-        win[:n_win]  = np.exp(-0.5 * ((idx - n_win) / sigma) ** 2)
-        win[-n_win:] = np.exp(-0.5 * (idx           / sigma) ** 2)
-        sig *= win
+        sig = np.sin(phase) * self._gauss_win(n_active, window_frac)
         full = np.zeros(n_total)
         full[:n_active] = sig
-        return ((full + 1.0) * 32767.5).clip(0, 65535).astype(np.uint16)
+        return self._real_to_u16(full)
 
     def _cw_sine_u16(self, cycles, n_samples):
         t = np.arange(n_samples)
-        wave = np.sin(2 * np.pi * cycles * t / n_samples)
-        return ((wave + 1.0) * 32767.5).clip(0, 65535).astype(np.uint16)
+        return self._real_to_u16(np.sin(2 * np.pi * cycles * t / n_samples))
 
     def send_chirp_with_lo(self, f_start_hz, f_stop_hz, chirp_us, dead_us,
                             f_lo_hz, detect_us, amplitude_vpp=0.5, window_frac=0.05):
@@ -214,16 +258,11 @@ class AWG:
 
         # CH2: zeros during chirp+dead, exact CW sine during detection window, zeros after
         t_lo  = np.arange(n_detect, dtype=np.float64)
-        lo_active = np.sin(2 * np.pi * f_lo_hz / rate * t_lo)
-        n_win = max(int(window_frac * n_detect), 1)
-        sigma = n_win / 3.0
-        idx   = np.arange(n_win, dtype=np.float64)
-        lo_active[:n_win]  *= np.exp(-0.5 * ((idx - n_win) / sigma) ** 2)
-        lo_active[-n_win:] *= np.exp(-0.5 * (idx           / sigma) ** 2)
+        lo_active = np.sin(2 * np.pi * f_lo_hz / rate * t_lo) * self._gauss_win(n_detect, window_frac)
         ch2_sig = np.zeros(n_total)
         lo_start = n_chirp + n_dead
         ch2_sig[lo_start:lo_start + n_detect] = lo_active
-        ch2 = ((ch2_sig + 1.0) * 32767.5).clip(0, 65535).astype(np.uint16)
+        ch2 = self._real_to_u16(ch2_sig)
 
         t_detect_actual = n_detect / rate * 1e6
         t_dead_actual   = (n_total - n_chirp - n_detect) / rate * 1e6
@@ -276,38 +315,23 @@ class AWG:
         # Segment stores 2×n_total uint16 values; must be multiple of 64 → n_total multiple of 32
         n_total = max(int(np.ceil((n_chirp + n_dead + n_detect) / 32)) * 32, 64)
 
-        def _gauss_win(n):
-            n_w = max(int(window_frac * n), 1)
-            sig = n_w / 3.0
-            idx = np.arange(n_w, dtype=np.float64)
-            w = np.ones(n)
-            w[:n_w]  = np.exp(-0.5 * ((idx - n_w) / sig) ** 2)
-            w[-n_w:] = np.exp(-0.5 * (idx / sig) ** 2)
-            return w
-
         # CH1: analytic chirp — I = cos(phase)·win, Q = sin(phase)·win
         t = np.arange(n_chirp, dtype=np.float64) / rate_cx
         T = t[-1] if n_chirp > 1 else 1e-9
         phase = 2 * np.pi * (f_start_bb_hz * t +
                               (f_stop_bb_hz - f_start_bb_hz) / (2 * T) * t ** 2)
-        win1 = _gauss_win(n_chirp)
+        win1 = self._gauss_win(n_chirp, window_frac)
         I1 = np.zeros(n_total);  I1[:n_chirp] = np.cos(phase) * win1
         Q1 = np.zeros(n_total);  Q1[:n_chirp] = np.sin(phase) * win1
 
         # CH2: gated CW — I=win during detect window, Q=0 → output at exactly f_lo_hz
         lo_start = n_chirp + n_dead
-        win2 = _gauss_win(n_detect)
+        win2 = self._gauss_win(n_detect, window_frac)
         I2 = np.zeros(n_total);  I2[lo_start:lo_start + n_detect] = win2
         Q2 = np.zeros(n_total)
 
-        def _to_u16(I, Q):
-            iq = np.empty(2 * len(I), dtype=np.float64)
-            iq[0::2] = I;  iq[1::2] = Q
-            # np.round before astype so midscale (0.0) maps to exactly 32768, not 32767
-            return np.round((iq + 1.0) * 32767.5).clip(0, 65535).astype(np.uint16)
-
-        ch1_u16 = _to_u16(I1, Q1)
-        ch2_u16 = _to_u16(I2, Q2)
+        ch1_u16 = self._iq_to_u16(I1, Q1)
+        ch2_u16 = self._iq_to_u16(I2, Q2)
 
         print(f"[DUC CH1] {(f_carrier_chirp_hz+f_start_bb_hz)/1e6:.3f}→"
               f"{(f_carrier_chirp_hz+f_stop_bb_hz)/1e6:.3f} MHz  "
@@ -367,6 +391,7 @@ class AWG:
             self._dev.write("*CLS; *RST")
             time.sleep(0.5)
             self._dev.query("*OPC?")
+            self._rate_sent.clear()
 
             # Diagnostic: confirm the DUC/IQM option is actually installed on this unit.
             print(f"  *OPT? -> {self._dev.query('*OPT?').strip()!r}")
@@ -387,74 +412,11 @@ class AWG:
 
         return n_chirp / rate_cx, f_lo_hz
 
-    def send_chirp_with_lo_nco(self, f_carrier_hz, f_start_bb_hz, f_stop_bb_hz,
-                                chirp_us, dead_us, f_lo_hz, detect_us,
-                                amplitude_vpp=0.5, window_frac=0.05):
-        """NCO-mode upconversion — works when IQM ONE is not licensed.
-
-        CH1: real windowed chirp (f_start_bb → f_stop_bb) upconverted by NCO carrier.
-             Output is double-sideband:
-               upper  = f_carrier + f_start_bb  →  f_carrier + f_stop_bb
-               image  = f_carrier - f_stop_bb   →  f_carrier - f_start_bb
-        CH2: gaussian-windowed amplitude envelope gating the NCO carrier → pure
-             CW at exactly f_lo_hz during the detect window, zero elsewhere.
-
-        Both channels run at SAMPLE_RATE_DUAL (2.5 GS/s real sample rate).
-        """
-        rate = SAMPLE_RATE_DUAL
-        n_chirp  = round(chirp_us  * 1e-6 * rate)
-        n_dead   = round(dead_us   * 1e-6 * rate)
-        n_detect = round(detect_us * 1e-6 * rate)
-        n_total  = max(int(np.ceil((n_chirp + n_dead + n_detect) / 64)) * 64, 128)
-
-        # CH1: real chirp — same waveform as direct mode, NCO does the upconversion
-        ch1 = self._chirp_windowed_u16(f_start_bb_hz, f_stop_bb_hz, n_chirp, n_total,
-                                        rate, window_frac)
-
-        # CH2: gaussian-windowed amplitude envelope during detect window, zeros elsewhere.
-        # In NCO mode: output = envelope(t) × cos(2π f_lo t) → gated CW at f_lo.
-        lo_start = n_chirp + n_dead
-        n_win    = max(int(window_frac * n_detect), 1)
-        sig_     = n_win / 3.0
-        idx      = np.arange(n_win, dtype=np.float64)
-        lo_env   = np.zeros(n_total)
-        lo_env[lo_start:lo_start + n_detect]                         = 1.0
-        lo_env[lo_start:lo_start + n_win]                           *= np.exp(-0.5 * ((idx - n_win) / sig_) ** 2)
-        lo_env[lo_start + n_detect - n_win:lo_start + n_detect]     *= np.exp(-0.5 * (idx           / sig_) ** 2)
-        ch2 = np.round((lo_env + 1.0) * 32767.5).clip(0, 65535).astype(np.uint16)
-
-        print(f"[NCO CH1] USB {(f_carrier_hz+f_start_bb_hz)/1e6:.1f}→{(f_carrier_hz+f_stop_bb_hz)/1e6:.1f} MHz  "
-              f"image {(f_carrier_hz-f_stop_bb_hz)/1e6:.1f}→{(f_carrier_hz-f_start_bb_hz)/1e6:.1f} MHz  "
-              f"carrier {f_carrier_hz/1e6:.3f} MHz  active {n_chirp/rate*1e6:.3f} µs")
-        print(f"[NCO CH2] LO {f_lo_hz/1e6:.6f} MHz (NCO exact)  "
-              f"detect {n_detect/rate*1e6:.3f} µs  period {n_total/rate*1e6:.3f} µs")
-
-        def _nco_ch(ch, segnum, data_u16, ncof):
-            self._cmd(f":INST:CHAN {ch}")
-            self._cmd(":MODE NCO")
-            mode_actual = self._dev.query(":MODE?").strip()
-            print(f"  CH{ch} MODE? -> {mode_actual!r}  (expected 'NCO')")
-            self._cmd(f":FREQ:RAST {rate:.0f}")
-            self._cmd(":INIT:CONT ON")
-            self._upload(data_u16, segnum=segnum)
-            self._cmd(f":FUNC:MODE:SEGM {segnum}")
-            self._cmd(f":VOLT {amplitude_vpp:.3f}")
-            self._cmd(":NCO:SIXD1 ON")
-            self._cmd(f":NCO:CFR1 {ncof:.0f}")
-            self._cmd(":OUTP ON")
-
-        with self._lock:
-            self._dev.write("*CLS; *RST")
-            time.sleep(0.5)
-            self._dev.query("*OPC?")
-            self._cmd(":INST:CHAN 1")
-            self._cmd(":TRAC:DEL:ALL")
-            _nco_ch(1, 1, ch1, f_carrier_hz)
-            self._active_seg[1] = 1
-            _nco_ch(2, 2, ch2, f_lo_hz)
-            self._active_seg[2] = 2
-
-        return n_chirp / rate, f_lo_hz
+    # NOTE: an earlier send_chirp_with_lo_nco used :MODE NCO to "upconvert" an
+    # uploaded chirp/envelope. Removed: NCO mode plays NO waveform memory — it
+    # internally generates a plain sine at :NCO:CFR (prog. manual §5.2 p.87-88;
+    # DUC primer fig 1.4 "no modulation"), so both channels were just CW.
+    # Use send_chirp_with_lo_duc (IQM ONE) for upconverted chirps.
 
     def send_iq_sine(self, frequency_hz=100e6, amplitude_vpp=0.5, exact=False):
         """Output I (sine) on CH1 and Q (cosine, 90° shifted) on CH2 simultaneously.
@@ -469,8 +431,8 @@ class AWG:
               f"(err {err_hz:+.1f} Hz, Fs={rate/1e9:.6f} GS/s)")
 
         t = np.arange(self.n_samples)
-        i_wave = ((np.sin(2 * np.pi * cycles * t / self.n_samples) + 1.0) * 32767.5).clip(0, 65535).astype(np.uint16)
-        q_wave = ((np.cos(2 * np.pi * cycles * t / self.n_samples) + 1.0) * 32767.5).clip(0, 65535).astype(np.uint16)
+        i_wave = self._real_to_u16(np.sin(2 * np.pi * cycles * t / self.n_samples))
+        q_wave = self._real_to_u16(np.cos(2 * np.pi * cycles * t / self.n_samples))
 
         with self._lock:
             # Reset and configure CH1 (sets the shared clock rate for both channels)
@@ -494,6 +456,8 @@ class AWG:
             self._setup(channel, reset, sample_rate=rate)
             self._upload(self._ramp_u16(cycles), segnum=channel)
             self._play(amplitude_vpp, segnum=channel)
+            self._active_seg[channel] = channel
+        return actual
 
     def send_square(self, frequency_hz=None, amplitude_vpp=0.5, channel=1, reset=True, exact=False):
         cycles, rate, actual = self._resolve(frequency_hz, exact) if frequency_hz else (1, self.sample_rate, self.sample_rate / self.n_samples)
@@ -502,6 +466,8 @@ class AWG:
             self._setup(channel, reset, sample_rate=rate)
             self._upload(self._square_u16(cycles), segnum=channel)
             self._play(amplitude_vpp, segnum=channel)
+            self._active_seg[channel] = channel
+        return actual
 
     # ── CH2-as-trigger comparison (direct vs DUC) ──────────────────
     # CH1 = signal under test (-> scope CH1); CH2 = start-of-buffer sync pulse
@@ -514,14 +480,21 @@ class AWG:
         samples -> one clean rising edge per period at sample 0."""
         w = np.zeros(n_total)
         w[:max(n_pulse, 1)] = 1.0
-        return ((w + 1.0) * 32767.5).clip(0, 65535).astype(np.uint16)
+        return self._real_to_u16(w)
 
-    def _iq_to_u16(self, I, Q):
-        """Interleave complex baseband [I0,Q0,I1,Q1,...] as offset-binary uint16."""
+    @staticmethod
+    def _iq_to_u16(I, Q):
+        """Interleave complex baseband [I0,Q0,I1,Q1,...] as uint16 for DUC/IQM.
+
+        IQ data must use codes 1..65535 symmetric about 32768, NOT the full
+        0..65535 range: with code 0 included the negative half has one more
+        level than the positive half, and that DC bias shows up as a residual
+        carrier spur at the NCO frequency (~-78 dBc; prog. manual §5.9 p.95,
+        DUC primer fig 2.3). Matches Tabor's myQuantization(minLevel=1)."""
         iq = np.empty(2 * len(I), dtype=np.float64)
         iq[0::2] = I
         iq[1::2] = Q
-        return np.round((iq + 1.0) * 32767.5).clip(0, 65535).astype(np.uint16)
+        return (np.round(iq * 32767.0) + 32768.0).clip(1, 65535).astype(np.uint16)
 
     def _duc_upload_ch(self, ch, segnum, data_u16, ncof, rate, rate_cx, amp):
         """Per-channel DUC/IQM-ONE upload (same ordering as send_chirp_with_lo_duc:
@@ -545,6 +518,9 @@ class AWG:
                             sync_pulse_ns=40, sync_amp_vpp=0.8):
         """Direct-mode CW on CH1 + sync pulse on CH2 (2.5 GS/s dual). Returns actual Hz."""
         rate = SAMPLE_RATE_DUAL
+        if freq_hz > rate / 2:
+            raise ValueError(f"{freq_hz/1e6:.1f} MHz is above Nyquist "
+                             f"({rate/2e6:.0f} MHz) — use the DUC mode instead")
         n_total = self.n_samples
         cycles = max(round(freq_hz * n_total / rate), 1)
         actual = cycles * rate / n_total
@@ -605,6 +581,7 @@ class AWG:
               f"CH2 burst {n_pulse/rate_cx*1e9:.1f} ns @ {sync_carrier/1e6:.1f} MHz")
         with self._lock:
             self._dev.write("*CLS; *RST"); time.sleep(0.5); self._dev.query("*OPC?")
+            self._rate_sent.clear()
             self._cmd(":INST:CHAN 1"); self._cmd(":TRAC:DEL:ALL")
             self._duc_upload_ch(1, 1, ch1, carrier_hz, rate, rate_cx, amplitude_vpp)
             self._active_seg[1] = 1
@@ -630,12 +607,7 @@ class AWG:
         T = t[-1] if n_chirp > 1 else 1e-9
         phase = 2 * np.pi * (f_start_bb_hz * t +
                              (f_stop_bb_hz - f_start_bb_hz) / (2 * T) * t ** 2)
-        n_w = max(int(window_frac * n_chirp), 1)
-        sig = n_w / 3.0
-        idx = np.arange(n_w, dtype=np.float64)
-        win = np.ones(n_chirp)
-        win[:n_w]  = np.exp(-0.5 * ((idx - n_w) / sig) ** 2)
-        win[-n_w:] = np.exp(-0.5 * (idx / sig) ** 2)
+        win = self._gauss_win(n_chirp, window_frac)
         I1 = np.zeros(n_total); I1[:n_chirp] = np.cos(phase) * win
         Q1 = np.zeros(n_total); Q1[:n_chirp] = np.sin(phase) * win
         ch1 = self._iq_to_u16(I1, Q1)
@@ -647,6 +619,7 @@ class AWG:
               f"period {n_total/rate_cx*1e6:.3f} us  CH2 burst {n_pulse/rate_cx*1e9:.1f} ns")
         with self._lock:
             self._dev.write("*CLS; *RST"); time.sleep(0.5); self._dev.query("*OPC?")
+            self._rate_sent.clear()
             self._cmd(":INST:CHAN 1"); self._cmd(":TRAC:DEL:ALL")
             self._duc_upload_ch(1, 1, ch1, f_carrier_chirp_hz, rate, rate_cx, amplitude_vpp)
             self._active_seg[1] = 1
