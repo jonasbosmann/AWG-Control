@@ -328,6 +328,10 @@ class LabGUI:
         live_btn.grid(row=5, column=0, columnspan=2, sticky='ew', pady=2)
         self._action_btns.append(live_btn)
 
+        restore_btn = ttk.Button(s, text="Restore Scope", command=self._restore_scope)
+        restore_btn.grid(row=6, column=0, columnspan=2, sticky='ew', pady=2)
+        self._action_btns.append(restore_btn)
+
     # ── Setup (microwave-chain configuration) panel ────────────────
 
     def _build_setup_panel(self, parent):
@@ -690,21 +694,14 @@ class LabGUI:
                             "dt_s": dt_s, "voltage": wv,
                         })
 
-                        # Live per-step plot: waveform on top, loss curve on bottom
-                        self._fig.clear()
-                        ax1 = self._fig.add_subplot(211)
-                        ax1.plot(wt * 1e9, wv * 1e3)
-                        ax1.set_xlabel("Time (ns)")
-                        ax1.set_ylabel("Voltage (mV)")
-                        ax1.set_title(f"{actual/1e6:.3f} MHz — Vpp {vpp*1e3:.1f} mV")
-                        ax1.grid(True)
-                        ax2 = self._fig.add_subplot(212)
-                        ax2.plot(freqs_plot, losses_plot, 'o-')
-                        ax2.set_xlabel("Frequency (MHz)")
-                        ax2.set_ylabel("Loss (dB)")
-                        ax2.grid(True)
-                        self._fig.tight_layout()
-                        self._redraw()
+                        # Live per-step plot — drawn on the Tk main thread only.
+                        # Mutating self._fig from this worker thread races with
+                        # the previous iteration's canvas.draw and aborts the
+                        # sweep with a matplotlib error on the second step.
+                        # Pass list copies: the worker keeps appending.
+                        self.root.after(0, self._draw_sweep_step,
+                                        wt, wv, actual, vpp,
+                                        list(freqs_plot), list(losses_plot))
                     else:
                         print(f"{f/1e6:>14.1f}  {actual/1e6:>14.3f}  {'(no scope)':>10}")
 
@@ -729,6 +726,23 @@ class LabGUI:
 
         self._thread(sweep)
 
+    def _draw_sweep_step(self, wt, wv, actual, vpp, freqs_plot, losses_plot):
+        """Main-thread only: per-step sweep plot (waveform + loss curve)."""
+        self._fig.clear()
+        ax1 = self._fig.add_subplot(211)
+        ax1.plot(wt * 1e9, wv * 1e3)
+        ax1.set_xlabel("Time (ns)")
+        ax1.set_ylabel("Voltage (mV)")
+        ax1.set_title(f"{actual/1e6:.3f} MHz — Vpp {vpp*1e3:.1f} mV")
+        ax1.grid(True)
+        ax2 = self._fig.add_subplot(212)
+        ax2.plot(freqs_plot, losses_plot, 'o-')
+        ax2.set_xlabel("Frequency (MHz)")
+        ax2.set_ylabel("Loss (dB)")
+        ax2.grid(True)
+        self._fig.tight_layout()
+        self._canvas.draw_idle()
+
     # ── Scope setup ────────────────────────────────────────────────
 
     def _setup_scope(self):
@@ -743,6 +757,21 @@ class LabGUI:
             finally:
                 self._set_busy(False)
         self._thread(do_setup)
+
+    def _restore_scope(self):
+        """Undo leftover measurement state (NORMal trigger on CH2, averaging,
+        armed single-sequence) — e.g. after compare_duc_direct.py."""
+        if not self._need_scope(): return
+        ch = int(self._chan_var.get())
+        def do_restore():
+            self._set_busy(True)
+            try:
+                self.scope.restore(channel=ch)
+            except Exception as e:
+                print(f"Restore error: {e}\n")
+            finally:
+                self._set_busy(False)
+        self._thread(do_restore)
 
     # ── Waveform capture ───────────────────────────────────────────
 
@@ -766,6 +795,24 @@ class LabGUI:
         if not self._need_scope(): return
         ch = int(self._chan_var.get())
 
+        def draw(t, v, freqs, spectrum):
+            # Main thread only — see _draw_sweep_step.
+            self._fig.clear()
+            ax1 = self._fig.add_subplot(211)
+            ax1.plot(t * 1e9, v * 1e3)
+            ax1.set_xlabel("Time (ns)")
+            ax1.set_ylabel("Voltage (mV)")
+            ax1.grid(True)
+
+            ax2 = self._fig.add_subplot(212)
+            ax2.plot(freqs * 1e-6, spectrum)
+            ax2.set_xlabel("Frequency (MHz)")
+            ax2.set_ylabel("Amplitude (dBV)")
+            ax2.grid(True)
+
+            self._fig.tight_layout()
+            self._canvas.draw_idle()
+
         def capture():
             self._set_busy(True)
             try:
@@ -776,21 +823,7 @@ class LabGUI:
                 freqs    = np.fft.rfftfreq(n, dt)
                 spectrum = 20 * np.log10(np.abs(np.fft.rfft(v)) * 2 / n + 1e-12)
 
-                self._fig.clear()
-                ax1 = self._fig.add_subplot(211)
-                ax1.plot(t * 1e9, v * 1e3)
-                ax1.set_xlabel("Time (ns)")
-                ax1.set_ylabel("Voltage (mV)")
-                ax1.grid(True)
-
-                ax2 = self._fig.add_subplot(212)
-                ax2.plot(freqs * 1e-6, spectrum)
-                ax2.set_xlabel("Frequency (MHz)")
-                ax2.set_ylabel("Amplitude (dBV)")
-                ax2.grid(True)
-
-                self._fig.tight_layout()
-                self._redraw()
+                self.root.after(0, draw, t, v, freqs, spectrum)
             except Exception as e:
                 print(f"Capture error: {e}\n")
             finally:
