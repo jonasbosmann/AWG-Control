@@ -60,7 +60,9 @@ def save_sweep(setup_name, description, photo_path, params, records):
                 "target_hz": float(r["target_hz"]),
                 "actual_hz": float(r["actual_hz"]),
                 "vpp_v":     round(float(r["vpp_v"]), 9),
-                "loss_db":   round(float(r["loss_db"]), 4),
+                # -inf (Vpp=0) would serialize as -Infinity, which is not valid JSON
+                "loss_db":   round(float(r["loss_db"]), 4)
+                             if np.isfinite(r["loss_db"]) else None,
                 "dt_s":      float(r["dt_s"]),
                 "n_points":  int(len(r["voltage"])),
                 "voltage_v": f"@@WF{i}@@",   # placeholder → compact array below

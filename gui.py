@@ -4,6 +4,7 @@ import threading
 import queue
 import sys
 import os
+import time
 import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
@@ -44,6 +45,7 @@ class LabGUI:
         self.root.geometry("1100x780")
         self.awg   = None
         self.scope = None
+        self._awg_needs_reset = True   # *RST once after connect / rate change
         self._live_running = False
         self._live_gen     = 0
         self._sweep_stop   = threading.Event()
@@ -105,8 +107,11 @@ class LabGUI:
 
         ctrl.bind('<Configure>', lambda _: canvas.configure(scrollregion=canvas.bbox('all')))
         canvas.bind('<Configure>', lambda e: canvas.itemconfig(win_id, width=e.width))
-        canvas.bind_all('<MouseWheel>',
-                        lambda e: canvas.yview_scroll(int(-1 * e.delta / 120), 'units'))
+        # Scroll only while the pointer is over the control panel — a permanent
+        # bind_all would hijack the wheel everywhere (log, plot, live view).
+        canvas.bind('<Enter>', lambda _: canvas.bind_all(
+            '<MouseWheel>', lambda e: canvas.yview_scroll(int(-1 * e.delta / 120), 'units')))
+        canvas.bind('<Leave>', lambda _: canvas.unbind_all('<MouseWheel>'))
 
         self._build_std_waveform(ctrl)
         self._build_chirp_panel(ctrl)
@@ -168,6 +173,7 @@ class LabGUI:
         self._on_rate_change()
 
     def _on_rate_change(self):
+        self._awg_needs_reset = True   # clock change → re-init segments on next send
         dual = "2.5" in self._rate_var.get()
         for w in self._ch2_std_widgets:
             new_state = ('readonly' if isinstance(w, ttk.Combobox) else 'normal') if dual else 'disabled'
@@ -486,6 +492,7 @@ class LabGUI:
         def connect():
             try:
                 self.awg = AWG(sample_rate=self._rate())
+                self._awg_needs_reset = True
                 self._status(self._awg_lbl, "AWG: connected", "green")
             except Exception as e:
                 print(f"AWG connection failed: {e}\n")
@@ -515,7 +522,9 @@ class LabGUI:
             print(f"Invalid parameter: {e}\n")
             return
         rate = self._rate()
-        reset = (channel == 1)
+        # Reset only on first send after connect / rate change — an unconditional
+        # reset on "Send CH1" (*RST + TRAC:DEL:ALL) would silently kill a running CH2.
+        reset = self._awg_needs_reset
         self._set_busy(True)
         def run():
             try:
@@ -526,6 +535,7 @@ class LabGUI:
                     self.awg.send_square(freq, amp, channel=channel, reset=reset)
                 elif wave == "Ramp":
                     self.awg.send_ramp(freq, amp, channel=channel, reset=reset)
+                self._awg_needs_reset = False
             except Exception as e:
                 print(f"Waveform error: {e}\n")
             finally:
@@ -617,15 +627,24 @@ class LabGUI:
             n_avg = int(self._sweep_avg_var.get())
             scope_ch = int(self._sweep_chan_var.get())
             try:
+                # Drop frequencies above Nyquist — they would silently alias
+                # (the buffer wraps) and log a bogus "actual" frequency.
+                nyq = self.awg.sample_rate / 2
+                freqs = [f for f in DEFAULT_FREQS if f <= nyq]
+                skipped = [f for f in DEFAULT_FREQS if f > nyq]
+                if skipped:
+                    print(f"Skipping {len(skipped)} freqs above Nyquist "
+                          f"({nyq/1e6:.0f} MHz at {self.awg.sample_rate/1e9:g} GS/s): "
+                          f"{', '.join(f'{f/1e6:.0f}' for f in skipped)} MHz\n")
+
                 # Pre-load all segments once; the sweep loop then just switches
-                import time as _time
                 print("Pre-loading waveform segments…\n")
-                t_pre0 = _time.perf_counter()
-                self.awg.send_sine(DEFAULT_FREQS[0], amp, channel=awg_ch, reset=True)
-                t_pre1 = _time.perf_counter()
+                t_pre0 = time.perf_counter()
+                self.awg.send_sine(freqs[0], amp, channel=awg_ch, reset=True)
+                t_pre1 = time.perf_counter()
                 print(f"  send_sine: {(t_pre1-t_pre0):.1f} s\n")
-                segments = self.awg.sweep_preload(DEFAULT_FREQS, channel=awg_ch)
-                t_pre2 = _time.perf_counter()
+                segments = self.awg.sweep_preload(freqs, channel=awg_ch)
+                t_pre2 = time.perf_counter()
                 print(f"  sweep_preload: {(t_pre2-t_pre1):.1f} s\n")
 
                 if self.scope is not None:
@@ -638,25 +657,24 @@ class LabGUI:
                 print(f"\n{'Target (MHz)':>14}  {'Actual (MHz)':>14}  {'Vpp (mV)':>10}  {'Loss (dB)':>10}")
                 print("-" * 56)
 
-                for (actual, segnum), f in zip(segments, DEFAULT_FREQS):
+                for (actual, segnum), f in zip(segments, freqs):
                     if self._sweep_stop.is_set():
                         print("Sweep aborted.\n")
                         break
 
-                    import time as _time
-                    t0 = _time.perf_counter()
+                    t0 = time.perf_counter()
                     self.awg.sweep_step(segnum, amp, channel=awg_ch)
-                    t1 = _time.perf_counter()
+                    t1 = time.perf_counter()
                     print(f"  sweep_step: {(t1-t0)*1000:.0f} ms\n")
 
                     if self.scope is not None:
-                        t2 = _time.perf_counter()
+                        t2 = time.perf_counter()
                         self.scope.set_timebase(actual, n_cycles=n_cycles)
-                        t3 = _time.perf_counter()
+                        t3 = time.perf_counter()
                         print(f"  set_timebase: {(t3-t2)*1000:.0f} ms\n")
                         vpp, wt, wv = self.scope.measure_vpp(
                             channel=scope_ch, settle=settle_s)
-                        t4 = _time.perf_counter()
+                        t4 = time.perf_counter()
                         print(f"  measure_vpp: {(t4-t3)*1000:.0f} ms\n")
                         if ref_vpp is None:
                             ref_vpp = vpp
@@ -700,6 +718,8 @@ class LabGUI:
                             "amplitude_vpp": amp, "awg_ch": awg_ch,
                             "scope_ch": scope_ch, "n_averages": n_avg,
                             "settle_ms": settle_s * 1000.0, "cycles_shown": n_cycles,
+                            "sample_rate_hz": self.awg.sample_rate,
+                            "n_samples": self.awg.n_samples,
                         }
                         path = sweeplog.save_sweep(name, desc, photo, params, records)
                         print(f"Saved {len(records)} points -> {path}\n")
@@ -823,6 +843,26 @@ class LabGUI:
             gen = self._live_gen
             self._thread(lambda: self._live_loop(gen))
 
+    def _live_draw(self, gen, t, v, freqs, spectrum):
+        """Runs on the Tk main thread — the only place the live figure is touched.
+        Mutating the figure from the worker thread races with canvas draws."""
+        if not (self._live_running and self._live_gen == gen):
+            return
+        if self._live_win is None or not self._live_win.winfo_exists():
+            return
+        self._live_fig.clear()
+        ax1 = self._live_fig.add_subplot(211)
+        ax1.plot(t * 1e9, v * 1e3)
+        ax1.set_xlabel("Time (ns)"); ax1.set_ylabel("Voltage (mV)"); ax1.grid(True)
+
+        ax2 = self._live_fig.add_subplot(212)
+        ax2.plot(freqs * 1e-6, spectrum)
+        ax2.set_xlabel("Frequency (MHz)"); ax2.set_ylabel("Amplitude (dBV)")
+        ax2.grid(True)
+
+        self._live_fig.tight_layout()
+        self._live_canvas.draw_idle()
+
     def _live_loop(self, gen):
         ch = int(self._chan_var.get())
         self._apply_timebase()
@@ -835,23 +875,12 @@ class LabGUI:
                 freqs    = np.fft.rfftfreq(n, dt)
                 spectrum = 20 * np.log10(np.abs(np.fft.rfft(v)) * 2 / n + 1e-12)
 
-                self._live_fig.clear()
-                ax1 = self._live_fig.add_subplot(211)
-                ax1.plot(t * 1e9, v * 1e3)
-                ax1.set_xlabel("Time (ns)"); ax1.set_ylabel("Voltage (mV)"); ax1.grid(True)
-
-                ax2 = self._live_fig.add_subplot(212)
-                ax2.plot(freqs * 1e-6, spectrum)
-                ax2.set_xlabel("Frequency (MHz)"); ax2.set_ylabel("Amplitude (dBV)")
-                ax2.grid(True)
-
-                self._live_fig.tight_layout()
-                self.root.after(0, self._live_canvas.draw_idle)
+                self.root.after(0, self._live_draw, gen, t, v, freqs, spectrum)
 
             except Exception as e:
                 print(f"Live view error: {e}\n")
 
-            threading.Event().wait(0.05)
+            time.sleep(0.05)
 
         if self._live_gen == gen:
             self._live_running = False
