@@ -503,6 +503,157 @@ class AWG:
             self._upload(self._square_u16(cycles), segnum=channel)
             self._play(amplitude_vpp, segnum=channel)
 
+    # ── CH2-as-trigger comparison (direct vs DUC) ──────────────────
+    # CH1 = signal under test (-> scope CH1); CH2 = start-of-buffer sync pulse
+    # (-> scope CH2, used as the scope trigger). Both channels share one buffer
+    # period, so the CH2 pulse marks the identical CH1 phase every period ->
+    # coherent scope triggering / averaging without the hardware marker.
+
+    def _sync_pulse_u16(self, n_total, n_pulse):
+        """Real start-of-buffer pulse: 0 V baseline, +full for the first n_pulse
+        samples -> one clean rising edge per period at sample 0."""
+        w = np.zeros(n_total)
+        w[:max(n_pulse, 1)] = 1.0
+        return ((w + 1.0) * 32767.5).clip(0, 65535).astype(np.uint16)
+
+    def _iq_to_u16(self, I, Q):
+        """Interleave complex baseband [I0,Q0,I1,Q1,...] as offset-binary uint16."""
+        iq = np.empty(2 * len(I), dtype=np.float64)
+        iq[0::2] = I
+        iq[1::2] = Q
+        return np.round((iq + 1.0) * 32767.5).clip(0, 65535).astype(np.uint16)
+
+    def _duc_upload_ch(self, ch, segnum, data_u16, ncof, rate, rate_cx, amp):
+        """Per-channel DUC/IQM-ONE upload (same ordering as send_chirp_with_lo_duc:
+        baseband clock first -> DUC -> IQM ONE -> INT -> raise clock)."""
+        int_kw = {2: "X2", 4: "X4", 8: "X8"}[round(rate / rate_cx)]
+        self._cmd(f":INST:CHAN {ch}")
+        self._cmd(f":FREQ:RAST {rate_cx:.0f}")
+        self._cmd(":MODE DUC")
+        self._cmd(":SOUR:IQM ONE")
+        self._cmd(f":SOUR:INT {int_kw}")
+        self._cmd(f":FREQ:RAST {rate:.0f}")
+        self._cmd(":INIT:CONT ON")
+        self._upload(data_u16, segnum=segnum)
+        self._cmd(f":FUNC:MODE:SEGM {segnum}")
+        self._cmd(f":VOLT {amp:.3f}")
+        self._cmd(":NCO:SIXD1 ON")
+        self._cmd(f":NCO:CFR1 {ncof:.0f}")
+        self._cmd(":OUTP ON")
+
+    def send_cw_direct_sync(self, freq_hz, amplitude_vpp=0.5,
+                            sync_pulse_ns=40, sync_amp_vpp=0.8):
+        """Direct-mode CW on CH1 + sync pulse on CH2 (2.5 GS/s dual). Returns actual Hz."""
+        rate = SAMPLE_RATE_DUAL
+        n_total = self.n_samples
+        cycles = max(round(freq_hz * n_total / rate), 1)
+        actual = cycles * rate / n_total
+        n_pulse = max(int(sync_pulse_ns * 1e-9 * rate), 1)
+        ch1 = self._cw_sine_u16(cycles, n_total)
+        ch2 = self._sync_pulse_u16(n_total, n_pulse)
+        print(f"[DIRECT CW] CH1 {actual/1e6:.4f} MHz ({cycles} cyc)  "
+              f"CH2 sync {n_pulse/rate*1e9:.1f} ns @ {sync_amp_vpp} Vpp")
+        with self._lock:
+            self._setup(1, reset=True,  sample_rate=rate)
+            self._upload(ch1, segnum=1); self._play(amplitude_vpp, segnum=1)
+            self._active_seg[1] = 1
+            self._setup(2, reset=False, sample_rate=rate)
+            self._upload(ch2, segnum=2); self._play(sync_amp_vpp, segnum=2)
+            self._active_seg[2] = 2
+        return actual
+
+    def send_chirp_direct_sync(self, f_start_hz, f_stop_hz, chirp_us, dead_us,
+                               amplitude_vpp=0.5, sync_pulse_ns=40, sync_amp_vpp=0.8,
+                               window_frac=0.05):
+        """Direct-mode windowed chirp on CH1 + sync pulse on CH2 (2.5 GS/s dual).
+        Returns chirp active duration (s)."""
+        rate = SAMPLE_RATE_DUAL
+        n_chirp = round(chirp_us * 1e-6 * rate)
+        n_dead  = round(dead_us  * 1e-6 * rate)
+        n_total = max(int(np.ceil((n_chirp + n_dead) / 64)) * 64, 128)
+        n_pulse = max(int(sync_pulse_ns * 1e-9 * rate), 1)
+        ch1 = self._chirp_windowed_u16(f_start_hz, f_stop_hz, n_chirp, n_total, rate, window_frac)
+        ch2 = self._sync_pulse_u16(n_total, n_pulse)
+        print(f"[DIRECT CHIRP] CH1 {f_start_hz/1e6:.1f}->{f_stop_hz/1e6:.1f} MHz  "
+              f"active {n_chirp/rate*1e6:.3f} us  period {n_total/rate*1e6:.3f} us  "
+              f"CH2 sync {n_pulse/rate*1e9:.1f} ns")
+        with self._lock:
+            self._setup(1, reset=True,  sample_rate=rate)
+            self._upload(ch1, segnum=1); self._play(amplitude_vpp, segnum=1)
+            self._active_seg[1] = 1
+            self._setup(2, reset=False, sample_rate=rate)
+            self._upload(ch2, segnum=2); self._play(sync_amp_vpp, segnum=2)
+            self._active_seg[2] = 2
+        return n_chirp / rate
+
+    def send_cw_duc_sync(self, carrier_hz, amplitude_vpp=0.5, n_total=4096,
+                         sync_pulse_ns=40, sync_amp_vpp=0.8, sync_carrier_hz=None):
+        """DUC/IQM-ONE CW on CH1 (pure carrier at carrier_hz) + gated-burst sync on
+        CH2 at buffer start (9 GS/s DAC, X8). Returns carrier_hz."""
+        rate = 9e9
+        rate_cx = rate / 8.0
+        n_total = max(int(np.ceil(n_total / 32)) * 32, 64)   # 2*n_total multiple of 64
+        n_pulse = max(int(sync_pulse_ns * 1e-9 * rate_cx), 1)
+        sync_carrier = sync_carrier_hz if sync_carrier_hz is not None else carrier_hz
+
+        # CH1: constant complex baseband (I=1,Q=0) -> pure carrier via NCO.
+        ch1 = self._iq_to_u16(np.ones(n_total), np.zeros(n_total))
+        # CH2: I-envelope gate for the first n_pulse samples -> RF burst at t=0.
+        I2 = np.zeros(n_total); I2[:n_pulse] = 1.0
+        ch2 = self._iq_to_u16(I2, np.zeros(n_total))
+        print(f"[DUC CW] CH1 {carrier_hz/1e6:.4f} MHz  "
+              f"CH2 burst {n_pulse/rate_cx*1e9:.1f} ns @ {sync_carrier/1e6:.1f} MHz")
+        with self._lock:
+            self._dev.write("*CLS; *RST"); time.sleep(0.5); self._dev.query("*OPC?")
+            self._cmd(":INST:CHAN 1"); self._cmd(":TRAC:DEL:ALL")
+            self._duc_upload_ch(1, 1, ch1, carrier_hz, rate, rate_cx, amplitude_vpp)
+            self._active_seg[1] = 1
+            self._duc_upload_ch(2, 2, ch2, sync_carrier, rate, rate_cx, sync_amp_vpp)
+            self._active_seg[2] = 2
+        return carrier_hz
+
+    def send_chirp_duc_sync(self, f_carrier_chirp_hz, f_start_bb_hz, f_stop_bb_hz,
+                            chirp_us, dead_us, amplitude_vpp=0.5, window_frac=0.05,
+                            sync_pulse_ns=40, sync_amp_vpp=0.8, sync_carrier_hz=None):
+        """DUC/IQM-ONE analytic chirp on CH1 + gated-burst sync on CH2 at buffer
+        start (9 GS/s DAC, X8). Returns chirp active duration (s)."""
+        rate = 9e9
+        rate_cx = rate / 8.0
+        n_chirp = round(chirp_us * 1e-6 * rate_cx)
+        n_dead  = round(dead_us  * 1e-6 * rate_cx)
+        n_total = max(int(np.ceil((n_chirp + n_dead) / 32)) * 32, 64)
+        n_pulse = max(int(sync_pulse_ns * 1e-9 * rate_cx), 1)
+        sync_carrier = sync_carrier_hz if sync_carrier_hz is not None else f_carrier_chirp_hz
+
+        # CH1: analytic (single-sideband) windowed chirp.
+        t = np.arange(n_chirp, dtype=np.float64) / rate_cx
+        T = t[-1] if n_chirp > 1 else 1e-9
+        phase = 2 * np.pi * (f_start_bb_hz * t +
+                             (f_stop_bb_hz - f_start_bb_hz) / (2 * T) * t ** 2)
+        n_w = max(int(window_frac * n_chirp), 1)
+        sig = n_w / 3.0
+        idx = np.arange(n_w, dtype=np.float64)
+        win = np.ones(n_chirp)
+        win[:n_w]  = np.exp(-0.5 * ((idx - n_w) / sig) ** 2)
+        win[-n_w:] = np.exp(-0.5 * (idx / sig) ** 2)
+        I1 = np.zeros(n_total); I1[:n_chirp] = np.cos(phase) * win
+        Q1 = np.zeros(n_total); Q1[:n_chirp] = np.sin(phase) * win
+        ch1 = self._iq_to_u16(I1, Q1)
+        # CH2: burst at buffer start.
+        I2 = np.zeros(n_total); I2[:n_pulse] = 1.0
+        ch2 = self._iq_to_u16(I2, np.zeros(n_total))
+        print(f"[DUC CHIRP] CH1 {(f_carrier_chirp_hz+f_start_bb_hz)/1e6:.1f}->"
+              f"{(f_carrier_chirp_hz+f_stop_bb_hz)/1e6:.1f} MHz  active {n_chirp/rate_cx*1e6:.3f} us  "
+              f"period {n_total/rate_cx*1e6:.3f} us  CH2 burst {n_pulse/rate_cx*1e9:.1f} ns")
+        with self._lock:
+            self._dev.write("*CLS; *RST"); time.sleep(0.5); self._dev.query("*OPC?")
+            self._cmd(":INST:CHAN 1"); self._cmd(":TRAC:DEL:ALL")
+            self._duc_upload_ch(1, 1, ch1, f_carrier_chirp_hz, rate, rate_cx, amplitude_vpp)
+            self._active_seg[1] = 1
+            self._duc_upload_ch(2, 2, ch2, sync_carrier, rate, rate_cx, sync_amp_vpp)
+            self._active_seg[2] = 2
+        return n_chirp / rate_cx
+
     def stop(self):
         with self._lock:
             for ch in [1, 2]:

@@ -31,25 +31,40 @@ class Scope:
         print("Scope:", idn)
         self._dev.timeout = 10000
 
-    def setup(self, channel=1, n_averages=1):
+    def setup(self, channel=1, n_averages=1, trigger_channel=None, trigger_level=0.0,
+              trigger_mode="AUTO"):
+        """Configure acquisition and edge trigger.
+
+        trigger_channel: if given, trigger on that channel while measuring `channel`
+        (e.g. measure CH1, trigger on CH2 sync pulse). Defaults to `channel`.
+        trigger_level: edge trigger level (V) on the trigger channel — use ~half the
+        sync-pulse amplitude when triggering on a 0 V-baseline pulse.
+        trigger_mode: 'AUTO' (free-runs if no trigger — WASHES OUT coherent averaging)
+        or 'NORMal' (only acquire/average on genuine triggers — required for coherent
+        averaging on a CH2 sync pulse).
+        """
+        trig_ch = trigger_channel if trigger_channel is not None else channel
         with self._lock:
             self._dev.write("MEASUrement:DELETEALL")
             self._dev.write(f"CH{channel}:TERmination 50")
+            if trig_ch != channel:
+                self._dev.write(f"CH{trig_ch}:TERmination 50")
             if n_averages > 1:
                 self._dev.write("ACQuire:MODe AVErage")
                 self._dev.write(f"ACQuire:NUMAVg {n_averages}")
             else:
                 self._dev.write("ACQuire:MODe SAMple")
             self._dev.write("TRIGger:A:TYPe EDGE")
-            self._dev.write(f"TRIGger:A:EDGE:SOUrce CH{channel}")
+            self._dev.write(f"TRIGger:A:EDGE:SOUrce CH{trig_ch}")
             self._dev.write("TRIGger:A:EDGE:SLOpe RISe")
-            self._dev.write("TRIGger:A:MODe AUTO")
-            self._dev.write(f"TRIGger:A:LEVEL:CH{channel} 0.0")
+            self._dev.write(f"TRIGger:A:MODe {trigger_mode}")
+            self._dev.write(f"TRIGger:A:LEVEL:CH{trig_ch} {trigger_level:.3f}")
             self._dev.write("ACQuire:STOPAfter RUNSTop")
             self._dev.write("ACQuire:STATE RUN")
         self._pre.clear()
         mode = f"{n_averages}× avg" if n_averages > 1 else "sample"
-        print(f"Scope: CH{channel} @ 50 Ω, {mode}\n")
+        trig = f", trig CH{trig_ch}@{trigger_level:.2f}V {trigger_mode}" if trig_ch != channel else ""
+        print(f"Scope: CH{channel} @ 50 Ω, {mode}{trig}\n")
 
     def set_timebase_direct(self, seconds_per_div):
         self._pre.clear()
@@ -130,6 +145,21 @@ class Scope:
         vrms = np.sqrt(np.mean(v_ac ** 2))
         vpp = float(2.0 * np.sqrt(2.0) * vrms)    # Vpp = 2√2 · Vrms for sine
         return vpp, t, v
+
+    def restore(self, channel=1):
+        """Return the scope to normal free-running operation: AUTO edge trigger on
+        `channel`, Sample mode, continuous acquisition. Undoes the NORMal-trigger /
+        Average / alternate-trigger-source state left by comparison measurements."""
+        with self._lock:
+            self._dev.write("ACQuire:MODe SAMple")
+            self._dev.write("TRIGger:A:TYPe EDGE")
+            self._dev.write(f"TRIGger:A:EDGE:SOUrce CH{channel}")
+            self._dev.write("TRIGger:A:MODe AUTO")
+            self._dev.write(f"TRIGger:A:LEVEL:CH{channel} 0.0")
+            self._dev.write("ACQuire:STOPAfter RUNSTop")
+            self._dev.write("ACQuire:STATE RUN")
+        self._pre.clear()
+        print(f"Scope: restored to normal (AUTO trigger CH{channel}, Sample, running)\n")
 
     def close(self):
         self._dev.close()
