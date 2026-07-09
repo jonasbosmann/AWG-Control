@@ -25,7 +25,7 @@ def amplitude_sweep(freqs_hz=None, amplitude_vpp=0.5, channel=1, settle=2.0, n_a
     print("-" * 56)
 
     actual = awg.send_sine(freqs_hz[0], amplitude_vpp, channel=channel, reset=True)
-    vpp = scope.measure_vpp(settle=settle)
+    vpp, _, _ = scope.measure_vpp(channel=channel, settle=settle)
     ref_vpp = vpp
     results.append((freqs_hz[0], actual, vpp, 0.0))
     print(f"{freqs_hz[0]/1e6:>14.1f}  {actual/1e6:>14.3f}  {vpp*1e3:>10.1f}  {'0.00':>10}")
@@ -33,7 +33,7 @@ def amplitude_sweep(freqs_hz=None, amplitude_vpp=0.5, channel=1, settle=2.0, n_a
     try:
         for f in freqs_hz[1:]:
             actual = awg.update_sine(f, amplitude_vpp, channel=channel)
-            vpp = scope.measure_vpp(settle=settle)
+            vpp, _, _ = scope.measure_vpp(channel=channel, settle=settle)
             loss_db = 20 * np.log10(vpp / ref_vpp) if vpp > 0 else float('-inf')
             results.append((f, actual, vpp, loss_db))
             print(f"{f/1e6:>14.1f}  {actual/1e6:>14.3f}  {vpp*1e3:>10.1f}  {loss_db:>10.2f}")

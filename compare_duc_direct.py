@@ -111,6 +111,29 @@ def inst_freq(t, v):
     return t[:-1], f
 
 
+def chirp_region(v, thresh_frac=0.25):
+    """Slice covering the chirp burst: longest contiguous run where the smoothed
+    envelope exceeds thresh_frac of its 95th percentile. Without this, the fit
+    would include pre-trigger baseline and dead time, where inst_freq is noise."""
+    v = np.asarray(v)
+    env = np.abs(analytic_signal(v - np.mean(v)))
+    k = max(len(env) // 200, 5)
+    env = np.convolve(env, np.ones(k) / k, mode='same')
+    mask = env > thresh_frac * np.percentile(env, 95)
+    if not mask.any():
+        return slice(0, len(v))
+    runs, start = [], None
+    for i, m in enumerate(mask):
+        if m and start is None:
+            start = i
+        elif not m and start is not None:
+            runs.append((start, i)); start = None
+    if start is not None:
+        runs.append((start, len(mask)))
+    a, b = max(runs, key=lambda r: r[1] - r[0])
+    return slice(a, b)
+
+
 def chirp_linearity(t, f):
     """Fit a line to f(t) over its central 80% and return (fit, residual_rms_hz)."""
     lo, hi = int(0.1 * len(t)), int(0.9 * len(t))
@@ -140,6 +163,9 @@ def _arm_scope(scope, tdiv):
     scope.setup(channel=SIG_CH, n_averages=N_AVG, trigger_channel=TRIG_CH,
                 trigger_level=TRIG_LEVEL_V, trigger_mode=TRIG_MODE)
     scope.set_timebase_direct(tdiv)
+    # Trigger at 10% of the record: the sync pulse marks the buffer start, so
+    # at the default 50% half the capture would be pre-trigger baseline.
+    scope.set_horizontal_position(10)
 
 
 def show_cw(label, t, v, f, md, si, sp, s, fmax):
@@ -190,7 +216,8 @@ def chirp_arm(scope, label, gen_fn):
     _arm_scope(scope, CHIRP_US * 1e-6 / 10 * 1.2)   # ~full chirp on screen
     pause(f"[{label}] live — verify CH1 chirp + CH2 trigger. Enter to capture {N_AVG}x avg...")
     t, v = acquire_avg(scope)
-    tf, fi = inst_freq(t, v)
+    sl = chirp_region(v)          # crop to the burst — exclude baseline/dead time
+    tf, fi = inst_freq(t[sl], v[sl])
     fit, res = chirp_linearity(tf, fi)
     print(f"  [{label}] f(t) residual = {res/1e3:.2f} kHz RMS")
     if SHOW_EACH:
@@ -200,10 +227,11 @@ def chirp_arm(scope, label, gen_fn):
 
 def run():
     awg = AWG()
-    scope = Scope()
+    scope = None
     results = {}
 
     try:
+        scope = Scope()
         if RUN_CW:
             print("\n=== CW SFDR: direct vs DUC ===")
             fd, md, sfdr_d = cw_arm(scope, "DIRECT CW",
@@ -233,8 +261,10 @@ def run():
             results['chirp'] = (td, fd_i, fit_d, tu, fu_i, fit_u)
     finally:
         # Always leave the instruments idle/normal — even on Ctrl-C or error.
-        for name, fn in (("awg.stop", awg.stop),
-                         ("scope.restore", lambda: scope.restore(channel=SIG_CH))):
+        cleanups = [("awg.stop", awg.stop)]
+        if scope is not None:
+            cleanups.append(("scope.restore", lambda: scope.restore(channel=SIG_CH)))
+        for name, fn in cleanups:
             try:
                 fn()
             except Exception as e:

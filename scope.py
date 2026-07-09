@@ -77,6 +77,13 @@ class Scope:
         with self._lock:
             self._dev.write(f"HORizontal:SCAle {scale:.3e}")
 
+    def set_horizontal_position(self, percent):
+        """Trigger position as % of the record (default 50). Set ~10 before
+        capturing a triggered burst/chirp so most of the record is post-trigger."""
+        self._pre.clear()
+        with self._lock:
+            self._dev.write(f"HORizontal:POSition {percent:.0f}")
+
     def get_waveform(self, channel=1, max_points=10000):
         """Read current waveform buffer without stopping acquisition.
 
@@ -125,14 +132,17 @@ class Scope:
                 time.sleep(0.005)
             else:
                 print("measure_vpp: acquisition timeout — reading buffer anyway\n")
-            if 'ymult' not in self._pre:
-                self._pre['xincr'] = float(self._dev.query("WFMOutpre:XINcr?"))
-                self._pre['ymult'] = float(self._dev.query("WFMOutpre:YMUlt?"))
-                self._pre['yzero'] = float(self._dev.query("WFMOutpre:YZEro?"))
-                self._pre['rl']    = int(self._dev.query("HORizontal:RECOrdlength?"))
+            # Select the data source FIRST — the preamble describes the currently
+            # selected source, so querying it before DATa:SOUrce can return another
+            # channel's vertical scaling. Always re-query here (cheap per sweep
+            # step) so front-panel scale changes can't leave the cache stale.
             self._dev.write(f"DATa:SOUrce CH{channel}")
             self._dev.write("DATa:ENCdg ASCIi")
             self._dev.write("DATa:STARt 1")
+            self._pre['xincr'] = float(self._dev.query("WFMOutpre:XINcr?"))
+            self._pre['ymult'] = float(self._dev.query("WFMOutpre:YMUlt?"))
+            self._pre['yzero'] = float(self._dev.query("WFMOutpre:YZEro?"))
+            self._pre['rl']    = int(self._dev.query("HORizontal:RECOrdlength?"))
             pts = self._pre['rl']   # download full record — consistent cycle count
             self._dev.write(f"DATa:STOP {pts}")
             raw_str = self._dev.query("CURVe?")
@@ -156,6 +166,7 @@ class Scope:
             self._dev.write(f"TRIGger:A:EDGE:SOUrce CH{channel}")
             self._dev.write("TRIGger:A:MODe AUTO")
             self._dev.write(f"TRIGger:A:LEVEL:CH{channel} 0.0")
+            self._dev.write("HORizontal:POSition 50")
             self._dev.write("ACQuire:STOPAfter RUNSTop")
             self._dev.write("ACQuire:STATE RUN")
         self._pre.clear()
