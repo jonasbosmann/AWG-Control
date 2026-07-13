@@ -15,19 +15,32 @@ class Scope:
         self._dev.read_termination = '\n'
         self._dev.write_termination = '\n'
         self._dev.timeout = 3000
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 self._dev.clear()
             except Exception:
                 pass
             self._dev.write("*CLS")
+            # Drain stale unread replies a previous session can leave on the
+            # scope's socket server — one leftover line shifts EVERY following
+            # query response by one (seen as *IDN? returning '1').
+            self._dev.timeout = 300
+            try:
+                while True:
+                    self._dev.read()
+            except Exception:
+                pass
+            self._dev.timeout = 3000
             try:
                 idn = self._dev.query("*IDN?").strip()
-                break
             except Exception:
-                if attempt == 1:
+                if attempt == 2:
                     raise
                 time.sleep(0.3)
+                continue
+            if "TEKTRONIX" in idn.upper():
+                break
+            # a stale reply was consumed as the IDN — drain again and retry
         print("Scope:", idn)
         self._dev.timeout = 10000
 

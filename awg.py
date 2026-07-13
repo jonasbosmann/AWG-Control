@@ -38,6 +38,21 @@ class AWG:
         else:
             print(f"  ERROR {c.lstrip(':')} -> {err.strip()}")
 
+    def _drain_errs(self, context):
+        """Empty the SCPI error queue; raise if anything was in it.
+
+        Guard for raw-write fast paths: fw 1.237.0 rejects some commands
+        silently or with queued errors only, so unchecked writes can corrupt
+        a measurement with no trace (see the DUC IQM=NONE incident)."""
+        errs = []
+        for _ in range(10):
+            e = self._dev.query(":SYST:ERR?").strip()
+            if e.startswith("0"):
+                break
+            errs.append(e)
+        if errs:
+            raise RuntimeError(f"AWG error after {context}: {'; '.join(errs)}")
+
     def _setup(self, channel=1, reset=True, sample_rate=None):
         rate = sample_rate if sample_rate is not None else self.sample_rate
         if reset:
@@ -70,7 +85,9 @@ class AWG:
         nb_str = str(len(data))
         self._dev.write_raw(f":TRAC:DATA #{len(nb_str)}{nb_str}".encode() + data + b"\n")
         time.sleep(0.3)
-        self._dev.write("*CLS")
+        # Check instead of *CLS — the old *CLS silently WIPED upload errors,
+        # so a rejected transfer played a stale/garbage segment without trace.
+        self._drain_errs(f"TRAC:DATA (segment {segnum})")
         print("  OK    TRAC:DATA")
 
     def _play(self, amplitude_vpp=0.5, segnum=1):
@@ -203,6 +220,8 @@ class AWG:
                 self._dev.write_raw(
                     f":TRAC:DATA #{len(nb_str)}{nb_str}".encode() + data + b"\n")
                 time.sleep(0.15)
+                self._drain_errs(f"preload of segment {segnum} "
+                                 f"({actual/1e6:.1f} MHz)")
                 results.append((actual, segnum))
                 print(f"  preload seg {segnum}: {actual/1e6:.3f} MHz")
         return results
@@ -223,6 +242,7 @@ class AWG:
                 self._dev.write(f":OUTP ON")
                 self._sweep_amp[channel] = amplitude_vpp
             self._dev.query("*OPC?")   # block until AWG has processed the switch
+            self._drain_errs(f"sweep_step to segment {segnum}")
             self._active_seg[channel] = segnum
 
     def _chirp_windowed_u16(self, f_start, f_stop, n_active, n_total, rate, window_frac=0.05):
@@ -625,6 +645,7 @@ class AWG:
             self._dev.write(f":INST:CHAN {channel}")
             self._dev.write(f":NCO:CFR1 {freq_hz:.0f}")
             self._dev.query("*OPC?")
+            self._drain_errs(f"NCO retune to {freq_hz/1e6:.1f} MHz")
         return freq_hz
 
     def send_chirp_duc_sync(self, f_carrier_chirp_hz, f_start_bb_hz, f_stop_bb_hz,
