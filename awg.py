@@ -342,37 +342,13 @@ class AWG:
               f"dead {n_dead/rate_cx*1e6:.3f} µs  "
               f"period {n_total/rate_cx*1e6:.3f} µs  ({n_total:,} cx samp)")
 
-        # Interpolation factor: ONE-mode complex (baseband) rate = DAC_rate / INT
-        # (manual §5.4/§5.9). complex rate = FREQ:RAST / INT, must be ≤ 1.25 GS/s.
-        # rate=9 GS/s, rate_cx=1.125 GS/s → INT X8.
-        int_map = {2: "X2", 4: "X4", 8: "X8"}
-        int_kw = int_map[round(rate / rate_cx)]
-
         def _duc_ch(ch, segnum, data_u16, ncof):
-            # Ordering matches Tabor's "how to program" DUC recipe and avoids two fw
-            # traps found by readback:
-            #  - :SOUR:INT is only valid in DUC mode (err 223 "settings conflict" in DIRECT).
-            #  - :SOUR:IQM ONE validates complex rate = FREQ:RAST/INT ≤ 1.25 GS/s at the
-            #    moment it is issued (err 204 "out of range" if clock is still 9 GHz).
-            # So: set clock to the BASEBAND rate first, switch to DUC, set IQM then INT,
-            # and only then raise the clock to the interpolated (9 GHz) rate.
-            self._cmd(f":INST:CHAN {ch}")
-            self._cmd(f":FREQ:RAST {rate_cx:.0f}")   # baseband rate first
-            self._cmd(":MODE DUC")
-            self._cmd(":SOUR:IQM ONE")               # valid: complex rate = rate_cx ≤ 1.25 GS/s
-            self._cmd(f":SOUR:INT {int_kw}")         # now in DUC mode → no conflict
-            self._cmd(f":FREQ:RAST {rate:.0f}")      # raise to interpolated DAC clock (9 GHz)
-            mode = self._dev.query(":MODE?").strip()
-            iqm  = self._dev.query(":SOUR:IQM?").strip()
-            print(f"  MODE? -> {mode!r}   IQM? -> {iqm!r}")
-            self._cmd(":INIT:CONT ON")
-            self._upload(data_u16, segnum=segnum)
-            self._cmd(f":FUNC:MODE:SEGM {segnum}")
-            self._cmd(f":VOLT {amplitude_vpp:.3f}")
-            self._cmd(":NCO:SIXD1 ON")
-            self._cmd(f":NCO:CFR1 {ncof:.0f}")
-            self._cmd(":OUTP ON")
-            self._cmd(f":FREQ:RAST {rate:.0f}")
+            # Shared verified recipe (ordering + IQM readback guard) — see
+            # _duc_upload_ch. An earlier local copy set :SOUR:IQM ONE before
+            # :SOUR:INT / the final clock, which fw 1.237.0 silently ignores
+            # (IQM stayed NONE → garbled multi-tone output).
+            self._duc_upload_ch(ch, segnum, data_u16, ncof, rate, rate_cx,
+                                amplitude_vpp)
 
         def _dump(ch):
             # Read back the state that actually determines DUC behaviour, per channel,
@@ -497,15 +473,35 @@ class AWG:
         return (np.round(iq * 32767.0) + 32768.0).clip(1, 65535).astype(np.uint16)
 
     def _duc_upload_ch(self, ch, segnum, data_u16, ncof, rate, rate_cx, amp):
-        """Per-channel DUC/IQM-ONE upload (same ordering as send_chirp_with_lo_duc:
-        baseband clock first -> DUC -> IQM ONE -> INT -> raise clock)."""
+        """Per-channel DUC/IQM-ONE upload.
+
+        Ordering verified per-command against fw 1.237.0 (2026-07-13 probe):
+          1. :MODE DUC, then :SOUR:INT. The firmware flags a spurious
+             '22, Invalid argument' on :SOUR:INT while the clock is still low
+             but APPLIES the value anyway — so it is verified by readback
+             below, not by the error code.
+          2. :FREQ:RAST to the interpolated DAC clock — must come after INT
+             (with INT still NONE, a 9 GHz clock implies complex rate 9 GS/s
+             > 1.25 GS/s → '223, settings conflict' on everything after).
+          3. :SOUR:IQM ONE LAST. Sent any earlier (INT still NONE, clock
+             still low) the firmware SILENTLY ignores it: no SCPI error,
+             readback stays NONE, and the interleaved I/Q segment plays as a
+             garbled multi-tone real waveform instead of a clean carrier.
+        """
         int_kw = {2: "X2", 4: "X4", 8: "X8"}[round(rate / rate_cx)]
         self._cmd(f":INST:CHAN {ch}")
-        self._cmd(f":FREQ:RAST {rate_cx:.0f}")
         self._cmd(":MODE DUC")
-        self._cmd(":SOUR:IQM ONE")
-        self._cmd(f":SOUR:INT {int_kw}")
+        self._dev.write(f":SOUR:INT {int_kw}")   # known-spurious err 22
+        time.sleep(0.05)
+        self._dev.query(":SYST:ERR?")            # drain it; verified below
         self._cmd(f":FREQ:RAST {rate:.0f}")
+        self._cmd(":SOUR:IQM ONE")
+        iqm  = self._dev.query(":SOUR:IQM?").strip()
+        intp = self._dev.query(":SOUR:INT?").strip()
+        if iqm != "ONE" or intp != int_kw:
+            raise RuntimeError(
+                f"CH{ch} DUC setup failed: IQM={iqm!r} (want 'ONE'), "
+                f"INT={intp!r} (want {int_kw!r}) — output would be garbled")
         self._cmd(":INIT:CONT ON")
         self._upload(data_u16, segnum=segnum)
         self._cmd(f":FUNC:MODE:SEGM {segnum}")
@@ -589,6 +585,48 @@ class AWG:
             self._active_seg[2] = 2
         return carrier_hz
 
+    def duc_cw_setup(self, freq_hz, amplitude_vpp=0.5, channel=1, n_total=4096):
+        """One-time DUC/IQM-ONE CW setup for an NCO-stepped frequency sweep.
+
+        Uploads a constant complex baseband (I=1, Q=0) once — the output is a
+        pure carrier at the NCO frequency. duc_cw_step() then retunes :NCO:CFR1
+        only, with no waveform re-upload, so each sweep step costs milliseconds
+        and every frequency is exact (no integer-cycles quantization).
+        9 GS/s DAC clock, X8 interpolation → NCO reaches the 4.5 GHz Nyquist.
+        """
+        rate = 9e9
+        rate_cx = rate / 8.0
+        if not 0 < freq_hz <= rate / 2:
+            raise ValueError(f"{freq_hz/1e6:.1f} MHz outside DUC NCO range "
+                             f"(0–{rate/2e9:g} GHz]")
+        n_total = max(int(np.ceil(n_total / 32)) * 32, 64)
+        ch1 = self._iq_to_u16(np.ones(n_total), np.zeros(n_total))
+        print(f"[DUC CW sweep] CH{channel} start {freq_hz/1e6:.4f} MHz  "
+              f"(9 GS/s DAC, X8, NCO-stepped)")
+        with self._lock:
+            self._dev.write("*CLS; *RST"); time.sleep(0.5); self._dev.query("*OPC?")
+            self._rate_sent.clear()
+            self._cmd(f":INST:CHAN {channel}"); self._cmd(":TRAC:DEL:ALL")
+            self._duc_upload_ch(channel, 1, ch1, freq_hz, rate, rate_cx, amplitude_vpp)
+            self._active_seg[channel] = 1
+        return freq_hz
+
+    def duc_cw_step(self, freq_hz, channel=1):
+        """Retune the NCO carrier of a channel prepared by duc_cw_setup().
+
+        Only :NCO:CFR1 changes — the constant baseband keeps playing. *OPC?
+        blocks until the AWG has processed the retune (same pattern as
+        sweep_step). Raw writes, no per-command error polling, for speed.
+        """
+        if not 0 < freq_hz <= 4.5e9:
+            raise ValueError(f"{freq_hz/1e6:.1f} MHz outside DUC NCO range "
+                             f"(0–4.5 GHz]")
+        with self._lock:
+            self._dev.write(f":INST:CHAN {channel}")
+            self._dev.write(f":NCO:CFR1 {freq_hz:.0f}")
+            self._dev.query("*OPC?")
+        return freq_hz
+
     def send_chirp_duc_sync(self, f_carrier_chirp_hz, f_start_bb_hz, f_stop_bb_hz,
                             chirp_us, dead_us, amplitude_vpp=0.5, window_frac=0.05,
                             sync_pulse_ns=40, sync_amp_vpp=0.8, sync_carrier_hz=None):
@@ -628,13 +666,13 @@ class AWG:
         return n_chirp / rate_cx
 
     def stop(self):
+        # No :ABORt here — the Proteus rejects it ('209, illegal/unknown scpi'
+        # on fw 1.237.0); :INIT:CONT OFF + :OUTP OFF is the whole recipe.
         with self._lock:
             for ch in [1, 2]:
                 self._dev.write(f":INST:CHAN {ch}")
                 time.sleep(0.05)
                 self._dev.write(":INIT:CONT OFF")
-                time.sleep(0.05)
-                self._dev.write(":ABOR")
                 time.sleep(0.05)
                 self._dev.write(":OUTP OFF")
                 time.sleep(0.05)

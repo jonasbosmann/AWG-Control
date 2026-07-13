@@ -77,6 +77,14 @@ class Scope:
         with self._lock:
             self._dev.write(f"HORizontal:SCAle {scale:.3e}")
 
+    def set_vertical(self, channel, volts_per_div):
+        """Set vertical scale (V/div), clamped to the MSO64B 50 Ω input range."""
+        volts_per_div = min(max(volts_per_div, 1e-3), 1.0)
+        self._pre.clear()
+        with self._lock:
+            self._dev.write(f"CH{channel}:SCAle {volts_per_div:.4e}")
+        return volts_per_div
+
     def set_horizontal_position(self, percent):
         """Trigger position as % of the record (default 50). Set ~10 before
         capturing a triggered burst/chirp so most of the record is post-trigger."""
@@ -112,7 +120,12 @@ class Scope:
 
         Sequence:
           1. sleep(settle) — AWG glitch transients die away while scope runs freely
-          2. SEQuence + RUN — arm scope for exactly one acquisition
+          2. STOP, then SEQuence + RUN — arm scope for exactly one acquisition.
+             The explicit STOP matters in average mode: the scope free-runs
+             between calls accumulating averages of the OLD signal, and arming
+             SEQuence while already running can complete the sequence with that
+             stale average mixed in. STOP→RUN restarts averaging from zero, so
+             every averaged waveform is acquired after the settle sleep.
           3. Poll ACQuire:STATE? until '0' (STOP) — guarantees the acquisition is
              actually complete before we read (unlike *OPC? over LAN, which returns
              as soon as the command is parsed, not when the hardware finishes)
@@ -122,6 +135,7 @@ class Scope:
         if settle > 0:
             time.sleep(settle)
         with self._lock:
+            self._dev.write("ACQuire:STATE STOP")
             self._dev.write("ACQuire:STOPAfter SEQuence")
             self._dev.write("ACQuire:STATE RUN")
             deadline = time.perf_counter() + acq_timeout
@@ -154,6 +168,33 @@ class Scope:
         v_ac = v - np.mean(v)
         vrms = np.sqrt(np.mean(v_ac ** 2))
         vpp = float(2.0 * np.sqrt(2.0) * vrms)    # Vpp = 2√2 · Vrms for sine
+        return vpp, t, v
+
+    def measure_vpp_auto(self, channel=1, settle=0.1, target_frac=0.75,
+                         max_retries=2):
+        """measure_vpp with vertical autoscale.
+
+        Re-measures with the channel rescaled so the waveform fills
+        ~target_frac of the 10-division screen whenever the current scale is
+        badly matched — too big (clipping distorts the RMS-based Vpp) or too
+        small (quantization/noise dominates). The scale persists between
+        calls, so across a smooth sweep most points measure once.
+        """
+        vpp, t, v = self.measure_vpp(channel, settle=settle)
+        for _ in range(max_retries):
+            if vpp <= 0:
+                break
+            with self._lock:
+                scale = float(self._dev.query(f"CH{channel}:SCAle?"))
+            full = 10.0 * scale
+            if 0.3 * full <= vpp <= 0.95 * full:
+                break
+            new_scale = self.set_vertical(channel, vpp / (10.0 * target_frac))
+            if abs(new_scale - scale) < 0.05 * scale:
+                break   # clamped at an input-range limit — can't improve
+            print(f"  vscale {scale*1e3:.3g} -> {new_scale*1e3:.3g} mV/div, "
+                  f"re-measuring\n")
+            vpp, t, v = self.measure_vpp(channel, settle=settle)
         return vpp, t, v
 
     def restore(self, channel=1):

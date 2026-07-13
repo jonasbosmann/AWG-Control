@@ -412,7 +412,7 @@ class LabGUI:
                      width=6, state='readonly').grid(row=1, column=1, sticky='ew', padx=(4, 0), pady=2)
 
         ttk.Label(w, text="Settle (ms)").grid(row=2, column=0, sticky='w', pady=2)
-        self._settle_var = tk.StringVar(value="50")
+        self._settle_var = tk.StringVar(value="200")
         ttk.Entry(w, textvariable=self._settle_var, width=6).grid(
             row=2, column=1, sticky='ew', padx=(4, 0), pady=2)
 
@@ -421,8 +421,22 @@ class LabGUI:
         ttk.Entry(w, textvariable=self._cycles_var, width=6).grid(
             row=3, column=1, sticky='ew', padx=(4, 0), pady=2)
 
+        ttk.Label(w, text="AWG mode").grid(row=4, column=0, sticky='w', pady=2)
+        self._sweep_mode_var = tk.StringVar(value="DUC (NCO step)")
+        ttk.Combobox(w, textvariable=self._sweep_mode_var,
+                     values=["Direct (segments)", "DUC (NCO step)"],
+                     width=16, state='readonly').grid(
+            row=4, column=1, sticky='ew', padx=(4, 0), pady=2)
+
+        # Blank = DEFAULT_FREQS. Comma list ("100, 500, 2000") or
+        # "start:stop:step" ("100:4400:100"), all in MHz.
+        ttk.Label(w, text="Freqs (MHz)").grid(row=5, column=0, sticky='w', pady=2)
+        self._sweep_freqs_var = tk.StringVar(value="100:4400:100")
+        ttk.Entry(w, textvariable=self._sweep_freqs_var, width=6).grid(
+            row=5, column=1, sticky='ew', padx=(4, 0), pady=2)
+
         btn = ttk.Button(w, text="Frequency Sweep", command=self._run_sweep)
-        btn.grid(row=4, column=0, columnspan=2, sticky='ew', pady=(6, 2))
+        btn.grid(row=6, column=0, columnspan=2, sticky='ew', pady=(6, 2))
         self._sweep_btn = btn
         self._action_btns.append(btn)
 
@@ -477,6 +491,31 @@ class LabGUI:
         return (float(self._freq1_var.get()) * 1e6,
                 float(self._amp1_var.get()),
                 1)
+
+    @staticmethod
+    def _parse_sweep_freqs(text):
+        """Sweep frequency field (MHz) → list of Hz, or None for DEFAULT_FREQS.
+
+        Accepts a comma list ("100, 500, 2000") or an inclusive range
+        "start:stop:step" ("100:4400:100").
+        """
+        text = text.strip()
+        if not text:
+            return None
+        if ':' in text:
+            parts = text.split(':')
+            if len(parts) != 3:
+                raise ValueError("range must be start:stop:step (MHz)")
+            a, b, s = (float(x) for x in parts)
+            if s <= 0 or b < a:
+                raise ValueError("range needs step > 0 and stop >= start")
+            n = int(np.floor((b - a) / s + 0.5)) + 1   # inclusive, fp-robust
+            freqs = [(a + i * s) * 1e6 for i in range(n)]
+        else:
+            freqs = [float(x) * 1e6 for x in text.split(',') if x.strip()]
+        if not freqs or any(f <= 0 for f in freqs):
+            raise ValueError("frequencies must be positive (MHz)")
+        return freqs
 
     def _need_awg(self):
         if self.awg is None:
@@ -618,6 +657,8 @@ class LabGUI:
             _, amp, awg_ch = self._std_params()
             settle_s = float(self._settle_var.get()) / 1000.0
             n_cycles = int(self._cycles_var.get())
+            use_duc = "DUC" in self._sweep_mode_var.get()
+            custom_freqs = self._parse_sweep_freqs(self._sweep_freqs_var.get())
         except Exception as e:
             print(f"Sweep param error: {e}\n")
             self._set_busy(False)
@@ -631,28 +672,48 @@ class LabGUI:
             n_avg = int(self._sweep_avg_var.get())
             scope_ch = int(self._sweep_chan_var.get())
             try:
+                base_freqs = custom_freqs if custom_freqs is not None else DEFAULT_FREQS
                 # Drop frequencies above Nyquist — they would silently alias
                 # (the buffer wraps) and log a bogus "actual" frequency.
-                nyq = self.awg.sample_rate / 2
-                freqs = [f for f in DEFAULT_FREQS if f <= nyq]
-                skipped = [f for f in DEFAULT_FREQS if f > nyq]
+                # DUC: the NCO reaches the 9 GS/s DAC Nyquist (4.5 GHz)
+                # regardless of the GUI channel-mode clock.
+                dac_rate = 9e9 if use_duc else self.awg.sample_rate
+                nyq = dac_rate / 2
+                freqs = [f for f in base_freqs if f <= nyq]
+                skipped = [f for f in base_freqs if f > nyq]
                 if skipped:
                     print(f"Skipping {len(skipped)} freqs above Nyquist "
-                          f"({nyq/1e6:.0f} MHz at {self.awg.sample_rate/1e9:g} GS/s): "
+                          f"({nyq/1e6:.0f} MHz at {dac_rate/1e9:g} GS/s): "
                           f"{', '.join(f'{f/1e6:.0f}' for f in skipped)} MHz\n")
+                if not freqs:
+                    print("No sweep frequencies at or below Nyquist — nothing to do.\n")
+                    return
 
-                # Pre-load all segments once; the sweep loop then just switches
-                print("Pre-loading waveform segments…\n")
-                t_pre0 = time.perf_counter()
-                self.awg.send_sine(freqs[0], amp, channel=awg_ch, reset=True)
-                t_pre1 = time.perf_counter()
-                print(f"  send_sine: {(t_pre1-t_pre0):.1f} s\n")
-                segments = self.awg.sweep_preload(freqs, channel=awg_ch)
-                t_pre2 = time.perf_counter()
-                print(f"  sweep_preload: {(t_pre2-t_pre1):.1f} s\n")
+                if use_duc:
+                    # One-time DUC setup; each step only retunes the NCO, so
+                    # frequencies are exact (actual = target).
+                    print("Setting up DUC CW (NCO-stepped)…\n")
+                    t_pre0 = time.perf_counter()
+                    self.awg.duc_cw_setup(freqs[0], amp, channel=awg_ch)
+                    print(f"  duc_cw_setup: {(time.perf_counter()-t_pre0):.1f} s\n")
+                    segments = [(f, None) for f in freqs]
+                else:
+                    # Pre-load all segments once; the sweep loop then just switches
+                    print("Pre-loading waveform segments…\n")
+                    t_pre0 = time.perf_counter()
+                    self.awg.send_sine(freqs[0], amp, channel=awg_ch, reset=True)
+                    t_pre1 = time.perf_counter()
+                    print(f"  send_sine: {(t_pre1-t_pre0):.1f} s\n")
+                    segments = self.awg.sweep_preload(freqs, channel=awg_ch)
+                    t_pre2 = time.perf_counter()
+                    print(f"  sweep_preload: {(t_pre2-t_pre1):.1f} s\n")
 
                 if self.scope is not None:
                     self.scope.setup(channel=scope_ch, n_averages=n_avg)
+                    # Start with the vertical scale matched to the commanded
+                    # amplitude (~75% of the 10-div screen); measure_vpp_auto
+                    # then tracks the signal as it rolls off.
+                    self.scope.set_vertical(scope_ch, amp / 7.5)
                     print(f"  scope: CH{scope_ch}, {n_avg}× avg\n")
 
                 ref_vpp = None
@@ -667,16 +728,20 @@ class LabGUI:
                         break
 
                     t0 = time.perf_counter()
-                    self.awg.sweep_step(segnum, amp, channel=awg_ch)
+                    if use_duc:
+                        self.awg.duc_cw_step(f, channel=awg_ch)
+                    else:
+                        self.awg.sweep_step(segnum, amp, channel=awg_ch)
                     t1 = time.perf_counter()
-                    print(f"  sweep_step: {(t1-t0)*1000:.0f} ms\n")
+                    print(f"  {'duc_cw_step' if use_duc else 'sweep_step'}: "
+                          f"{(t1-t0)*1000:.0f} ms\n")
 
                     if self.scope is not None:
                         t2 = time.perf_counter()
                         self.scope.set_timebase(actual, n_cycles=n_cycles)
                         t3 = time.perf_counter()
                         print(f"  set_timebase: {(t3-t2)*1000:.0f} ms\n")
-                        vpp, wt, wv = self.scope.measure_vpp(
+                        vpp, wt, wv = self.scope.measure_vpp_auto(
                             channel=scope_ch, settle=settle_s)
                         t4 = time.perf_counter()
                         print(f"  measure_vpp: {(t4-t3)*1000:.0f} ms\n")
@@ -701,7 +766,8 @@ class LabGUI:
                         # Pass list copies: the worker keeps appending.
                         self.root.after(0, self._draw_sweep_step,
                                         wt, wv, actual, vpp,
-                                        list(freqs_plot), list(losses_plot))
+                                        list(freqs_plot), list(losses_plot),
+                                        dac_rate)
                     else:
                         print(f"{f/1e6:>14.1f}  {actual/1e6:>14.3f}  {'(no scope)':>10}")
 
@@ -713,11 +779,16 @@ class LabGUI:
                     try:
                         params = {
                             "amplitude_vpp": amp, "awg_ch": awg_ch,
+                            "awg_mode": "duc_nco" if use_duc else "direct_segments",
+                            "dac_rate_hz": dac_rate,
                             "scope_ch": scope_ch, "n_averages": n_avg,
                             "settle_ms": settle_s * 1000.0, "cycles_shown": n_cycles,
                             "sample_rate_hz": self.awg.sample_rate,
                             "n_samples": self.awg.n_samples,
                         }
+                        if use_duc:
+                            params["interpolation"] = "X8"
+                            params["baseband_rate_hz"] = dac_rate / 8.0
                         path = sweeplog.save_sweep(name, desc, photo, params, records)
                         print(f"Saved {len(records)} points -> {path}\n")
                     except Exception as e:
@@ -726,7 +797,8 @@ class LabGUI:
 
         self._thread(sweep)
 
-    def _draw_sweep_step(self, wt, wv, actual, vpp, freqs_plot, losses_plot):
+    def _draw_sweep_step(self, wt, wv, actual, vpp, freqs_plot, losses_plot,
+                         dac_rate=None):
         """Main-thread only: per-step sweep plot (waveform + loss curve)."""
         self._fig.clear()
         ax1 = self._fig.add_subplot(211)
@@ -736,7 +808,16 @@ class LabGUI:
         ax1.set_title(f"{actual/1e6:.3f} MHz — Vpp {vpp*1e3:.1f} mV")
         ax1.grid(True)
         ax2 = self._fig.add_subplot(212)
-        ax2.plot(freqs_plot, losses_plot, 'o-')
+        ax2.plot(freqs_plot, losses_plot, 'o-', label="measured")
+        if dac_rate and len(freqs_plot) > 1:
+            # Ideal zero-order-hold DAC roll-off, sinc(f/Fs), normalized to the
+            # same reference frequency as the measured loss (the first point).
+            fgrid = np.linspace(min(freqs_plot), max(freqs_plot), 200)
+            theory = (20 * np.log10(np.sinc(fgrid * 1e6 / dac_rate))
+                      - 20 * np.log10(np.sinc(freqs_plot[0] * 1e6 / dac_rate)))
+            ax2.plot(fgrid, theory, '--', color='gray',
+                     label=f"DAC sinc @ {dac_rate/1e9:g} GS/s")
+            ax2.legend(fontsize=8)
         ax2.set_xlabel("Frequency (MHz)")
         ax2.set_ylabel("Loss (dB)")
         ax2.grid(True)
