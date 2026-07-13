@@ -8,9 +8,9 @@ Each sweep is written as ONE self-contained, human-readable JSON file under
 
 The JSON keeps the metadata + per-frequency summary pretty-printed, while the
 raw waveform samples are stored as compact single-line arrays (rounded) so the
-file stays readable without exploding to one line per sample.  The time axis is
-NOT stored per sample — it is linear, so only the sample step ``dt_s`` is kept
-and reconstructed on load as ``t = arange(n) * dt_s``.
+file stays readable without exploding to one line per sample.  The time axis
+is stored the same way (``time_s``) alongside ``dt_s``; older files without a
+stored axis are reconstructed on load as ``t = arange(n) * dt_s``.
 """
 
 import json
@@ -32,7 +32,8 @@ def save_sweep(setup_name, description, photo_path, params, records):
     """Write one sweep run to disk and return the JSON path.
 
     records: list of dicts, one per frequency, each with keys
-        target_hz, actual_hz, vpp_v, loss_db, dt_s, voltage (1-D array-like).
+        target_hz, actual_hz, vpp_v, loss_db, dt_s, voltage (1-D array-like)
+        and optionally time (1-D array-like, the scope's time axis in s).
     """
     os.makedirs(SWEEP_DIR, exist_ok=True)
     ts   = time.strftime("%Y-%m-%d_%H%M%S")
@@ -65,7 +66,9 @@ def save_sweep(setup_name, description, photo_path, params, records):
                              if np.isfinite(r["loss_db"]) else None,
                 "dt_s":      float(r["dt_s"]),
                 "n_points":  int(len(r["voltage"])),
-                "voltage_v": f"@@WF{i}@@",   # placeholder → compact array below
+                # placeholders → compact one-line arrays below
+                "time_s":    f"@@WT{i}@@" if r.get("time") is not None else None,
+                "voltage_v": f"@@WF{i}@@",
             }
             for i, r in enumerate(records)
         ],
@@ -74,6 +77,9 @@ def save_sweep(setup_name, description, photo_path, params, records):
     text = json.dumps(doc, indent=2)
     # Swap each placeholder for a compact one-line array of the samples.
     for i, r in enumerate(records):
+        if r.get("time") is not None:
+            arr = "[" + ",".join(f"{float(x):.6g}" for x in r["time"]) + "]"
+            text = text.replace(f'"@@WT{i}@@"', arr, 1)
         arr = "[" + ",".join(f"{float(x):.6g}" for x in r["voltage"]) + "]"
         text = text.replace(f'"@@WF{i}@@"', arr, 1)
 
@@ -94,5 +100,8 @@ def load_sweep(path):
     for m in doc.get("measurements", []):
         v = np.asarray(m["voltage_v"], dtype=float)
         m["voltage_v"] = v
-        m["time_s"] = np.arange(len(v)) * m["dt_s"]
+        if m.get("time_s") is not None:
+            m["time_s"] = np.asarray(m["time_s"], dtype=float)
+        else:   # older files: reconstruct the linear axis from the step
+            m["time_s"] = np.arange(len(v)) * m["dt_s"]
     return doc

@@ -756,7 +756,7 @@ class LabGUI:
                         records.append({
                             "target_hz": f, "actual_hz": actual,
                             "vpp_v": vpp, "loss_db": loss,
-                            "dt_s": dt_s, "voltage": wv,
+                            "dt_s": dt_s, "time": wt, "voltage": wv,
                         })
 
                         # Live per-step plot — drawn on the Tk main thread only.
