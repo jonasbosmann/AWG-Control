@@ -7,3 +7,6 @@ resources/
 
 # Saved sweep measurements (experimental data)
 sweeps/
+
+# Microwave-chain setup photos (originals; copies land in sweeps/ per run)
+setup_photos/
