@@ -13,3 +13,6 @@ setup_photos/
 
 # Saved spectrum analyzer traces (experimental data)
 specan_traces/
+
+# Saved chirp-quality captures (experimental data)
+chirp_captures/

@@ -53,6 +53,25 @@ class AWG:
         if errs:
             raise RuntimeError(f"AWG error after {context}: {'; '.join(errs)}")
 
+    def set_reference_external(self, freq_mhz=10):
+        """Lock the AWG's clock to an external 10/100 MHz reference (e.g.
+        the scope's REF OUT) instead of its own internal 1 ppm TCXO.
+
+        Needs a physical cable: scope REF OUT (BNC) -> AWG REF IN (BNC).
+        Without this, even software-aligned averaging
+        (chirp_quality.align_and_average()) can only correct a constant
+        per-shot time OFFSET between AWG and scope -- independent,
+        unsynchronized clocks also drift the whole waveform's timebase
+        slightly differently on every shot (worse at higher frequency,
+        since more phase accumulates per ppm of clock mismatch over the
+        same duration), which a simple time-shift alignment cannot undo.
+        Sharing one reference removes that drift at the source.
+        """
+        freq_kw = {10: "10M", 100: "100M"}[freq_mhz]
+        with self._lock:
+            self._cmd(":ROSC:SOUR EXT")
+            self._cmd(f":ROSC:FREQ {freq_kw}")
+
     def _setup(self, channel=1, reset=True, sample_rate=None):
         rate = sample_rate if sample_rate is not None else self.sample_rate
         if reset:

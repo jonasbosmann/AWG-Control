@@ -45,7 +45,7 @@ class Scope:
         self._dev.timeout = 10000
 
     def setup(self, channel=1, n_averages=1, trigger_channel=None, trigger_level=0.0,
-              trigger_mode="AUTO"):
+              trigger_mode="AUTO", trigger_slope="RISe"):
         """Configure acquisition and edge trigger.
 
         trigger_channel: if given, trigger on that channel while measuring `channel`
@@ -55,6 +55,12 @@ class Scope:
         trigger_mode: 'AUTO' (free-runs if no trigger — WASHES OUT coherent averaging)
         or 'NORMal' (only acquire/average on genuine triggers — required for coherent
         averaging on a CH2 sync pulse).
+        trigger_slope: 'RISe' (default) or 'FALL'. For a start-of-buffer sync pulse that
+        shares its buffer with the signal under test (both start at sample 0), triggering
+        on the pulse's FALLing edge instead of its RISing edge moves the trigger reference
+        point to the END of the pulse rather than its start — giving a guaranteed
+        pulse-width's worth of extra margin before the signal of interest, and a cleaner/
+        more certain edge to detect than a possibly slow rising transition.
         """
         trig_ch = trigger_channel if trigger_channel is not None else channel
         with self._lock:
@@ -69,20 +75,80 @@ class Scope:
                 self._dev.write("ACQuire:MODe SAMple")
             self._dev.write("TRIGger:A:TYPe EDGE")
             self._dev.write(f"TRIGger:A:EDGE:SOUrce CH{trig_ch}")
-            self._dev.write("TRIGger:A:EDGE:SLOpe RISe")
+            self._dev.write(f"TRIGger:A:EDGE:SLOpe {trigger_slope}")
             self._dev.write(f"TRIGger:A:MODe {trigger_mode}")
             self._dev.write(f"TRIGger:A:LEVEL:CH{trig_ch} {trigger_level:.3f}")
             self._dev.write("ACQuire:STOPAfter RUNSTop")
             self._dev.write("ACQuire:STATE RUN")
         self._pre.clear()
         mode = f"{n_averages}× avg" if n_averages > 1 else "sample"
-        trig = f", trig CH{trig_ch}@{trigger_level:.2f}V {trigger_mode}" if trig_ch != channel else ""
+        trig = f", trig CH{trig_ch}@{trigger_level:.2f}V {trigger_mode} {trigger_slope}" if trig_ch != channel else ""
         print(f"Scope: CH{channel} @ 50 Ω, {mode}{trig}\n")
 
     def set_timebase_direct(self, seconds_per_div):
         self._pre.clear()
         with self._lock:
             self._dev.write(f"HORizontal:SCAle {seconds_per_div:.3e}")
+
+    def set_record_length(self, n_points):
+        """Set the acquisition record length (memory depth) directly.
+
+        Only takes effect reliably in MANUAL horizontal mode (see
+        set_max_sample_rate) -- in the default AUTO/CONSTANT modes the scope
+        recalculates record length/sample rate itself whenever HORizontal:
+        SCAle changes, silently overriding a plain RECOrdlength write.
+        """
+        self._pre.clear()
+        with self._lock:
+            self._dev.write(f"HORizontal:RECOrdlength {int(n_points)}")
+
+    def set_active_channels(self, channels, n_channels=4):
+        """Turn ON the given channels and OFF all others.
+
+        This scope's real-time sample rate is tiered by how many channels
+        are active (e.g. 1 active -> fastest tier, 2 -> half that, 4 ->
+        quarter) -- leaving unused channels switched on from an earlier
+        session silently caps the achievable rate well below spec even
+        with HORizontal:MODE:SAMPLERate MAX requested. `channels`: iterable
+        of channel numbers to enable (e.g. [1, 2]); everything else in
+        1..n_channels is turned off.
+        """
+        self._pre.clear()
+        wanted = set(channels)
+        with self._lock:
+            for ch in range(1, n_channels + 1):
+                self._dev.write(f"SELect:CH{ch} {'ON' if ch in wanted else 'OFF'}")
+
+    def set_max_sample_rate(self, capture_seconds):
+        """Force MANUAL horizontal mode with sample rate pinned at the
+        scope's maximum, and record length sized to capture exactly
+        `capture_seconds` at whatever that maximum turns out to be --
+        so every capture runs as fast as the hardware allows regardless of
+        what's on the input, without capturing far more time than needed
+        (a fixed large record length overshoots badly once the achieved
+        rate is known: 100000 samples at this scope's actual 12.5 GS/s is
+        8 us of data for a 1 us chirp). Crop to the exact region of interest
+        afterward in software (chirp_quality.py's find_burst_window())
+        rather than trading sample rate for a specific on-screen window.
+
+        Plain HORizontal:RECOrdlength writes (set_record_length) don't
+        reliably stick in the scope's default AUTO/CONSTANT horizontal
+        mode -- SCAle changes there recompute record length/sample rate
+        automatically and silently override it. MANUAL mode is what makes
+        both settings actually hold.
+
+        Returns the achieved sample rate (Hz), queried after requesting MAX
+        rather than assumed, so this adapts automatically if the channel
+        count or scope model changes what "max" actually is.
+        """
+        self._pre.clear()
+        with self._lock:
+            self._dev.write("HORizontal:MODE MANual")
+            self._dev.write("HORizontal:MODE:SAMPLERate MAX")
+            rate = float(self._dev.query("HORizontal:SAMPLERate?"))
+            record_length = max(int(round(capture_seconds * rate)), 1)
+            self._dev.write(f"HORizontal:MODE:RECOrdlength {record_length}")
+        return rate
 
     def set_timebase(self, freq_hz, n_cycles=8):
         self._pre.clear()
