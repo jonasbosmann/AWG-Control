@@ -10,3 +10,6 @@ sweeps/
 
 # Microwave-chain setup photos (originals; copies land in sweeps/ per run)
 setup_photos/
+
+# Saved spectrum analyzer traces (experimental data)
+specan_traces/
