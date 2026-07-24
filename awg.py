@@ -10,6 +10,43 @@ N_SAMPLES = 2048            # must be multiple of 64 for Proteus granularity
 _RESOURCE = "TCPIP0::141.51.196.111::5025::SOCKET"
 
 
+def widen_for_flat_plateau(f_start, f_stop, window_frac=0.05):
+    """Given a DESIRED flat/full-amplitude plateau [f_start, f_stop], return
+    the wider (f_start_cmd, f_stop_cmd) that should actually be COMMANDED to
+    the AWG so the plateau -- not the tapered edges -- covers the requested
+    range.
+
+    The chirp's Gaussian amplitude taper (_gauss_win, window_frac fraction
+    of the sweep tapered on EACH side) only leaves the middle
+    (1 - 2*window_frac) of whatever bandwidth is actually commanded at full
+    amplitude; the outer window_frac on each side ramps from ~0 up to full
+    scale. Since a chirp's instantaneous frequency is linear in time, that
+    same window_frac fraction of TIME maps directly onto window_frac of the
+    SWEPT FREQUENCY RANGE too -- so if you ask for e.g. "1.70-1.80 GHz" and
+    command exactly that, the AWG is NOT actually at full power at either
+    1.70 or 1.80 GHz, only somewhere inside that range. Confirmed on real
+    bench data 2026-07-24 (chirp_bench/pipeline_view.py FFT-panel
+    investigation): a nominal 1.70-1.80 GHz commanded segment's -3dB
+    amplitude plateau only spanned ~1.706-1.793 GHz, not the full 100 MHz.
+
+    Solving B_total*(1-2*window_frac) = B_design for B_total:
+        B_total = B_design / (1 - 2*window_frac)
+        margin (per side) = (B_total - B_design) / 2
+
+    Returns (f_start_cmd, f_stop_cmd), each pushed outward by that margin.
+    Keeps the commanded DURATION unchanged (sweep rate goes up slightly,
+    ~11% at window_frac=0.05) -- deliberate choice for diagnostic/QC scans,
+    where matching a specific physical sweep rate doesn't matter, over
+    extending duration instead (which would ripple into dead-time/capture-
+    window budgets elsewhere). Revisit if this margin logic is ever applied
+    to real excitation-chirp design, where sweep rate (Hz/s) affects
+    adiabatic-passage efficiency and preserving it might matter more than
+    preserving duration."""
+    b_design = f_stop - f_start
+    margin = b_design * window_frac / (1 - 2 * window_frac)
+    return f_start - margin, f_stop + margin
+
+
 class AWG:
     def __init__(self, sample_rate=SAMPLE_RATE_SINGLE, n_samples=N_SAMPLES):
         self.sample_rate = sample_rate

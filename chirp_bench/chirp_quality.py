@@ -25,7 +25,8 @@ import os
 import tempfile
 
 import numpy as np
-from scipy.signal import (correlate as _correlate, hilbert, savgol_filter,
+from scipy.signal import (butter, correlate as _correlate, filtfilt, hilbert,
+                           resample as _resample, savgol_filter,
                            spectrogram as _spectrogram)
 
 
@@ -46,6 +47,25 @@ def _gauss_win(n, frac):
     idx = np.arange(n_w, dtype=np.float64)
     w[:n_w] = np.exp(-0.5 * ((idx - n_w) / sigma) ** 2)
     w[-n_w:] = np.exp(-0.5 * (idx / sigma) ** 2)
+    return w
+
+
+def _gauss_win_continuous(tau, duration, frac):
+    """Continuous-time version of _gauss_win -- same taper shape, but
+    evaluated at arbitrary tau (seconds since chirp start) instead of a
+    fixed sample grid, so it can be aligned to a capture's own time axis
+    (used by evm_score() to build the ideal complex reference on the
+    capture's actual sample times). Zero outside [0, duration]."""
+    tau = np.asarray(tau, dtype=np.float64)
+    w = np.ones_like(tau)
+    nw_t = min(max(frac * duration, 0.0), duration / 2)
+    if nw_t > 0:
+        sigma_t = nw_t / 3.0
+        rising = tau < nw_t
+        w[rising] = np.exp(-0.5 * ((tau[rising] - nw_t) / sigma_t) ** 2)
+        falling = tau > duration - nw_t
+        w[falling] = np.exp(-0.5 * ((tau[falling] - (duration - nw_t)) / sigma_t) ** 2)
+    w = np.where((tau < 0) | (tau > duration), 0.0, w)
     return w
 
 
@@ -339,11 +359,13 @@ def rolloff_frequency(centers, amp_db, threshold_db=-3.0):
 def matched_filter_score(t, v, f_start, f_stop, duration, t0=None,
                           window_frac=0.05, guard_factor=3.0):
     """Cross-correlate the capture against the ideal commanded chirp.
-    Returns the compressed pulse's mainlobe width (compare to the
-    diffraction-limited 1/bandwidth) and peak sidelobe level (dB relative to
-    the mainlobe peak) -- a single aggregate quality number, standard
-    practice for characterizing LFM/radar chirps, robust to spurs that
-    would confuse instantaneous-frequency demod."""
+    Returns the compressed pulse's mainlobe width -- IRW, "impulse response
+    width", the standard SAR/radar convention of measuring at -3dB from the
+    peak (compare to the diffraction-limited 1/bandwidth) -- and peak
+    sidelobe level (PSLR, dB relative to the mainlobe peak) -- a single
+    aggregate quality number, standard practice for characterizing
+    LFM/radar chirps, robust to spurs that would confuse instantaneous-
+    frequency demod."""
     if t0 is None:
         t0 = refine_t0(t, v, f_start, f_stop, duration, window_frac=window_frac)
 
@@ -364,15 +386,34 @@ def matched_filter_score(t, v, f_start, f_stop, duration, t0=None,
             f"the trigger signal amplitude/level before re-running.")
     seg = seg - np.mean(seg)
 
-    corr = np.correlate(seg, ref, mode="full")
-    peak_idx = int(np.argmax(np.abs(corr)))
-    peak = np.abs(corr[peak_idx])
+    corr = _correlate(seg, ref, mode="full", method="fft")
+
+    # Real-valued correlation of two bandpass signals rides a fast carrier-
+    # frequency ripple on top of the true (slowly-varying) compression
+    # envelope: corr(tau) ~ envelope(tau)*cos(2*pi*f_carrier*tau). For a
+    # narrow-span (low relative bandwidth) chirp the envelope stays near its
+    # peak for many carrier cycles, so that ripple swings tens of dB
+    # sample-to-sample even while genuinely still "in the mainlobe" --
+    # confirmed 2026-07-24 on real bench data (0.1 GHz-span 1.70-1.80 GHz
+    # capture): raw |corr| swung from 0 dB to -19 dB one sample apart,
+    # collapsing the naive -3dB contiguous-region search to a single sample
+    # (IRW -> 0) even though the true envelope stayed within -3dB for ~9.4 ns,
+    # matching the 10 ns diffraction-limited (1/bandwidth) expectation almost
+    # exactly. Using the Hilbert ENVELOPE of corr for peak-finding and the
+    # IRW search sidesteps this -- it's immune to the ripple by construction,
+    # the same reason dechirp_residual() uses the analytic signal rather than
+    # a raw real-valued comparison.
+    corr_env = np.abs(hilbert(corr))
+    peak_idx = int(np.argmax(corr_env))
+    peak = corr_env[peak_idx]
     lag = (np.arange(len(corr)) - (n - 1)) * dt
     with np.errstate(divide="ignore"):
         corr_db = 20 * np.log10(np.abs(corr) / peak + 1e-300)
+        corr_env_db = 20 * np.log10(corr_env / peak + 1e-300)
 
-    # Mainlobe = contiguous region around the peak above -6 dB.
-    above = corr_db > -6.0
+    # Mainlobe = contiguous region around the peak above -3 dB (IRW convention),
+    # measured on the envelope -- see note above.
+    above = corr_env_db > -3.0
     left = peak_idx
     while left > 0 and above[left - 1]:
         left -= 1
@@ -381,16 +422,153 @@ def matched_filter_score(t, v, f_start, f_stop, duration, t0=None,
         right += 1
     mainlobe_width_s = (right - left) * dt
 
+    # PSLR guard region derives from mainlobe_width_s, so this is fixed
+    # automatically now too: the old collapsed (~0-width) mainlobe gave a
+    # near-zero guard, letting the PSLR search see ripple points right next
+    # to the true peak (reporting a falsely-bad ~0 dB PSLR) instead of only
+    # genuinely distant sidelobes.
     guard = int(round(guard_factor * max(right - left, 1) / 2)) + 1
     outside = np.ones(len(corr), dtype=bool)
     outside[max(peak_idx - guard, 0):peak_idx + guard + 1] = False
     psl_db = float(np.max(corr_db[outside])) if np.any(outside) else float("nan")
 
     return {
-        "lag_s": lag, "corr_db": corr_db, "peak_idx": peak_idx,
+        "lag_s": lag, "corr_db": corr_db, "corr_env_db": corr_env_db, "peak_idx": peak_idx,
         "mainlobe_width_s": mainlobe_width_s,
         "ideal_width_s": 1.0 / abs(f_stop - f_start),
         "psl_db": psl_db,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Metric 4: coherent dechirp residual (LFM-radar "stretch processing")
+# ---------------------------------------------------------------------------
+
+def dechirp_residual(t, v, f_start, f_stop, duration, t0=None, window_frac=0.05,
+                      edge_frac=0.05, lowpass_hz=20e6):
+    """Coherent 'dechirp' (a.k.a. stretch processing) residual -- the
+    standard LFM-radar technique for isolating chirp nonlinearity and phase
+    noise, used in receivers/instrumentation specifically to determine
+    chirp linearity: mix the capture DOWN against the exact, known,
+    commanded reference chirp (multiply by its conjugate), then low-pass.
+    A perfect chirp collapses to a constant after this; any ramp
+    nonlinearity, phase noise, or mode-hop survives as a residual that's
+    SLOW (near DC), not fast -- because the GHz-scale sweep itself has
+    already been cancelled by the mix, not just measured.
+
+    This sidesteps demodulate()'s core tension (differentiating a fast-
+    swept phase is a high-pass operation that amplifies noise by ~1/dt,
+    see its docstring) by using information linearity_error() throws away:
+    since the reference is DUC/IQ-generated, the exact ideal complex
+    baseband is already known exactly, not just its envelope -- mixing
+    against it does the "remove the GHz sweep" step with one multiply
+    instead of a derivative. The residual phase is consequently already
+    well-conditioned; unlike demodulate(), no extra smoothing stage is
+    needed before differentiating it for a frequency-error estimate.
+
+    lowpass_hz: cutoff for isolating the near-DC residual from the (already
+    single-sideband, via the analytic signal) mixer output and noise --
+    default 20 MHz assumes genuine defects vary slower than that and
+    f_start is well above it (so no real content sits near DC before
+    mixing); tune down for a cleaner residual if the capture is very
+    low-noise, or up if you need to resolve a suspected fast defect.
+    """
+    if t0 is None:
+        t0 = refine_t0(t, v, f_start, f_stop, duration, window_frac=window_frac)
+
+    dt = float(np.median(np.diff(t)))
+    tau = t - t0
+    tau_c = np.clip(tau, 0, duration)
+    phase_ideal = 2 * np.pi * (f_start * tau_c + (f_stop - f_start) / (2 * duration) * tau_c ** 2)
+
+    analytic = hilbert(v - np.mean(v))
+    mixed = analytic * np.exp(-1j * phase_ideal)
+
+    nyq = 0.5 / dt
+    wn = min(lowpass_hz / nyq, 0.99)
+    b, a = butter(4, wn, btype="low")
+    residual = filtfilt(b, a, mixed)
+
+    lo, hi = duration * edge_frac, duration * (1 - edge_frac)
+    mask = (tau >= lo) & (tau <= hi)
+    if not np.any(mask):
+        raise ValueError("no samples fall inside the trimmed chirp window -- "
+                          "check t0/duration against the capture's time axis")
+
+    phase_err = np.unwrap(np.angle(residual[mask]))
+    phase_err -= phase_err[0]   # anchor to 0; only the SHAPE (drift/wobble)
+                                 # of the residual is meaningful -- the
+                                 # absolute value is an arbitrary reference
+                                 # phase set by t0/cable length.
+    t_mask = tau[mask]
+    freq_err = np.gradient(phase_err, t_mask) / (2 * np.pi)
+
+    return {
+        "t": t_mask, "residual": residual[mask],
+        "phase_err_rad": phase_err,
+        "phase_err_rms_rad": float(np.sqrt(np.mean(phase_err ** 2))),
+        "phase_err_peak_rad": float(np.max(np.abs(phase_err))),
+        "freq_err_hz": freq_err,
+        "freq_err_rms_hz": float(np.sqrt(np.mean(freq_err ** 2))),
+        "freq_err_peak_hz": float(np.max(np.abs(freq_err))),
+        "t0": t0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Metric 5: Error Vector Magnitude (EVM) -- standard RF/telecom AWG fidelity
+# metric (used by Keysight/Tek/R&S to spec their own AWGs' output quality).
+# ---------------------------------------------------------------------------
+
+def evm_score(t, v, f_start, f_stop, duration, t0=None, window_frac=0.05,
+              edge_frac=0.05):
+    """Error Vector Magnitude: direct complex-baseband comparison against
+    the known ideal reference, instead of comparing derived quantities
+    (instantaneous frequency, envelope) separately as the other metrics do.
+    Well-suited here because the reference is DUC/IQ-generated, so the
+    exact ideal complex baseband is already known -- this is the metric a
+    vendor datasheet or an RF engineer would reach for first to quantify
+    "how faithfully does the hardware reproduce the commanded waveform".
+
+    Aligns t0 (matched filter) and fits a single complex scalar (gain +
+    constant phase offset) by least squares before computing the error --
+    standard EVM practice, so an uncalibrated cable loss or an arbitrary
+    absolute phase reference doesn't get counted as "error". Does NOT fit
+    away a chirp-rate/span scaling error -- that would be a real defect,
+    not an alignment nuisance.
+
+    Returns EVM as % rms and % peak (both normalized to the aligned
+    reference's rms amplitude), the conventional way EVM is quoted.
+    """
+    if t0 is None:
+        t0 = refine_t0(t, v, f_start, f_stop, duration, window_frac=window_frac)
+
+    tau = t - t0
+    tau_c = np.clip(tau, 0, duration)
+    phase_ideal = 2 * np.pi * (f_start * tau_c + (f_stop - f_start) / (2 * duration) * tau_c ** 2)
+    ideal_complex = _gauss_win_continuous(tau, duration, window_frac) * np.exp(1j * phase_ideal)
+
+    lo, hi = duration * edge_frac, duration * (1 - edge_frac)
+    mask = (tau >= lo) & (tau <= hi)
+    if not np.any(mask):
+        raise ValueError("no samples fall inside the trimmed chirp window -- "
+                          "check t0/duration against the capture's time axis")
+
+    analytic = hilbert(v - np.mean(v))
+    meas, ideal = analytic[mask], ideal_complex[mask]
+
+    c = np.sum(meas * np.conj(ideal)) / np.sum(np.abs(ideal) ** 2)
+    aligned_ideal = c * ideal
+    err = meas - aligned_ideal
+    ref_rms = float(np.sqrt(np.mean(np.abs(aligned_ideal) ** 2)))
+
+    evm_t_pct = 100 * np.abs(err) / ref_rms
+    return {
+        "t": tau[mask], "err": err, "gain": complex(c),
+        "evm_t_pct": evm_t_pct,
+        "evm_rms_pct": float(np.sqrt(np.mean(np.abs(err) ** 2)) / ref_rms * 100),
+        "evm_peak_pct": float(np.max(np.abs(err)) / ref_rms * 100),
+        "t0": t0,
     }
 
 
@@ -406,6 +584,62 @@ def spectrogram(t, v, nperseg=256):
     return f, tt + t[0], sxx
 
 
+def spectrum_db(t, v):
+    """Magnitude spectrum (periodogram) of the WHOLE capture -- unlike
+    spectrogram() this doesn't trade frequency resolution for time
+    resolution, so it's the better view for spotting narrow spurs, harmonics,
+    or out-of-band content sitting below what a coarse spectrogram bin could
+    resolve (e.g. the ~1.5 GHz environmental spur found 2026-07-24 was only
+    ever confirmed via a spectrogram; a plain FFT would show it as a single
+    sharp, unambiguous line rather than a faint horizontal streak). Real
+    input -> only 0..Nyquist is meaningful, returned via rfft.
+
+    Deliberately NOT windowed. An extra Hann taper applied across the whole
+    record (dead time included) was tried first and rounded the swept-band
+    peak into a smooth Gaussian-looking bump -- confirmed 2026-07-24 to be a
+    self-inflicted artifact, not a real AWG characteristic: with no extra
+    window the peak sits flat at ~0dB across nearly the entire commanded
+    band with sharp edges, matching the textbook flat-top LFM spectrum shape.
+    No windowing is actually needed here anyway -- the commanded envelope
+    (chirp_quality._gauss_win()) already tapers smoothly to true zero at both
+    ends of the record, so there's no abrupt edge for a window to protect
+    against leakage from."""
+    fs = 1.0 / float(np.median(np.diff(t)))
+    n = len(v)
+    spec = np.fft.rfft(v - np.mean(v))
+    freqs = np.fft.rfftfreq(n, d=1.0 / fs)
+    mag_db = 20 * np.log10(np.abs(spec) / (np.max(np.abs(spec)) + 1e-300) + 1e-300)
+    return freqs, mag_db
+
+
+def sinc_reconstruct(x, y, upsample=8):
+    """Band-limited (sinc / Whittaker-Shannon) reconstruction of a real
+    voltage trace for DISPLAY -- the same thing a scope's own Sin(x)/x
+    display mode does, exact as long as the signal is genuinely sampled
+    above Nyquist (comfortably true for any capture used with this module).
+    scipy.signal.resample does this via FFT zero-padding; independently
+    cross-checked 2026-07-24 against a hand-coded literal sinc sum on real
+    capture data (agreement ~0.3% away from window edges).
+
+    Returns the upsampled (x, y) directly -- deliberately NOT decimated down
+    to a fixed point/bin count afterward. An earlier version did that
+    (min/max per display bin) and it was wrong: collapsing bins to [min,max]
+    pairs joined by straight lines looks like a filled envelope only when
+    zoomed out; zoom in on the actual plot and you're looking at a handful
+    of those bins, and alternating min/max points connected by lines is a
+    sawtooth by construction, regardless of the true signal's shape. Handing
+    matplotlib the real reconstructed samples and letting ITS zoom/pan do
+    the work means every zoom level shows the genuine curve, not an artifact
+    of a decimation scheme tuned for one zoom level. Used both by plot()
+    here and by chirp_bench/pipeline_view.py's per-metric deep-dive views."""
+    n = len(y)
+    if n <= 1:
+        return x, y
+    y_up = _resample(y, n * upsample)
+    x_up = np.interp(np.arange(n * upsample), np.arange(0, n * upsample, upsample), x)
+    return x_up, y_up
+
+
 # ---------------------------------------------------------------------------
 # Top-level bundle + plot
 # ---------------------------------------------------------------------------
@@ -415,43 +649,86 @@ def analyze(t, v, f_start, f_stop, duration, t0=None, edge_frac=0.05, n_bins=200
     centers, amp_binned, amp_db = swept_amplitude_response(lin, n_bins=n_bins)
     rolloff = rolloff_frequency(centers, amp_db)
     mf = matched_filter_score(t, v, f_start, f_stop, duration, t0=lin["t0"])
+    dechirp = dechirp_residual(t, v, f_start, f_stop, duration, t0=lin["t0"], edge_frac=edge_frac)
+    evm = evm_score(t, v, f_start, f_stop, duration, t0=lin["t0"], edge_frac=edge_frac)
     return {
         "linearity": lin,
         "response_freq_hz": centers, "response_amp": amp_binned, "response_db": amp_db,
         "rolloff_hz": rolloff,
         "matched_filter": mf,
+        "dechirp": dechirp,
+        "evm": evm,
     }
 
 
 def plot(t, v, result, f_start, f_stop, title=None):
+    """Dashboard layout (2026-07-24, reordered): PRIMARY metrics first
+    (dechirp residual -- the one step-by-step-verified against real bench
+    data -- and EVM, the industry-standard AWG fidelity number), then
+    supporting/cross-check metrics (swept amplitude response, pulse
+    compression), then raw capture + spectrum for sanity checking, and
+    finally the smoothed-instantaneous-frequency view demoted to the bottom
+    with an explicit caveat -- it's largely SUPERSEDED by dechirp_residual()
+    for the same underlying question (frequency-vs-time linearity):
+    differentiating phase is a high-pass operation that amplifies noise, so
+    it needs heavy smoothing to be usable, and that smoothing can't tell a
+    genuine fast defect (mode-hop, glitch) apart from noise -- a clean
+    SMOOTHED trace is not proof of a clean chirp. dechirp_residual() avoids
+    this by mixing down against the known reference first, never needing
+    that smoothing in the first place.
+
+    spectrogram() dropped from this routine dashboard entirely -- confirmed
+    the plain FFT spectrum shows spectral content (e.g. spurs) MORE sharply
+    since it doesn't trade frequency resolution for time resolution, and
+    dechirp_residual() already gives quantitative time-resolved defect
+    info a spectrogram could only show as a fuzzy color blob. The function
+    itself is kept (not deleted) -- still worth reaching for by hand during
+    genuinely exploratory investigation of an unfamiliar signal, which is
+    how it earned its keep originally (finding the ~1.5 GHz environmental
+    spur, 2026-07-24)."""
     import matplotlib.pyplot as plt
 
     lin = result["linearity"]
-    fig, axes = plt.subplots(3, 2, figsize=(11, 9))
+    fig, axes = plt.subplots(4, 2, figsize=(11, 12))
     if title:
         fig.suptitle(title)
 
     ax = axes[0, 0]
-    ax.plot(t * 1e6, v, lw=0.5)
+    # Same rendering as pipeline_view.py's deep-dive panels: band-limited
+    # (sinc) reconstruction -- what a scope's own Sin(x)/x display mode
+    # does -- with the real raw samples overlaid as markers on top, so the
+    # curve's fidelity to the actual data is directly checkable by eye
+    # rather than trusting a naive line-connect (which looks like a fake
+    # sawtooth at low samples/cycle) or losing the continuous shape
+    # entirely (markers alone, tried and superseded).
+    xd, yd = sinc_reconstruct(t * 1e6, v)
+    ax.plot(xd, yd, lw=0.5, color="C0", zorder=1)
+    ax.plot(t * 1e6, v, ".", ms=1.5, alpha=0.35, color="C3", zorder=2)
     ax.set_xlabel("time (us)"); ax.set_ylabel("V"); ax.set_title("raw capture")
 
     ax = axes[0, 1]
-    ax.plot(lin["t_raw"] * 1e6, lin["freq_meas_raw"] / 1e9, color="0.75", lw=0.3,
-            label="measured (raw)", zorder=1)
-    ax.plot(lin["t"] * 1e6, lin["freq_ideal"] / 1e9, "k--", lw=1, label="commanded", zorder=3)
-    ax.plot(lin["t"] * 1e6, lin["freq_meas"] / 1e9, lw=0.8, label="measured (smoothed)", zorder=2)
-    ax.set_xlabel("time (us)"); ax.set_ylabel("GHz"); ax.legend(fontsize=7)
-    ax.set_title("instantaneous frequency")
+    f_spec, mag_db = spectrum_db(t, v)
+    ax.plot(f_spec / 1e9, mag_db, lw=0.5)
+    ax.set_xlim(0, max(f_start, f_stop) * 1.5 / 1e9)
+    ax.set_ylim(-80, 2)
+    ax.set_xlabel("GHz"); ax.set_ylabel("dB (norm. to peak)")
+    ax.set_title("FFT magnitude spectrum (whole capture)")
 
     ax = axes[1, 0]
-    ax.plot(lin["t_raw"] * 1e6, lin["err_hz_raw"] / 1e6, color="0.75", lw=0.3, zorder=1)
-    ax.plot(lin["t"] * 1e6, lin["err_hz"] / 1e6, lw=0.8, zorder=2)
+    dc = result["dechirp"]
+    ax.plot(dc["t"] * 1e6, dc["freq_err_hz"] / 1e6, lw=0.8, color="C3")
     ax.set_xlabel("time (us)"); ax.set_ylabel("error (MHz)")
-    ax.set_title(f"freq error  smoothed rms={lin['rms_hz']/1e6:.2f} peak={lin['peak_hz']/1e6:.2f}  "
-                 f"|  raw rms={lin['rms_hz_raw']/1e6:.2f} peak={lin['peak_hz_raw']/1e6:.2f} (MHz)",
-                 fontsize=9)
+    ax.set_title(f"PRIMARY: dechirp residual freq error  rms={dc['freq_err_rms_hz']/1e6:.3f} "
+                 f"peak={dc['freq_err_peak_hz']/1e6:.3f} MHz", fontsize=9)
 
     ax = axes[1, 1]
+    evm = result["evm"]
+    ax.plot(evm["t"] * 1e6, evm["evm_t_pct"], lw=0.8, color="C4")
+    ax.set_xlabel("time (us)"); ax.set_ylabel("EVM (%)")
+    ax.set_title(f"EVM (read w/ amplitude response, not alone)  "
+                 f"rms={evm['evm_rms_pct']:.2f}%  peak={evm['evm_peak_pct']:.2f}%", fontsize=9)
+
+    ax = axes[2, 0]
     ax.plot(result["response_freq_hz"] / 1e9, result["response_db"], lw=1)
     ax.axhline(-3.0, color="r", ls=":", lw=1)
     if result["rolloff_hz"]:
@@ -460,21 +737,33 @@ def plot(t, v, result, f_start, f_stop, title=None):
     roll_txt = f"{result['rolloff_hz']/1e9:.2f} GHz" if result["rolloff_hz"] else "none in band"
     ax.set_title(f"swept amplitude response  -3dB @ {roll_txt}")
 
-    ax = axes[2, 0]
-    f, tt, sxx = spectrogram(t, v)
-    ax.pcolormesh(tt * 1e6, f / 1e9, 10 * np.log10(sxx + 1e-20), shading="auto")
-    ax.set_ylim(0, max(f_start, f_stop) * 1.2 / 1e9)
-    ax.set_xlabel("time (us)"); ax.set_ylabel("GHz"); ax.set_title("spectrogram")
-
     ax = axes[2, 1]
     mf = result["matched_filter"]
-    ax.plot(mf["lag_s"] * 1e9, mf["corr_db"], lw=0.8)
-    zoom_ns = max(mf["mainlobe_width_s"], mf["ideal_width_s"]) * 15e9
+    zoom_ns = max(mf["mainlobe_width_s"], mf["ideal_width_s"], 5e-9) * 15e9
+    ax.plot(mf["lag_s"] * 1e9, mf["corr_db"], lw=0.4, color="0.75")
+    ax.plot(mf["lag_s"] * 1e9, mf["corr_env_db"], lw=1.0, color="C0")
+    ax.axhline(-3.0, color="r", ls=":", lw=1)
     ax.set_xlim(-zoom_ns, zoom_ns)
     ax.set_ylim(-40, 2)
     ax.set_xlabel("lag (ns)"); ax.set_ylabel("dB")
-    ax.set_title(f"pulse compression  width={mf['mainlobe_width_s']*1e9:.2f} ns "
-                 f"(ideal {mf['ideal_width_s']*1e9:.2f} ns)  PSL={mf['psl_db']:.1f} dB")
+    ax.set_title(f"pulse compression (cross-check)  IRW={mf['mainlobe_width_s']*1e9:.2f} ns "
+                 f"(ideal {mf['ideal_width_s']*1e9:.2f} ns)  PSLR={mf['psl_db']:.1f} dB", fontsize=8)
+
+    ax = axes[3, 0]
+    ax.plot(lin["t_raw"] * 1e6, lin["freq_meas_raw"] / 1e9, color="0.75", lw=0.3,
+            label="measured (raw)", zorder=1)
+    ax.plot(lin["t"] * 1e6, lin["freq_ideal"] / 1e9, "k--", lw=1, label="commanded", zorder=3)
+    ax.plot(lin["t"] * 1e6, lin["freq_meas"] / 1e9, lw=0.8, label="measured (smoothed)", zorder=2)
+    ax.set_xlabel("time (us)"); ax.set_ylabel("GHz"); ax.legend(fontsize=7)
+    ax.set_title("instantaneous frequency (SECONDARY -- see dechirp instead)", fontsize=8)
+
+    ax = axes[3, 1]
+    ax.plot(lin["t_raw"] * 1e6, lin["err_hz_raw"] / 1e6, color="0.75", lw=0.3, zorder=1)
+    ax.plot(lin["t"] * 1e6, lin["err_hz"] / 1e6, lw=0.8, zorder=2)
+    ax.set_xlabel("time (us)"); ax.set_ylabel("error (MHz)")
+    ax.set_title(f"freq error (SECONDARY, MHz)  smoothed rms={lin['rms_hz']/1e6:.2f} peak={lin['peak_hz']/1e6:.2f}  "
+                 f"|  raw rms={lin['rms_hz_raw']/1e6:.2f} peak={lin['peak_hz_raw']/1e6:.2f}",
+                 fontsize=7)
 
     fig.tight_layout()
     return fig
@@ -532,8 +821,15 @@ if __name__ == "__main__":
     print(f"linearity: rms={lin['rms_hz']/1e6:.2f} MHz  peak={lin['peak_hz']/1e6:.2f} MHz")
     print(f"swept response -3dB rolloff: "
           f"{result['rolloff_hz']/1e9:.3f} GHz" if result["rolloff_hz"] else "no rolloff in band")
-    print(f"matched filter: mainlobe={mf['mainlobe_width_s']*1e9:.2f} ns "
-          f"(ideal {mf['ideal_width_s']*1e9:.2f} ns)  PSL={mf['psl_db']:.1f} dB")
+    print(f"matched filter: IRW={mf['mainlobe_width_s']*1e9:.2f} ns "
+          f"(ideal {mf['ideal_width_s']*1e9:.2f} ns)  PSLR={mf['psl_db']:.1f} dB")
+
+    dc, evm = result["dechirp"], result["evm"]
+    print(f"dechirp residual: freq err rms={dc['freq_err_rms_hz']/1e6:.3f} MHz "
+          f"peak={dc['freq_err_peak_hz']/1e6:.3f} MHz  "
+          f"(injected wobble peak was {freq_dev_hz/1e6:.2f} MHz -- should be in "
+          f"the same ballpark, recovered without demodulate()'s smoothing)")
+    print(f"EVM: rms={evm['evm_rms_pct']:.2f}%  peak={evm['evm_peak_pct']:.2f}%")
 
     fig = plot(t, v, result, f_start, f_stop, title="chirp_quality.py self-test (synthetic)")
     out_path = os.path.join(tempfile.gettempdir(), "chirp_quality_selftest.png")

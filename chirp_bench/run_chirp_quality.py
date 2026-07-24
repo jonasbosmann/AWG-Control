@@ -18,11 +18,16 @@ confirm wiring + trigger before looping the whole band.
 
 import json
 import os
+import sys
 import time
 
 import numpy as np
 
-from awg import AWG
+# awg.py/scope.py live one level up (project root) -- this script moved
+# into chirp_bench/ but the hardware drivers stayed put, shared with the
+# other (non-chirp-quality) bench tools there.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from awg import AWG, widen_for_flat_plateau
 from scope import Scope
 import chirp_quality as cq
 
@@ -70,7 +75,7 @@ N_AVG    = 1             # scope-HARDWARE averaging -- kept at 1 (not used).
                           # sync burst can't guarantee that (see N_SHOTS_AVG
                           # below for the software alternative that doesn't
                           # depend on trigger precision).
-N_SHOTS_AVG = 20         # number of independent single-shot captures to
+N_SHOTS_AVG = 1         # number of independent single-shot captures to
                           # align (via cross-correlation on CH1's own
                           # waveform) and average IN SOFTWARE per segment --
                           # see chirp_quality.align_and_average(). Set to 1
@@ -99,6 +104,16 @@ CAPTURE_MARGIN_MULT = 2.0   # capture window = chirp duration * this multiplier,
                             # per shot for a 1 us chirp (8x more than needed,
                             # 20x over with N_SHOTS_AVG capturing that much
                             # ASCII data per shot).
+DISPLAY_MARGIN_MULT = 1.0  # on-screen display window = chirp duration * this
+                            # multiplier -- deliberately DIFFERENT from
+                            # CAPTURE_MARGIN_MULT. The scope can acquire more
+                            # into memory (CAPTURE_MARGIN_MULT's safety margin
+                            # against trigger/cable skew) than it displays at
+                            # once (RECOrdlength/SAMPLERate vs. HORizontal:
+                            # SCAle are independent) -- showing the full 2x
+                            # capture window on screen was needlessly wide for
+                            # visually checking the pulse; this frames just
+                            # the chirp itself.
 
 
 def arm_scope(scope, chirp_us):
@@ -126,34 +141,65 @@ def arm_scope(scope, chirp_us):
     capture_s = chirp_us * 1e-6 * CAPTURE_MARGIN_MULT
     rate = scope.set_max_sample_rate(capture_s)
     scope.set_horizontal_position(0)
-    print(f"  scope: {rate/1e9:.2f} GS/s, {capture_s*1e6:.2f} us capture "
+    # set_max_sample_rate() only sets the ACQUIRED record (rate + length) --
+    # it never touches HORizontal:SCAle, so the on-screen display keeps
+    # whatever timebase was left over from before (usually much wider than
+    # the chirp), needing a manual scale turn to actually see the pulse.
+    # Set the display window separately from the (wider) acquired one --
+    # DISPLAY_MARGIN_MULT frames just the chirp, not the full safety margin.
+    display_s = chirp_us * 1e-6 * DISPLAY_MARGIN_MULT
+    actual_spd = scope.set_timebase_direct(display_s / 10)
+    print(f"  scope: {rate/1e9:.2f} GS/s, {capture_s*1e6:.2f} us captured "
           f"({int(round(capture_s*rate))} samples) for a "
-          f"{chirp_us*1e3:.0f} ns chirp")
+          f"{chirp_us*1e3:.0f} ns chirp, displaying {display_s*1e6:.2f} us "
+          f"({actual_spd*1e6:.3f} us/div)")
 
 
-def save_result(label, f_start, f_stop, t, v, result, fig):
+def save_result(label, f_start, f_stop, t, v, result, fig,
+                 f_start_designated=None, f_stop_designated=None):
     """Save one segment's raw capture + computed metrics as a JSON (mirrors
     sweeplog.py's compact-array convention) plus the diagnostic PNG, so
     results survive past the terminal and can be reloaded/re-analyzed later
-    without re-running the bench."""
+    without re-running the bench.
+
+    f_start/f_stop: the ACTUAL commanded range (post-widen_for_flat_plateau)
+    -- stored as f_start_hz/f_stop_hz, same field names as always, so every
+    existing tool that reads a capture and uses these directly for the
+    reference phase model (pipeline_view.py, chirp_quality.analyze()) keeps
+    working correctly without needing to know about widening at all.
+
+    f_start_designated/f_stop_designated: the narrower ORIGINAL range that
+    should actually be flat -- optional, stored separately for tools that
+    want to crop out the tapered edges when aggregating many segments
+    (band_overview.py). None for callers that don't widen (kept equal to
+    f_start/f_stop in that case, so downstream code always has a sensible
+    designated range to fall back on)."""
     os.makedirs(CAPTURE_DIR, exist_ok=True)
     ts = time.strftime("%Y-%m-%d_%H%M%S")
     safe_label = label.replace(".", "p").replace("-", "_").replace(" ", "")
     base = f"{ts}_{safe_label}"
 
     lin, mf = result["linearity"], result["matched_filter"]
+    dc, evm = result["dechirp"], result["evm"]
     doc = {
         "label": label,
         "timestamp": ts,
         "f_start_hz": f_start,
         "f_stop_hz": f_stop,
+        "f_start_designated_hz": f_start_designated if f_start_designated is not None else f_start,
+        "f_stop_designated_hz": f_stop_designated if f_stop_designated is not None else f_stop,
         "params": {
             "chirp_us": CHIRP_US, "dead_us": DEAD_US, "amp_vpp": AMP_VPP,
             "sync_amp_vpp": SYNC_AMP_VPP, "sync_pulse_ns": SYNC_PULSE_NS,
             "sync_carrier_hz": SYNC_CARRIER_HZ, "n_avg": N_AVG,
             "n_shots_avg": N_SHOTS_AVG,
         },
-        "dt_s": float(t[1] - t[0]),
+        # np.median, not t[1]-t[0] -- matches what every chirp_quality.py
+        # function internally uses (dt = np.median(np.diff(t))) to derive
+        # its own dt, so a reloaded capture reconstructs the identical time
+        # axis metrics were actually computed against, not just an
+        # approximation of it (a real, if tiny, sub-ppm gap otherwise).
+        "dt_s": float(np.median(np.diff(t))),
         "n_points": len(t),
         "metrics": {
             "linearity_rms_hz": lin["rms_hz"],
@@ -162,6 +208,10 @@ def save_result(label, f_start, f_stop, t, v, result, fig):
             "mainlobe_width_s": mf["mainlobe_width_s"],
             "ideal_width_s": mf["ideal_width_s"],
             "psl_db": mf["psl_db"],
+            "dechirp_freq_err_rms_hz": dc["freq_err_rms_hz"],
+            "dechirp_freq_err_peak_hz": dc["freq_err_peak_hz"],
+            "evm_rms_pct": evm["evm_rms_pct"],
+            "evm_peak_pct": evm["evm_peak_pct"],
         },
         "voltage_v": "@@WF@@",   # placeholder -> compact one-line array below
     }
@@ -180,9 +230,22 @@ def save_result(label, f_start, f_stop, t, v, result, fig):
 
 
 def run_segment(awg, scope, f_start, span_hz):
+    # f_start/f_stop here are the DESIGNATED range -- what should end up
+    # flat/full-amplitude, used for the label and for grouping/cropping in
+    # aggregate views (band_overview.py). The AWG actually gets commanded a
+    # WIDER range (f_start_cmd/f_stop_cmd) so the flat plateau -- not the
+    # tapered edges -- lands on the designated band; see
+    # awg.widen_for_flat_plateau() for the reasoning + the real-data
+    # confirmation that a chirp is NOT actually at full power at its own
+    # nominal edge frequencies otherwise. All signal-processing downstream
+    # (cq.analyze/plot, and this segment's saved f_start_hz/f_stop_hz used
+    # by every other tool that re-loads this capture) uses f_start_cmd/
+    # f_stop_cmd, since that's what the hardware actually produced -- the
+    # reference phase model has to match reality, not the aspiration.
     f_stop = f_start + span_hz
-    carrier_hz = f_start + span_hz / 2
-    half_span_hz = span_hz / 2
+    f_start_cmd, f_stop_cmd = widen_for_flat_plateau(f_start, f_stop)
+    carrier_hz = (f_start_cmd + f_stop_cmd) / 2
+    half_span_hz = (f_stop_cmd - f_start_cmd) / 2
     label = f"{f_start/1e9:.2f}-{f_stop/1e9:.2f} GHz"
 
     pause(f"\n[{label}] press Enter to generate + arm scope...")
@@ -225,16 +288,22 @@ def run_segment(awg, scope, f_start, span_hz):
     else:
         t, v = shots[0]
 
-    result = cq.analyze(t, v, f_start, f_stop, CHIRP_US * 1e-6)
+    result = cq.analyze(t, v, f_start_cmd, f_stop_cmd, CHIRP_US * 1e-6)
     lin, mf = result["linearity"], result["matched_filter"]
+    dc, evm = result["dechirp"], result["evm"]
     roll = f"{result['rolloff_hz']/1e9:.2f} GHz" if result["rolloff_hz"] else "none in segment"
-    print(f"  [{label}] lin rms={lin['rms_hz']/1e6:.2f} MHz peak={lin['peak_hz']/1e6:.2f} MHz  "
-          f"rolloff(-3dB)={roll}  mainlobe={mf['mainlobe_width_s']*1e9:.2f} ns "
-          f"(ideal {mf['ideal_width_s']*1e9:.2f} ns)  PSL={mf['psl_db']:.1f} dB")
+    print(f"  [{label}] (commanded {f_start_cmd/1e9:.4f}-{f_stop_cmd/1e9:.4f} GHz for a "
+          f"flat plateau there) lin rms={lin['rms_hz']/1e6:.2f} MHz peak={lin['peak_hz']/1e6:.2f} MHz  "
+          f"rolloff(-3dB)={roll}  IRW={mf['mainlobe_width_s']*1e9:.2f} ns "
+          f"(ideal {mf['ideal_width_s']*1e9:.2f} ns)  PSLR={mf['psl_db']:.1f} dB")
+    print(f"  [{label}] dechirp freq err rms={dc['freq_err_rms_hz']/1e6:.3f} MHz "
+          f"peak={dc['freq_err_peak_hz']/1e6:.3f} MHz  "
+          f"EVM rms={evm['evm_rms_pct']:.2f}% peak={evm['evm_peak_pct']:.2f}%")
 
     import matplotlib.pyplot as plt
-    fig = cq.plot(t, v, result, f_start, f_stop, title=f"chirp {label}")
-    save_result(label, f_start, f_stop, t, v, result, fig)
+    fig = cq.plot(t, v, result, f_start_cmd, f_stop_cmd, title=f"chirp {label}")
+    save_result(label, f_start_cmd, f_stop_cmd, t, v, result, fig,
+                f_start_designated=f_start, f_stop_designated=f_stop)
     if SHOW_PLOTS:
         plt.show()
     else:
@@ -272,10 +341,11 @@ def run():
     print("\n=== summary ===")
     for label, result in summary:
         lin, mf = result["linearity"], result["matched_filter"]
+        evm = result["evm"]
         roll = f"{result['rolloff_hz']/1e9:.2f} GHz" if result["rolloff_hz"] else "flat"
         print(f"{label:16s}  rms={lin['rms_hz']/1e6:6.2f} MHz  "
               f"peak={lin['peak_hz']/1e6:7.2f} MHz  rolloff={roll:10s}  "
-              f"PSL={mf['psl_db']:6.1f} dB")
+              f"PSLR={mf['psl_db']:6.1f} dB  EVM={evm['evm_rms_pct']:5.2f}%")
     return summary
 
 

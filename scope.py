@@ -86,9 +86,21 @@ class Scope:
         print(f"Scope: CH{channel} @ 50 Ω, {mode}{trig}\n")
 
     def set_timebase_direct(self, seconds_per_div):
+        """Set the horizontal display scale (time/div) and verify it stuck --
+        reads the value back plus drains :SYSTem:ERRor? afterward, since a
+        write that's silently ignored (e.g. rejected in the scope's current
+        horizontal mode) looks identical to success unless checked for."""
         self._pre.clear()
         with self._lock:
             self._dev.write(f"HORizontal:SCAle {seconds_per_div:.3e}")
+            actual = float(self._dev.query("HORizontal:SCAle?"))
+            err = self._dev.query("*ESR?").strip()
+            errmsg = self._dev.query("EVMsg?").strip() if err != "0" else ""
+        if abs(actual - seconds_per_div) > 0.01 * seconds_per_div:
+            print(f"  WARNING: set_timebase_direct({seconds_per_div:.3e}) requested but "
+                  f"scope reports {actual:.3e} s/div -- write likely rejected/ignored"
+                  f"{' -- ' + errmsg if errmsg else ''}")
+        return actual
 
     def set_record_length(self, n_points):
         """Set the acquisition record length (memory depth) directly.
