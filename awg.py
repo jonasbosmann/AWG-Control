@@ -687,6 +687,44 @@ class AWG:
             self._active_seg[channel] = 1
         return freq_hz
 
+    def duc_cw_setup_dual(self, freq_hz, amplitude_vpp=0.5, n_total=4096):
+        """Identical DUC CW on CH1 AND CH2 at the same NCO frequency.
+
+        Purpose: CH1 drives the DUT (e.g. a mixer IF port) where it can't be
+        observed, while CH2 carries a monitor copy for a scope, so an
+        automated sweep can be watched/verified step by step instead of
+        trusted blind.
+
+        A plain second call to duc_cw_setup() cannot do this -- that function
+        begins with '*CLS; *RST', which would wipe whichever channel was set
+        up first. Both channels are therefore configured inside ONE reset
+        here, the same structure send_cw_duc_sync()/send_chirp_duc_sync()
+        use. Both share the 9 GS/s DAC clock and X8 interpolation; dual
+        channels are fine in DUC mode (the 2.5 GS/s dual-channel ceiling is
+        an ARB/direct-mode memory limit, not a DUC one).
+
+        Retune BOTH afterwards with duc_cw_step(f, channel=1) and
+        duc_cw_step(f, channel=2) -- NCO writes are per-channel.
+        """
+        rate = 9e9
+        rate_cx = rate / 8.0
+        if not 0 < freq_hz <= rate / 2:
+            raise ValueError(f"{freq_hz/1e6:.1f} MHz outside DUC NCO range "
+                             f"(0-{rate/2e9:g} GHz]")
+        n_total = max(int(np.ceil(n_total / 32)) * 32, 64)
+        data = self._iq_to_u16(np.ones(n_total), np.zeros(n_total))
+        print(f"[DUC CW dual] CH1+CH2 both {freq_hz/1e6:.4f} MHz "
+              f"(CH2 = monitor copy of CH1)")
+        with self._lock:
+            self._dev.write("*CLS; *RST"); time.sleep(0.5); self._dev.query("*OPC?")
+            self._rate_sent.clear()
+            self._cmd(":INST:CHAN 1"); self._cmd(":TRAC:DEL:ALL")
+            self._duc_upload_ch(1, 1, data, freq_hz, rate, rate_cx, amplitude_vpp)
+            self._active_seg[1] = 1
+            self._duc_upload_ch(2, 2, data, freq_hz, rate, rate_cx, amplitude_vpp)
+            self._active_seg[2] = 2
+        return freq_hz
+
     def duc_cw_step(self, freq_hz, channel=1):
         """Retune the NCO carrier of a channel prepared by duc_cw_setup().
 
