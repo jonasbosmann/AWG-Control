@@ -114,6 +114,7 @@ class LabGUI:
         canvas.bind('<Leave>', lambda _: canvas.unbind_all('<MouseWheel>'))
 
         self._build_std_waveform(ctrl)
+        self._build_duc_cw_panel(ctrl)
         self._build_chirp_panel(ctrl)
         self._build_duc_panel(ctrl)
         self._build_scope_panel(ctrl)
@@ -183,6 +184,91 @@ class LabGUI:
                 pass
 
     # ── Chirp + CW panel ──────────────────────────────────────────
+
+    def _build_duc_cw_panel(self, parent):
+        """Manual DUC CW at an EXACT frequency.
+
+        Fills a real gap: 'Standard Waveform' uses DIRECT mode, where the
+        frequency is quantised to a whole number of cycles in the buffer
+        (~4.4 MHz steps at 9 GS/s), so asking for 500 MHz actually produces
+        501.0 MHz. The DUC NCO has no such quantisation -- exact to the Hz --
+        but until now it was only reachable through the Sweep panel, i.e. you
+        couldn't just park a tone at one exact frequency by hand.
+
+        'Both channels' puts the IDENTICAL tone on CH1 and CH2 so one can
+        drive a DUT while the other is watched on a scope
+        (awg.duc_cw_setup_dual)."""
+        f = ttk.LabelFrame(parent, text="DUC CW  (exact frequency, NCO)", padding=8)
+        f.pack(fill='x', pady=4)
+
+        self._duccw_freq_var = tk.StringVar(value="500")
+        self._duccw_amp_var  = tk.StringVar(value="0.5")
+        self._duccw_ch_var   = tk.StringVar(value="CH1")
+
+        ttk.Label(f, text="Freq (MHz)").grid(row=0, column=0, sticky='w')
+        ttk.Entry(f, textvariable=self._duccw_freq_var, width=10).grid(
+            row=0, column=1, sticky='w', padx=4)
+        ttk.Label(f, text="Amp (Vpp)").grid(row=0, column=2, sticky='w', padx=(8, 0))
+        ttk.Entry(f, textvariable=self._duccw_amp_var, width=6).grid(
+            row=0, column=3, sticky='w', padx=4)
+
+        ttk.Label(f, text="Channel").grid(row=1, column=0, sticky='w', pady=(4, 0))
+        ttk.Combobox(f, textvariable=self._duccw_ch_var, width=12, state='readonly',
+                     values=["CH1", "CH2", "Both (CH2=monitor)"]).grid(
+            row=1, column=1, columnspan=2, sticky='w', padx=4, pady=(4, 0))
+
+        ttk.Button(f, text="Set / Retune", command=self._duc_cw_set).grid(
+            row=2, column=0, columnspan=2, sticky='we', pady=(6, 0), padx=(0, 4))
+        ttk.Button(f, text="Stop Output", command=self._duc_cw_stop).grid(
+            row=2, column=2, columnspan=2, sticky='we', pady=(6, 0), padx=(4, 0))
+        ttk.Label(f, text="Exact NCO frequency (no integer-cycle rounding).\n"
+                          "Retunes in ~ms once set up — change the frequency\n"
+                          "and press again to step by hand.",
+                  foreground="gray", justify='left').grid(
+            row=3, column=0, columnspan=4, sticky='w', pady=(6, 0))
+        for c in range(4):
+            f.columnconfigure(c, weight=1)
+
+    def _duc_cw_stop(self):
+        """Stop the output and forget the DUC state, so the next Set does a
+        full setup rather than an NCO retune into a stopped channel."""
+        self._duccw_state = None
+        self._stop()
+
+    def _duc_cw_set(self):
+        if not self._need_awg(): return
+
+        def work():
+            try:
+                freq = float(self._duccw_freq_var.get()) * 1e6
+                amp = float(self._duccw_amp_var.get())
+                sel = self._duccw_ch_var.get()
+            except Exception as e:
+                print(f"DUC CW param error: {e}\n")
+                return
+            dual = sel.startswith("Both")
+            ch = 2 if sel == "CH2" else 1
+            key = ("dual" if dual else ch, amp)
+            try:
+                # Retune only if this channel selection + amplitude is already
+                # set up -- an NCO write is milliseconds, whereas a full
+                # duc_cw_setup does *RST + re-upload and takes seconds.
+                if getattr(self, "_duccw_state", None) == key:
+                    self.awg.duc_cw_step(freq, channel=1 if dual else ch)
+                    if dual:
+                        self.awg.duc_cw_step(freq, channel=2)
+                    print(f"DUC CW retuned to {freq/1e6:.6f} MHz ({sel})\n")
+                else:
+                    if dual:
+                        self.awg.duc_cw_setup_dual(freq, amplitude_vpp=amp)
+                    else:
+                        self.awg.duc_cw_setup(freq, amplitude_vpp=amp, channel=ch)
+                    self._duccw_state = key
+                    print(f"DUC CW set up at {freq/1e6:.6f} MHz ({sel}, {amp} Vpp)\n")
+            except Exception as e:
+                self._duccw_state = None
+                print(f"DUC CW error: {e}\n")
+        self._thread(work)
 
     def _build_chirp_panel(self, parent):
         f = ttk.LabelFrame(parent, text="Chirp + CW  (CP-FTMW)", padding=8)

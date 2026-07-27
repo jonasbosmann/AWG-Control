@@ -1,4 +1,5 @@
 import os
+import sys
 import tkinter as tk
 from tkinter import ttk, scrolledtext, filedialog
 import threading
@@ -11,6 +12,14 @@ from matplotlib.figure import Figure
 
 from specan import SpecAn, find_peaks
 import specanlog
+
+# chirp_bench/ holds run_specan_band_scan.py (the AWG+EXA band-scan cross-
+# check of the scope-based chirp rolloff finding) -- not on sys.path by
+# default since it's a subfolder, unlike specan.py/specanlog.py which sit
+# next to this file already.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "chirp_bench"))
+import run_specan_band_scan as rsbs
+import run_mixer_check as rmc
 
 
 class _LogRedirect:
@@ -40,11 +49,32 @@ class SpecAnGUI:
     TRACE_MODES = {"Normal": "NORM", "Max Hold": "MAXH",
                    "Min Hold": "MINH", "Average": "AVER"}
 
-    def __init__(self, root):
+    def __init__(self, root, awg_provider=None):
+        """awg_provider: optional callable returning an already-connected AWG.
+
+        The Proteus is on a raw TCP socket, which generally accepts only ONE
+        session -- so when this GUI runs alongside the AWG GUI (see
+        run_all.py) it must BORROW that window's connection rather than open
+        a second one, which would fail or hang. When a provider is supplied
+        this GUI never creates or closes an AWG of its own; the AWG window
+        stays the owner, and you can keep driving it by hand between runs."""
         self.root = root
         self.root.title("Spectrum Analyzer Control")
         self.root.geometry("950x700")
         self.sa = None
+        self._awg = None
+        self._awg_provider = awg_provider
+        # Last chirp band scan's per-segment results, kept so a subsequent
+        # CW Level Check can overlay the two droop shapes for comparison.
+        self._last_chirp_results = None
+        # Generation counter for scan live-updates. Live updates are posted
+        # with root.after(0, ...) from a worker thread, so some can still be
+        # QUEUED when the scan finishes and draws its final summary figure --
+        # and _draw() clears the figure, so a late straggler would wipe the
+        # stitched/CW plot and replace it with one stale segment. Bumping
+        # this counter before drawing the final figure makes every pending
+        # update stale, so they no-op instead. Same idea as _live_gen.
+        self._scan_gen = 0
         self._live_running = False
         self._live_gen = 0
         self._action_btns = []
@@ -58,6 +88,11 @@ class SpecAnGUI:
         self._live_running = False
         if self.sa:
             try: self.sa.close()
+            except Exception: pass
+        # Only close an AWG we opened ourselves -- a borrowed one belongs to
+        # the AWG window and must outlive this one.
+        if self._awg and self._awg_provider is None:
+            try: self._awg.close()
             except Exception: pass
         self.root.destroy()
 
@@ -174,6 +209,77 @@ class SpecAnGUI:
         b.grid(row=0, column=6, padx=4)
         self._action_btns.append(b)
 
+        # ── AWG-driven measurements ────────────────────────────────
+        # One row per measurement, each stating WHAT it measures and WHAT
+        # cabling it needs. These three need DIFFERENT wiring, and getting
+        # it wrong is not always obvious in the results -- notably the CW
+        # Level Check produces the absolute-power reference that the Mixer
+        # Check subtracts against, so running it with the mixer in line
+        # would silently corrupt every later conversion-loss number.
+        awgf = ttk.LabelFrame(self.root, text="AWG-driven measurements", padding=5)
+        awgf.pack(fill='x', padx=8, pady=4)
+
+        top = ttk.Frame(awgf)
+        top.grid(row=0, column=0, columnspan=3, sticky='w', pady=(0, 4))
+        if self._awg_provider is None:
+            b = ttk.Button(top, text="Connect AWG", command=self._connect_awg)
+            b.pack(side='left', padx=(0, 6))
+            self._action_btns.append(b)
+            self._awg_status_lbl = ttk.Label(top, text="AWG disconnected",
+                                              foreground='red')
+        else:
+            # Sharing the AWG window's connection -- offering a second
+            # Connect here would open a rival socket session to the same
+            # instrument, which the Proteus won't accept.
+            self._awg_status_lbl = ttk.Label(
+                top, text="AWG: shared with the AWG Control window "
+                          "(connect and tune it there)", foreground='#0a58ca')
+        self._awg_status_lbl.pack(side='left', padx=(0, 16))
+        # The stitched chirp result crops each segment to its flat-top band,
+        # which is why it looks narrower than the analyzer's own screen; this
+        # makes the LIVE view match what the SA shows instead.
+        self._fullspan_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(top, text="Live view: full span (match SA screen)",
+                         variable=self._fullspan_var).pack(side='left')
+
+        def meas_row(row, text, cmd, what, wiring):
+            btn = ttk.Button(awgf, text=text, command=cmd, width=22)
+            btn.grid(row=row, column=0, sticky='w', padx=(0, 8), pady=2)
+            self._action_btns.append(btn)
+            ttk.Label(awgf, text=what).grid(row=row, column=1, sticky='w', padx=(0, 12))
+            ttk.Label(awgf, text=wiring, foreground="#0a58ca").grid(
+                row=row, column=2, sticky='w')
+            return btn
+
+        self._chirp_scan_btn = meas_row(
+            1, "Run Chirp Band Scan", self._run_chirp_band_scan,
+            f"Swept amplitude response from real chirp bursts "
+            f"({len(rsbs.SEGMENTS)} x {rsbs.SEGMENT_SPAN_HZ/1e6:.0f} MHz, Max Hold). "
+            f"Relative shape only — levels are power density, not absolute.",
+            "wiring:  AWG CH1 → EXA RF IN")
+
+        self._cw_btn = meas_row(
+            2, "Run CW Level Check", self._run_cw_level_check,
+            f"TRUE absolute AWG output vs frequency ({len(rsbs.CW_FREQS)} stepped CW tones). "
+            f"This is the reference the Mixer Check subtracts against — run it "
+            f"with the AWG straight to the EXA, never through the mixer.",
+            "wiring:  AWG CH1 → EXA RF IN")
+
+        self._mixer_btn = meas_row(
+            3, "Run Mixer Check", self._run_mixer_check,
+            "Mixer conversion loss vs IF, LO feedthrough and sideband balance. "
+            "Needs a CW Level Check on record first. Aborts early if no LO is present.",
+            "wiring:  CH1 → mixer IF (3) · LO → mixer LO (2) · "
+            "mixer RF (1) → pad → EXA")
+
+        ttk.Label(awgf, text="All three drive AWG CH1 and take over the EXA; "
+                              "Live View is stopped automatically. "
+                              f"External pad assumed: {rsbs.EXTERNAL_ATTEN_DB:.0f} dB "
+                              f"(set EXTERNAL_ATTEN_DB to 0 if removed).",
+                  foreground="gray").grid(row=4, column=0, columnspan=3,
+                                           sticky='w', pady=(4, 0))
+        awgf.columnconfigure(1, weight=1)
+
         # Plot
         plot_frame = ttk.Frame(self.root)
         plot_frame.pack(fill='both', expand=True, padx=8, pady=4)
@@ -230,6 +336,36 @@ class SpecAnGUI:
     def _need_sa(self):
         if self.sa is None:
             print("Connect the instrument first.\n")
+            return False
+        return True
+
+    def _connect_awg(self):
+        def work():
+            self.root.after(0, lambda: self._set_busy(True))
+            try:
+                self._awg = rsbs.AWG()
+                self.root.after(0, lambda: self._awg_status_lbl.configure(
+                    text="AWG connected", foreground='green'))
+            except Exception as e:
+                print(f"AWG connect error: {e}\n")
+            finally:
+                self.root.after(0, lambda: self._set_busy(False))
+        self._thread(work)
+
+    def _get_awg(self):
+        """The AWG to drive: borrowed from the AWG window if one was supplied,
+        otherwise this GUI's own connection."""
+        if self._awg_provider is not None:
+            return self._awg_provider()
+        return self._awg
+
+    def _need_awg(self):
+        if self._get_awg() is None:
+            if self._awg_provider is not None:
+                print("Connect the AWG in the AWG Control window first "
+                      "(this window shares that connection).\n")
+            else:
+                print("Connect the AWG first (AWG-driven measurements section).\n")
             return False
         return True
 
@@ -310,6 +446,13 @@ class SpecAnGUI:
             print(f"Loaded overlay: {path}\n")
         except Exception as e:
             print(f"Load trace error: {e}\n")
+
+    def _draw_if_current(self, gen, freqs, amps):
+        """Apply a scan live-update only if its scan is still the active one
+        (see _scan_gen) -- drops stragglers that would otherwise land after
+        the final summary plot and clear it."""
+        if self._scan_gen == gen:
+            self._draw(freqs, amps)
 
     def _clear_overlays(self):
         self._overlays = []
@@ -533,6 +676,206 @@ class SpecAnGUI:
         except Exception as e:
             print(f"  save error: {e}\n")
         return peak_f, peak_a
+
+    # ── Chirp band scan (EXA cross-check of the scope rolloff finding) ──
+    # Reuses chirp_bench/run_specan_band_scan.py's functions directly
+    # (run_segment_specan, stitch_and_plot) rather than reimplementing the
+    # scan here, so the GUI path and the standalone bench-script path stay
+    # provably identical -- same segments, same AWG params, same rolloff
+    # math -- and can never quietly drift apart.
+
+    def _run_chirp_band_scan(self):
+        if not self._need_sa(): return
+        if not self._need_awg(): return
+        self._thread(self._chirp_band_scan_work)
+
+    def _run_cw_level_check(self):
+        if not self._need_sa(): return
+        if not self._need_awg(): return
+        self._thread(self._cw_level_check_work)
+
+    def _run_mixer_check(self):
+        if not self._need_sa(): return
+        if not self._need_awg(): return
+        self._thread(self._mixer_check_work)
+
+    def _mixer_check_work(self):
+        """Mixer bring-up: conversion loss vs IF, LO leakage, sideband balance.
+
+        Wiring: AWG CH1 -> mixer IF, LO -> mixer LO, mixer RF -> pad -> EXA.
+        Aborts in seconds if LO feedthrough is missing (a dead signal path
+        otherwise yields noise-floor maxima that look like plausible dBm)."""
+        self.root.after(0, lambda: self._set_busy(True))
+        if self._live_running:
+            print("Stopping Live View so the mixer check has exclusive use of the EXA.\n")
+            self._live_running = False
+            self.root.after(0, lambda: self._live_btn.configure(text="Live View: OFF"))
+            time.sleep(0.3)
+        try:
+            run_subdir = rmc.new_run_subdir()
+            self._scan_gen += 1
+            gen = self._scan_gen
+
+            # Plot conversion loss as it builds: (IF freq, CL) goes through
+            # the normal draw path unchanged.
+            def on_point(rows, lo_leak):
+                if len(rows) >= 2:
+                    self.root.after(0, self._draw_if_current, gen,
+                                     rows[:, 0], rows[:, 3])
+
+            r, lo_leak = rmc.measure(self._get_awg(), self.sa, run_subdir,
+                                      on_point=on_point)
+
+            self._scan_gen += 1          # invalidate stragglers before the final figure
+            fig = rmc.plot_results(r, lo_leak, fig=self._fig)
+            self.root.after(0, self._canvas.draw)
+
+            out_dir = os.path.join(specanlog.TRACE_DIR, run_subdir)
+            os.makedirs(out_dir, exist_ok=True)
+            png_path = os.path.join(out_dir, "_mixer_check.png")
+            fig.savefig(png_path, dpi=130)
+            print(f"\nsaved {png_path}\n")
+            print(f"conversion loss {r[:,3].min():.2f}-{r[:,3].max():.2f} dB, "
+                  f"LO leakage {lo_leak:+.2f} dBm "
+                  f"({rmc.LO_DELIVERED_DBM-lo_leak:.1f} dB isolation)\n")
+        except SystemExit as e:
+            # measure() raises SystemExit with the wiring diagnostic; in a GUI
+            # that must surface in the log, not kill the interpreter.
+            print(f"{e}\n")
+        except Exception as e:
+            print(f"Mixer check error: {e}\n")
+        finally:
+            try:
+                self._awg.stop()
+            except Exception as e:
+                print(f"cleanup (awg.stop): {e}\n")
+            self.root.after(0, lambda: self._set_busy(False))
+
+    def _cw_level_check_work(self):
+        """Step a CW tone across the band for TRUE absolute levels.
+
+        The chirp scan's dBm are power-density readings scaled by 1/B and
+        further reduced by the chirp sweeping through the RBW filter faster
+        than it settles -- fine for comparing shape, not absolute power. A
+        stationary CW tone has neither problem, so this is the calibration
+        reference, and its droop is an independent check on the chirp's."""
+        self.root.after(0, lambda: self._set_busy(True))
+        if self._live_running:
+            print("Stopping Live View so the CW level check has exclusive use of the EXA.\n")
+            self._live_running = False
+            self.root.after(0, lambda: self._live_btn.configure(text="Live View: OFF"))
+            time.sleep(0.3)
+        try:
+            self.sa.set_attenuation(rsbs.ATTEN_DB)
+            self.sa.set_ref_level(rsbs.REF_LEVEL_DBM)
+            run_subdir = rsbs.new_run_subdir().replace("chirp_band_scan", "cw_level_check")
+            print(f"CW level check: {len(rsbs.CW_FREQS)} tones, saving under "
+                  f"specan_traces/{run_subdir}/\n")
+
+            # Draw the response curve as it builds -- (freq, level) plots
+            # through the normal spectrum draw path unchanged.
+            self._scan_gen += 1
+            gen = self._scan_gen
+
+            def on_point(fs, levels):
+                self.root.after(0, self._draw_if_current, gen, fs, levels)
+
+            cw_f, cw_a = rsbs.run_cw_scan(self._get_awg(), self.sa, run_subdir,
+                                           on_point=on_point)
+
+            # Invalidate queued live updates before the final two-panel
+            # figure -- a straggler would clear it back to a single panel.
+            self._scan_gen += 1
+            fig = rsbs.plot_cw_scan(cw_f, cw_a, chirp_results=self._last_chirp_results,
+                                     fig=self._fig)
+            self.root.after(0, self._canvas.draw)
+
+            out_dir = os.path.join(specanlog.TRACE_DIR, run_subdir)
+            os.makedirs(out_dir, exist_ok=True)
+            png_path = os.path.join(out_dir, "_cw_level_check.png")
+            fig.savefig(png_path, dpi=130)
+            print(f"\nsaved {png_path}\n")
+            print(f"CW absolute level: {cw_a.max():.2f} to {cw_a.min():.2f} dBm, "
+                  f"droop {cw_a[0]-cw_a[-1]:.2f} dB across "
+                  f"{cw_f[0]/1e9:.2f}-{cw_f[-1]/1e9:.2f} GHz\n")
+            if self._last_chirp_results:
+                print("Shape overlay vs the chirp scan is in the lower panel -- if the two "
+                      "agree, the droop is real rather than a measurement artifact.\n")
+            else:
+                print("(Run a Chirp Band Scan too and the lower panel will overlay its "
+                      "shape against this for comparison.)\n")
+        except Exception as e:
+            print(f"CW level check error: {e}\n")
+        finally:
+            try:
+                self._awg.stop()
+            except Exception as e:
+                print(f"cleanup (awg.stop): {e}\n")
+            self.root.after(0, lambda: self._set_busy(False))
+
+    def _chirp_band_scan_work(self):
+        self.root.after(0, lambda: self._set_busy(True))
+        if self._live_running:
+            print("Stopping Live View so the chirp band scan has exclusive use of the EXA.\n")
+            self._live_running = False
+            self.root.after(0, lambda: self._live_btn.configure(text="Live View: OFF"))
+            time.sleep(0.3)  # let the live-view loop's current get_trace() finish
+        try:
+            self.sa.set_attenuation(rsbs.ATTEN_DB)
+            self.sa.set_ref_level(rsbs.REF_LEVEL_DBM)
+            run_subdir = rsbs.new_run_subdir()
+            print(f"Chirp band scan: {len(rsbs.SEGMENTS)} segments, saving under "
+                  f"specan_traces/{run_subdir}/\n")
+
+            # Live update while each segment's Max Hold accumulates, so the
+            # plot shows the trace building up instead of freezing for the
+            # whole settle. Called from this worker thread -> must marshal
+            # onto the Tk thread, same rule as every other UI update here.
+            self._scan_gen += 1
+            gen = self._scan_gen
+
+            def on_trace(freqs, amps):
+                if self._fullspan_var.get():
+                    self.root.after(0, self._draw_if_current, gen, freqs, amps)
+
+            results = []
+            for f_start, span_hz in rsbs.SEGMENTS:
+                label, fs, fe, freqs_crop, amps_crop = rsbs.run_segment_specan(
+                    self._get_awg(), self.sa, f_start, span_hz, run_subdir,
+                    on_trace=on_trace)
+                results.append((label, fs, fe, freqs_crop, amps_crop))
+                if len(freqs_crop):
+                    self.root.after(0, self._draw_if_current, gen, freqs_crop, amps_crop)
+
+            self._last_chirp_results = results   # for the CW check's shape overlay
+            # Invalidate any still-queued live updates before drawing the
+            # final figure, so none of them can clear it afterwards.
+            self._scan_gen += 1
+            fig, rolloff_hz = rsbs.stitch_and_plot(results, fig=self._fig)
+            self.root.after(0, self._canvas.draw)
+
+            out_dir = os.path.join(specanlog.TRACE_DIR, run_subdir)
+            os.makedirs(out_dir, exist_ok=True)
+            png_path = os.path.join(out_dir, "_band_overview.png")
+            fig.savefig(png_path, dpi=130)
+            print(f"\nsaved stitched plot: {png_path}\n")
+            if rolloff_hz is not None:
+                print(f"EXA-measured -3dB rolloff: {rolloff_hz/1e9:.3f} GHz "
+                      f"(single N=1 run -- not yet repeated)\n")
+            else:
+                print("EXA found no -3dB rolloff within the scanned band "
+                      "(single N=1 run -- not yet repeated)\n")
+            print("Cross-check against the scope-based swept_amplitude_response()/"
+                  "rolloff_frequency() finding from run_chirp_quality.py/"
+                  "band_overview.py for the same segments.\n")
+        except Exception as e:
+            print(f"Chirp band scan error: {e}\n")
+        finally:
+            try:
+                self._awg.stop()
+            except Exception as e:
+                print(f"cleanup (awg.stop): {e}\n")
+            self.root.after(0, lambda: self._set_busy(False))
 
 
 if __name__ == "__main__":
