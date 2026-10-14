@@ -725,12 +725,20 @@ class AWG:
             self._active_seg[2] = 2
         return freq_hz
 
-    def duc_cw_step(self, freq_hz, channel=1):
+    def duc_cw_step(self, freq_hz, channel=1, amplitude_vpp=None):
         """Retune the NCO carrier of a channel prepared by duc_cw_setup().
 
         Only :NCO:CFR1 changes — the constant baseband keeps playing. *OPC?
         blocks until the AWG has processed the retune (same pattern as
         sweep_step). Raw writes, no per-command error polling, for speed.
+
+        amplitude_vpp, if given, also retunes the output level in the same
+        transaction. That is what makes a PRE-EMPHASISED sweep possible: a
+        correction table is a different amplitude at every frequency, and
+        re-uploading a waveform per point would cost seconds each. Sent with
+        6 decimals because the correction this chain needs is measured in
+        thousandths of a dB — whether the instrument honours that many is a
+        separate question, and one worth measuring rather than assuming.
         """
         if not 0 < freq_hz <= 4.5e9:
             raise ValueError(f"{freq_hz/1e6:.1f} MHz outside DUC NCO range "
@@ -738,9 +746,85 @@ class AWG:
         with self._lock:
             self._dev.write(f":INST:CHAN {channel}")
             self._dev.write(f":NCO:CFR1 {freq_hz:.0f}")
+            if amplitude_vpp is not None:
+                self._dev.write(f":VOLT {amplitude_vpp:.6f}")
             self._dev.query("*OPC?")
             self._drain_errs(f"NCO retune to {freq_hz/1e6:.1f} MHz")
         return freq_hz
+
+    def duc_am_setup(self, carrier_hz, mod_hz=200e3, depth_db=6.0,
+                     amplitude_vpp=0.5, channel=1, n_total=16384):
+        """DUC/IQM-ONE carrier with a sinusoidal AMPLITUDE modulation.
+
+        Built for the AM-to-PM measurement: swing a stage's drive by a known
+        amount and watch what its output PHASE does. The slope (degrees per
+        dB) is the number that says whether running an amplifier or a
+        multiplier near compression is affordable. In this chain it is not a
+        detail -- a phase error at the AWG is multiplied by 192 on the way to
+        310-370 GHz and nothing downstream can absorb it, whereas an
+        amplitude error is multiplied into a 7 dB window that has room for it.
+
+        The envelope is normalised so its PEAK is full scale. amplitude_vpp
+        therefore means the same thing it means for duc_cw_setup() -- the
+        level at the TOP of the swing -- so an AM run made at the CW
+        operating amplitude explores DOWNWARD from the operating point and
+        never drives anything harder than the CW run already did. That is
+        what makes this safe to point at a chain already sitting close to a
+        compression limit: no new worst case is created.
+
+        I carries the envelope, Q is zero, so this is ordinary double-sideband
+        AM -- sidebands at carrier +- mod_hz and no phase modulation imposed
+        at all. Whatever phase modulation comes back is the DUT's, plus the
+        AWG's own, which needs a thru reference to separate.
+
+        An integer number of modulation cycles is fitted into the buffer, so
+        looping playback is continuous: without that, the wrap discontinuity
+        once per buffer would spray energy across the whole analysis band and
+        land in the same place as the phase modulation being measured.
+
+        Retune the carrier afterwards with duc_cw_step() -- it writes only
+        :NCO:CFR1 and leaves this baseband playing.
+        """
+        rate = 9e9
+        rate_cx = rate / 8.0
+        if not 0 < carrier_hz <= rate / 2:
+            raise ValueError(f"{carrier_hz/1e6:.1f} MHz outside DUC NCO range "
+                             f"(0-{rate/2e9:g} GHz]")
+        if not 0.0 < depth_db <= 40.0:
+            raise ValueError(f"depth_db {depth_db} outside (0, 40] dB")
+        n_total = max(int(np.ceil(n_total / 32)) * 32, 64)
+        cycles = max(int(round(mod_hz * n_total / rate_cx)), 1)
+        spc = n_total / cycles
+        if spc < 16:
+            raise ValueError(
+                f"{mod_hz/1e3:.1f} kHz gives only {spc:.1f} baseband samples "
+                f"per modulation cycle in an {n_total}-sample buffer -- the "
+                f"envelope would be a staircase. Lower mod_hz or raise n_total.")
+        actual_mod = cycles * rate_cx / n_total
+
+        # depth_db is the PEAK-TO-TROUGH swing: (1+m)/(1-m) in amplitude.
+        ratio = 10 ** (depth_db / 20.0)
+        m = (ratio - 1.0) / (ratio + 1.0)
+        k = np.arange(n_total, dtype=np.float64)
+        env = (1.0 + m * np.cos(2 * np.pi * cycles * k / n_total)) / (1.0 + m)
+        data = self._iq_to_u16(env, np.zeros(n_total))
+
+        print(f"[DUC AM] CH{channel} {carrier_hz/1e6:.4f} MHz, "
+              f"AM {actual_mod/1e3:.3f} kHz ({cycles} cyc in "
+              f"{n_total/rate_cx*1e6:.3f} us), depth {depth_db:.2f} dB p-p "
+              f"(m={m:.4f}), peak {amplitude_vpp:.4f} Vpp")
+        with self._lock:
+            self._dev.write("*CLS; *RST"); time.sleep(0.5); self._dev.query("*OPC?")
+            self._rate_sent.clear()
+            self._cmd(f":INST:CHAN {channel}"); self._cmd(":TRAC:DEL:ALL")
+            self._duc_upload_ch(channel, 1, data, carrier_hz, rate, rate_cx,
+                                amplitude_vpp)
+            self._active_seg[channel] = 1
+        return dict(carrier_hz=float(carrier_hz), mod_hz=float(actual_mod),
+                    depth_db=float(depth_db), m=float(m),
+                    n_total=int(n_total), cycles=int(cycles),
+                    samples_per_cycle=float(spc), trough_db=float(-depth_db),
+                    peak_vpp=float(amplitude_vpp))
 
     def send_chirp_duc_sync(self, f_carrier_chirp_hz, f_start_bb_hz, f_stop_bb_hz,
                             chirp_us, dead_us, amplitude_vpp=0.5, window_frac=0.05,

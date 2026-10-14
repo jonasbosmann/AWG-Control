@@ -16,3 +16,15 @@ specan_traces/
 
 # Saved chirp-quality captures (experimental data)
 chirp_captures/
+
+# x8 multiplier-chain bench measurements (experimental data)
+x8_chain/measurements/
+
+# x6 multiplier-chain bench measurements (experimental data)
+x6_chain/
+
+# AWG level-vs-scope captures (experimental data)
+awg_level_scope/
+
+# MS Office lock files
+~$*

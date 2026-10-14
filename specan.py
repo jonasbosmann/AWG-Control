@@ -147,10 +147,252 @@ class SpecAn:
         freqs = np.linspace(start, stop, n)
         return freqs, amps
 
-    def sweep_once(self):
-        """Single sweep + read, as one call."""
-        self.single_sweep()
-        return self.get_trace()
+    def _recover(self):
+        """Clear a wedged transaction and drain anything left queued.
+
+        A query that times out MID-TRANSACTION may still have its reply
+        arrive afterwards. Retrying without draining then reads that stale
+        reply, and every following query is answered by the one before it --
+        silently, with plausible numbers. So recovery has to drain, not just
+        retry. Same failure this class guards against in __init__.
+        """
+        try:
+            self._dev.clear()
+        except Exception:                            # noqa: BLE001
+            pass
+        t = self._dev.timeout
+        self._dev.timeout = 300
+        try:
+            while True:
+                self._dev.read()
+        except Exception:                            # noqa: BLE001
+            pass
+        self._dev.timeout = t
+        try:
+            self._dev.write("*CLS")
+        except Exception:                            # noqa: BLE001
+            pass
+
+    def sweep_once(self, retries=1):
+        """Single sweep + read, as one call.
+
+        Retries once through _recover() on a VISA timeout. Observed
+        2026-07-31: a single transient timeout on :INIT:IMM killed a 4-minute
+        sweep, with the instrument found afterwards in a perfectly healthy
+        state (SA mode, no errors, sweeps completing in 0.00 s). Losing a run
+        to that is not worth it; silently accepting shifted data would be
+        much worse, hence the drain.
+        """
+        for attempt in range(int(retries) + 1):
+            try:
+                self.single_sweep()
+                return self.get_trace()
+            except pyvisa.errors.VisaIOError:
+                if attempt >= retries:
+                    raise
+                print("  (analyzer timed out -- clearing and retrying)")
+                self._recover()
+
+    # ── IQ Analyzer (BASIC) mode ──────────────────────────────────────
+    # The swept trace above is a magnitude-only measurement: it cannot see
+    # phase, so it cannot answer "what does this stage's output phase do when
+    # its drive level moves?" -- i.e. AM-to-PM. The Waveform measurement in
+    # BASIC mode returns raw time-domain I/Q instead, from which envelope and
+    # phase come out together, sample by sample.
+    #
+    # Use: iq_setup() once, iq_capture() per point, iq_teardown() at the end.
+    # Mode switches take seconds, so they are deliberately NOT per-capture.
+
+    def _drain(self, max_n=20):
+        """Empty the SCPI error queue and return whatever was in it.
+        Called from inside an already-locked section."""
+        errs = []
+        for _ in range(max_n):
+            e = self._dev.query(":SYST:ERR?").strip()
+            if e.startswith("0") or e.startswith("+0"):
+                break
+            errs.append(e)
+        return errs
+
+    def _try(self, cmd):
+        """Write a command that may not exist on this firmware/option set.
+        Returns the error text, or '' if it took. Never raises -- used only
+        for the nice-to-haves, so a missing one degrades the run instead of
+        killing it."""
+        self._dev.write(cmd)
+        e = self._dev.query(":SYST:ERR?").strip()
+        return "" if (e.startswith("0") or e.startswith("+0")) else e
+
+    def _read_iq(self, big_endian):
+        raw = self._dev.query_binary_values(":READ:WAV0?", datatype='f',
+                                            is_big_endian=big_endian,
+                                            container=np.array)
+        x = np.asarray(raw, dtype=np.float64)
+        if x.size < 64 or x.size % 2:
+            raise RuntimeError(f"IQ record has {x.size} values -- expected an "
+                               f"even count of at least 64 interleaved I,Q")
+        z = x[0::2] + 1j * x[1::2]
+        mag = np.abs(z)
+        med = float(np.median(mag))
+        if not np.isfinite(z).all() or mag.max() <= 0 or \
+                (med > 0 and mag.max() / med > 1e6):
+            raise RuntimeError("IQ record is not physical (non-finite, or a "
+                               "1e6 spread between peak and median) -- "
+                               "suspect the binary byte order")
+        return z
+
+    def iq_setup(self, center_hz, if_bw_hz=5e6, duration_s=1e-3,
+                 atten_db=None):
+        """Enter BASIC mode and configure a time-domain I/Q capture.
+
+        THE SAMPLE RATE IS NOT SETTABLE ON THIS UNIT and is not what the
+        instrument says it is. Probed on fw A.11.04, 2026-07-31:
+
+          * ':WAV:SRAT <value>' is rejected -- '-110, Illegal command:
+            WAV:SRAT'. Only the QUERY form parses.
+          * ':WAV:SRAT?' answers, but it echoes the IF BANDWIDTH, not the
+            sample rate. With the IF BW at 100 kHz it reported 1e5 while the
+            record really arrived at 1.364 MS/s. ':WAV:BAND?',
+            ':WAV:BAND:RES?' and ':WAV:BWID:RES?' all alias to the same
+            parameter, so none of them is a second opinion.
+          * The real knob is ':WAV:DIF:BANDwidth'. Rate follows it, but not
+            by a fixed ratio: 100 kHz -> 1.364 MS/s (x13.6), 1 MHz ->
+            7.5 MS/s (x7.5).
+
+        So the rate is DERIVED from a real capture -- pairs returned divided
+        by ':WAV:SWE:TIME?' -- and that derived value is what iq_capture()
+        reports. A believed-but-wrong sample rate is the kind of error that
+        produces a plausible answer on the wrong frequency axis, so it is
+        settled here against data rather than read off a query that lies.
+
+        if_bw_hz should be set well WIDER than any modulation being measured.
+        The digital IF filter is Gaussian (':WAV:BAND:TYPE?' -> GAUS), and
+        any asymmetry of its response about the tone converts AM into PM and
+        back -- exactly the quantity an AM-to-PM measurement is trying to
+        attribute to the DUT. Running 25x wide makes its contribution
+        negligible; the cost is noise floor, which is cheap here.
+
+        Reference level is deliberately not touched. Attenuation is what sets
+        the front-end headroom, and an AM run made at a level already verified
+        in swept mode creates no new worst case: the modulation only goes
+        DOWN from the peak that was already measured safely.
+        """
+        self._iq_prev_timeout = self._dev.timeout
+        with self._lock:
+            self._dev.timeout = 30000
+            self._dev.write("*CLS")
+            self._dev.write(":INST:SEL BASIC")
+            self._dev.query("*OPC?")
+            mode = self._dev.query(":INST:SEL?").strip().upper()
+            if "BASIC" not in mode and "IQ" not in mode:
+                errs = self._drain()
+                self._dev.write(":INST:SEL SA")
+                self._dev.timeout = self._iq_prev_timeout
+                raise RuntimeError(
+                    f"could not enter IQ Analyzer mode: :INST:SEL? -> {mode!r}"
+                    + (f"; errors {errs}" if errs else "")
+                    + ". BASIC mode is a licensed option -- without it this "
+                      "instrument cannot capture I/Q and AM-to-PM is not "
+                      "measurable on it.")
+            self._dev.write(":CONF:WAV")
+            self._dev.query("*OPC?")
+            self._dev.write(":INIT:CONT OFF")
+            self._dev.write(f":FREQ:CENT {center_hz:.0f}")
+            if atten_db is not None:
+                self._dev.write(":POW:ATT:AUTO OFF")
+                self._dev.write(f":POW:ATT {atten_db:.0f}")
+            soft = {}
+            for tag, c in (("aver_off", ":WAV:AVER:STAT OFF"),
+                           ("elec_att_off", ":POW:EATT:STAT OFF")):
+                e = self._try(c)
+                if e:
+                    soft[tag] = e
+            self._dev.write(f":WAV:DIF:BAND {if_bw_hz:.0f}")
+            self._dev.write(f":WAV:SWE:TIME {duration_s:.9f}")
+            self._dev.write(":FORM:DATA REAL,32")
+            self._dev.write(":FORM:BORD SWAP")
+            errs = self._drain()
+            if errs:
+                self._dev.write(":INST:SEL SA")
+                self._dev.timeout = self._iq_prev_timeout
+                raise RuntimeError(f"IQ setup rejected: {'; '.join(errs)}")
+
+            dif = float(self._dev.query(":WAV:DIF:BAND?"))
+            tsw = float(self._dev.query(":WAV:SWE:TIME?"))
+            shape = self._dev.query(":WAV:BAND:TYPE?").strip()
+            att = float(self._dev.query(":POW:ATT?"))
+            self._dev.timeout = 120000
+
+            # Probe capture. Byte order is the one thing here that fails
+            # SILENTLY -- wrong-endian float32 still parses, just into
+            # nonsense -- so it is settled now, against a real record, rather
+            # than discovered later in a phase number that looks plausible.
+            self._iq_big_endian = False
+            try:
+                try:
+                    z = self._read_iq(False)
+                except RuntimeError:
+                    self._dev.write(":FORM:BORD NORM")
+                    self._drain()
+                    z = self._read_iq(True)
+                    self._iq_big_endian = True
+            except Exception:
+                # Never leave the analyzer parked in BASIC mode: every other
+                # script here uses the swept trace, and a mode left switched
+                # would break the next run rather than this one.
+                self._dev.write(":FORM:DATA ASCII")
+                self._dev.write(":INST:SEL SA")
+                self._drain()
+                self._dev.timeout = self._iq_prev_timeout
+                del self._iq_big_endian
+                raise
+            fs = len(z) / tsw                    # DERIVED, see the docstring
+            self._iq_fs = fs
+            self._iq_tsw = tsw
+            claimed = float(self._dev.query(":WAV:SRAT?"))
+        info = dict(sample_rate_hz=fs, duration_s=tsw, dif_bw_hz=dif,
+                    if_filter=shape, atten_db=att, center_hz=float(center_hz),
+                    n_samples=int(len(z)), srat_claimed_hz=claimed,
+                    big_endian=bool(self._iq_big_endian), soft_errors=soft)
+        return info
+
+    def iq_capture(self, center_hz=None):
+        """One I/Q record. Returns (z_complex, sample_rate_hz).
+
+        Retuning only writes :FREQ:CENT -- the capture configuration set up by
+        iq_setup() stays put, so points in a sweep are all taken under
+        identical acquisition conditions.
+        """
+        if not hasattr(self, "_iq_fs"):
+            raise RuntimeError("iq_capture() before iq_setup()")
+        with self._lock:
+            if center_hz is not None:
+                self._dev.write(f":FREQ:CENT {center_hz:.0f}")
+            self._dev.write("*CLS")
+            z = self._read_iq(self._iq_big_endian)
+            errs = self._drain()
+        if errs:
+            raise RuntimeError(f"IQ capture reported: {'; '.join(errs)}")
+        # Recomputed per record rather than reused: the returned length is the
+        # only handle on the rate, so a record that comes back a different
+        # length must change the rate with it, not be silently mislabelled.
+        return z, len(z) / self._iq_tsw
+
+    def iq_teardown(self):
+        """Back to swept SA mode, with the trace type that was in effect."""
+        with self._lock:
+            try:
+                self._dev.write(":FORM:DATA ASCII")
+                self._dev.write(":INST:SEL SA")
+                self._dev.query("*OPC?")
+                self._dev.write(f":TRAC1:TYPE {self._trace_mode}")
+                self._dev.write(":INIT:CONT ON")
+                self._drain()
+            finally:
+                self._dev.timeout = getattr(self, "_iq_prev_timeout", 8000)
+                for a in ("_iq_fs", "_iq_tsw", "_iq_big_endian"):
+                    if hasattr(self, a):
+                        delattr(self, a)
 
     def close(self):
         self._dev.close()
