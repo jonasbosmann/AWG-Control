@@ -314,155 +314,378 @@ class AWG:
         t = np.arange(n_samples)
         return self._real_to_u16(np.sin(2 * np.pi * cycles * t / n_samples))
 
+    # ── General dual-channel waveform builder ─────────────────────
+    #
+    # One code path behind every "play something on CH1 and/or CH2" case:
+    # chirp, CW, square or ramp, in DIRECT mode (real samples) or DUC mode
+    # (complex baseband on an exact NCO carrier), each channel gated to a
+    # window of ONE shared buffer period.  send_chirp_with_lo() and
+    # send_chirp_with_lo_duc() are thin wrappers over it, so the
+    # bench-proven CP-FTMW shot is built by exactly this code rather than
+    # by a parallel copy that can drift out of step with it.
+    #
+    # A channel spec is a plain dict:
+    #   kind           'off' | 'cw' | 'chirp' | 'square' | 'ramp'
+    #   freq_hz        cw/square/ramp: output frequency (direct mode) or
+    #                  baseband offset from the carrier (duc; 0 = pure carrier)
+    #   f_start_hz,
+    #   f_stop_hz      chirp: output sweep (direct) or baseband sweep (duc)
+    #   carrier_hz     duc only: NCO carrier, exact to the Hz
+    #   sideband       duc only: 'upper' | 'lower' | 'both'
+    #                  ('both' feeds the real baseband to I with Q=0 →
+    #                   carrier ± f, i.e. a DSB/two-tone signal)
+    #   gate           'continuous' | 'chirp' | 'detect'
+    #   amplitude_vpp  per channel (:VOLT is per channel on this instrument)
+
+    GRAN_DIRECT  = 64     # direct: segment length must be a multiple of 64
+    GRAN_DUC     = 32     # duc: 2 u16 per sample, so n·32 → 2n is a multiple of 64
+    DUC_DAC_RATE = 9e9    # DUC DAC clock; X8 interpolation → 1.125 GS/s complex
+    DUC_INTERP   = 8
+    SIGNAL_KINDS = ("off", "cw", "chirp", "square", "ramp")
+
+    @staticmethod
+    def _analytic(x):
+        """Single-sideband (analytic) version of a real baseband array.
+
+        Same construction as scipy.signal.hilbert, kept local to avoid adding
+        a scipy dependency: zero the negative-frequency half of the spectrum
+        and double the positive half. Needed for square/ramp basebands in DUC
+        mode — feeding the real waveform straight into I would put the
+        modulation on BOTH sides of the carrier.
+        """
+        n = len(x)
+        X = np.fft.fft(x)
+        h = np.zeros(n)
+        h[0] = 1.0
+        if n % 2 == 0:
+            h[n // 2] = 1.0
+            h[1:n // 2] = 2.0
+        else:
+            h[1:(n + 1) // 2] = 2.0
+        return np.fft.ifft(X * h)
+
+    @staticmethod
+    def snap_continuous(freq_hz, n_win, rate):
+        """Frequency a continuously repeating buffer can actually hold.
+
+        A waveform that plays continuously has to close on itself: the buffer
+        repeats, so a non-integer number of cycles steps the phase at the wrap
+        and sprays spurs across the band. Snapped to the nearest whole cycle,
+        the worst-case error is half of rate/n_win. A GATED burst is windowed
+        to zero at both ends, never wraps, and so keeps its exact frequency —
+        which is what the CP-FTMW LO needs.
+
+        Shared with the GUI so what it previews is what the builder sends.
+        """
+        if freq_hz == 0:
+            return 0.0
+        cycles = max(round(abs(freq_hz) * n_win / rate), 1)
+        return float(np.sign(freq_hz) * cycles * rate / n_win)
+
+    def _plan_timing(self, mode, timing, rate_eff):
+        """Sample counts for one shared buffer period: chirp | dead | detect.
+
+        The granularity round-up lands AFTER the detect window, so the chirp
+        and the detect window both start exactly where the requested timing
+        says they do; `pad_s` reports the leftover tail.
+        """
+        t = timing or {}
+        chirp_us  = float(t.get("chirp_us",  1.0))
+        dead_us   = float(t.get("dead_us",   0.1))
+        detect_us = float(t.get("detect_us", 10.0))
+        n_chirp  = round(chirp_us  * 1e-6 * rate_eff)
+        n_dead   = round(dead_us   * 1e-6 * rate_eff)
+        n_detect = round(detect_us * 1e-6 * rate_eff)
+        gran    = self.GRAN_DUC if mode == "duc" else self.GRAN_DIRECT
+        floor_n = 64 if mode == "duc" else 128
+        n_total = max(int(np.ceil((n_chirp + n_dead + n_detect) / gran)) * gran, floor_n)
+        return {
+            "mode": mode, "rate_eff": rate_eff,
+            "n_chirp": n_chirp, "n_dead": n_dead, "n_detect": n_detect,
+            "n_total": n_total,
+            "period_s": n_total / rate_eff,
+            "pad_s": (n_total - n_chirp - n_dead - n_detect) / rate_eff,
+            "windows": {
+                "continuous": (0, n_total),
+                "chirp":      (0, max(n_chirp, 1)),
+                "detect":     (n_chirp + n_dead, max(n_detect, 1)),
+            },
+        }
+
+    def _build_channel(self, mode, spec, plan, window_frac):
+        """One channel's samples (uint16, ready for :TRAC:DATA) + an info dict."""
+        kind  = spec.get("kind", "off")
+        gate  = spec.get("gate", "continuous")
+        if gate not in plan["windows"]:
+            raise ValueError(f"unknown gate {gate!r}")
+        start, n_win = plan["windows"][gate]
+        gated = gate != "continuous"
+        rate  = plan["rate_eff"]
+        env   = self._gauss_win(n_win, window_frac) if gated else np.ones(n_win)
+        t     = np.arange(n_win, dtype=np.float64) / rate
+        info  = {"kind": kind, "gate": gate, "n_win": n_win, "t_win_s": n_win / rate}
+
+        if kind == "chirp":
+            f0 = float(spec.get("f_start_hz", 0.0))
+            f1 = float(spec.get("f_stop_hz",  0.0))
+            T  = t[-1] if n_win > 1 else 1e-9
+            phase = 2 * np.pi * (f0 * t + (f1 - f0) / (2 * T) * t ** 2)
+            info.update(f_start_hz=f0, f_stop_hz=f1,
+                        chirp_rate_hz_per_s=(f1 - f0) / max(T, 1e-12))
+        else:
+            f = float(spec.get("freq_hz", 0.0))
+            # Gated bursts keep the exact frequency; a continuously repeating
+            # buffer gets snapped to a whole cycle count — see snap_continuous.
+            f_act = f if gated else self.snap_continuous(f, n_win, rate)
+            phase = 2 * np.pi * f_act * t
+            info.update(freq_hz=f, freq_actual_hz=f_act)
+
+        if kind in ("cw", "chirp"):
+            z = (np.exp(1j * phase) if mode == "duc" else np.sin(phase)) * env
+        elif kind == "square":
+            real = np.where(np.sin(phase) >= 0, 1.0, -1.0)
+            z = (self._analytic(real) if mode == "duc" else real) * env
+        elif kind == "ramp":
+            real = 2.0 * ((phase / (2 * np.pi)) % 1.0) - 1.0
+            z = (self._analytic(real) if mode == "duc" else real) * env
+        else:
+            raise ValueError(f"unknown signal kind {kind!r} "
+                             f"(expected one of {self.SIGNAL_KINDS})")
+
+        if mode == "duc":
+            sideband = spec.get("sideband", "upper")
+            if sideband == "lower":
+                z = np.conj(z)
+            elif sideband == "both":
+                z = np.real(z).astype(np.complex128)   # DSB: carrier ± f
+            elif sideband != "upper":
+                raise ValueError(f"unknown sideband {sideband!r}")
+            I, Q = np.real(z).copy(), np.imag(z).copy()
+            # The analytic square/ramp overshoots ±1 (Gibbs); scale it back so
+            # _iq_to_u16 does not clip the peaks into a flat top.
+            peak = max(np.abs(I).max(initial=0.0), np.abs(Q).max(initial=0.0))
+            if peak > 1.0:
+                I, Q = I / peak, Q / peak
+                info["scaled_by"] = 1.0 / peak
+            I_full = np.zeros(plan["n_total"]); I_full[start:start + n_win] = I
+            Q_full = np.zeros(plan["n_total"]); Q_full[start:start + n_win] = Q
+            info["sideband"] = sideband
+            return self._iq_to_u16(I_full, Q_full), info
+
+        full = np.zeros(plan["n_total"])
+        full[start:start + n_win] = np.real(z)
+        return self._real_to_u16(full), info
+
+    def _check_limits(self, mode, specs, rate_eff):
+        """Reject anything that would alias or exceed the NCO range, with the
+        number that is wrong named in the message — a silent alias looks like
+        a real measurement."""
+        for ch, s in specs.items():
+            kind = s.get("kind", "off")
+            freqs = ([s.get("f_start_hz", 0.0), s.get("f_stop_hz", 0.0)]
+                     if kind == "chirp" else [s.get("freq_hz", 0.0)])
+            if mode == "duc":
+                carrier = float(s.get("carrier_hz", 0.0))
+                nco_max = self.DUC_DAC_RATE / 2
+                if not 0 < carrier <= nco_max:
+                    raise ValueError(
+                        f"CH{ch} carrier {carrier/1e6:.1f} MHz outside the DUC NCO "
+                        f"range (0–{nco_max/1e9:g} GHz]")
+                bb_max = rate_eff / 2
+                for f in freqs:
+                    if abs(f) > bb_max:
+                        raise ValueError(
+                            f"CH{ch} baseband {f/1e6:.1f} MHz exceeds the complex "
+                            f"Nyquist limit ({bb_max/1e6:.1f} MHz at "
+                            f"{rate_eff/1e9:g} GS/s complex)")
+                    if not 0 < carrier + f <= nco_max:
+                        raise ValueError(
+                            f"CH{ch} output {(carrier + f)/1e6:.1f} MHz outside "
+                            f"0–{nco_max/1e9:g} GHz")
+            else:
+                for f in freqs:
+                    if abs(f) > rate_eff / 2:
+                        raise ValueError(
+                            f"CH{ch} {f/1e6:.1f} MHz is above Nyquist "
+                            f"({rate_eff/2e6:.0f} MHz at {rate_eff/1e9:g} GS/s) — "
+                            f"output would alias")
+
+    def send_waveforms(self, specs, mode="duc", timing=None, rate=None,
+                       window_frac=0.05, verbose=True):
+        """Play one spec per channel, both built into ONE shared buffer period.
+
+        mode='duc'    : 9 GS/s DAC clock, X8 interpolation (1.125 GS/s complex
+                        baseband), IQM ONE. Each channel's carrier is its own
+                        exact NCO frequency; both channels stay usable because
+                        the 2.5 GS/s dual-channel ceiling is an ARB/direct-mode
+                        memory limit, not a DUC one.
+        mode='direct' : real samples at `rate` (defaults to 2.5 GS/s whenever a
+                        second channel is active — one DAC per channel).
+
+        Returns the plan dict: period, window sample counts, and the per-channel
+        info (including the frequency actually produced after integer-cycle
+        snapping) so a caller can display what the hardware was really told.
+        """
+        mode  = mode.lower()
+        specs = {int(ch): dict(s or {"kind": "off"}) for ch, s in specs.items()}
+        active = {ch: s for ch, s in specs.items() if s.get("kind", "off") != "off"}
+        if not active:
+            raise ValueError("nothing to send — every channel spec is 'off'")
+
+        if mode == "duc":
+            rate_dac = self.DUC_DAC_RATE
+            rate_eff = rate_dac / self.DUC_INTERP
+        elif mode == "direct":
+            rate_dac = rate_eff = float(
+                rate if rate else (SAMPLE_RATE_DUAL if len(active) > 1
+                                   else self.sample_rate))
+            if len(active) > 1 and rate_eff > SAMPLE_RATE_DUAL:
+                raise ValueError(
+                    f"{rate_eff/1e9:g} GS/s is single-channel only — two active "
+                    f"channels need ≤ {SAMPLE_RATE_DUAL/1e9:g} GS/s in direct mode")
+        else:
+            raise ValueError(f"mode must be 'duc' or 'direct', not {mode!r}")
+
+        self._check_limits(mode, active, rate_eff)
+        plan = self._plan_timing(mode, timing, rate_eff)
+        built = {ch: self._build_channel(mode, s, plan, window_frac)
+                 for ch, s in active.items()}
+        plan["channels"] = {ch: info for ch, (_, info) in built.items()}
+        plan["rate_dac"] = rate_dac
+
+        if verbose:
+            print(f"[{mode.upper()}] period {plan['period_s']*1e6:.3f} µs "
+                  f"({plan['n_total']:,} samp @ {rate_eff/1e9:g} GS/s"
+                  f"{', complex' if mode == 'duc' else ''}), "
+                  f"rep rate {1/plan['period_s']/1e3:.2f} kHz")
+            for ch in sorted(built):
+                s, info = active[ch], built[ch][1]
+                base = f"[CH{ch}] {info['kind']}"
+                if mode == "duc":
+                    carrier = float(s.get("carrier_hz", 0.0))
+                    if info["kind"] == "chirp":
+                        span = (f"{(carrier+info['f_start_hz'])/1e6:.3f}→"
+                                f"{(carrier+info['f_stop_hz'])/1e6:.3f} MHz")
+                    else:
+                        span = f"{(carrier+info['freq_actual_hz'])/1e6:.6f} MHz"
+                    base += (f" {span}  carrier {carrier/1e6:.6f} MHz "
+                             f"({info['sideband']} sideband)")
+                else:
+                    base += (f" {info['f_start_hz']/1e6:.3f}→{info['f_stop_hz']/1e6:.3f} MHz"
+                             if info["kind"] == "chirp"
+                             else f" {info['freq_actual_hz']/1e6:.6f} MHz")
+                print(f"{base}  gate {info['gate']} "
+                      f"({info['t_win_s']*1e6:.3f} µs, {info['n_win']:,} samp)  "
+                      f"{s.get('amplitude_vpp', 0.5)} Vpp")
+
+        with self._lock:
+            if mode == "duc":
+                self._dev.write("*CLS; *RST")
+                time.sleep(0.5)
+                self._dev.query("*OPC?")
+                self._rate_sent.clear()
+                if verbose:
+                    # Confirms the DUC/IQM option is actually installed on this unit.
+                    print(f"  *OPT? -> {self._dev.query('*OPT?').strip()!r}")
+                # :IQModulation is per channel and only sticks after :MODE DUC,
+                # so every DUC command lives in _duc_upload_ch — see its docstring
+                # for the ordering the firmware actually honours.
+                self._cmd(":INST:CHAN 1")
+                self._cmd(":TRAC:DEL:ALL")
+                for ch in sorted(built):
+                    self._duc_upload_ch(ch, ch, built[ch][0],
+                                        float(active[ch].get("carrier_hz", 0.0)),
+                                        rate_dac, rate_eff,
+                                        float(active[ch].get("amplitude_vpp", 0.5)))
+                    self._active_seg[ch] = ch
+                if verbose:
+                    for ch in sorted(built):
+                        self._dump_duc_state(ch)
+            else:
+                for i, ch in enumerate(sorted(built)):
+                    self._setup(ch, reset=(i == 0), sample_rate=rate_eff)
+                    self._upload(built[ch][0], segnum=ch)
+                    self._play(float(active[ch].get("amplitude_vpp", 0.5)), segnum=ch)
+                    self._active_seg[ch] = ch
+            for ch in sorted(set(specs) - set(active)):
+                self._dev.write(f":INST:CHAN {ch}")
+                self._dev.write(":OUTP OFF")
+        return plan
+
+    def _dump_duc_state(self, ch):
+        """Read back the state that actually determines DUC behaviour, AFTER setup.
+
+        _duc_upload_ch already raises if IQM/INT came out wrong, so this is not
+        the guard — it is the bench record of what the channel ended up in, the
+        thing that made the 2026-07 'IQM stayed NONE → garbled multi-tone'
+        failure visible in the first place.
+        """
+        self._dev.write(f":INST:CHAN {ch}")
+        print(f"  [CH{ch} state] "
+              f"MODE={self._dev.query(':MODE?').strip()!r} "
+              f"IQM={self._dev.query(':SOUR:IQM?').strip()!r} "
+              f"INT={self._dev.query(':SOUR:INT?').strip()!r} "
+              f"CFR1={self._dev.query(':NCO:CFR1?').strip()!r} "
+              f"RAST={self._dev.query(':FREQ:RAST?').strip()!r} "
+              f"SEGM={self._dev.query(':FUNC:MODE:SEGM?').strip()!r}")
+
+    def retune(self, carriers, amplitudes=None):
+        """Fast retune of channels already set up by send_waveforms(mode='duc').
+
+        Writes only :NCO:CFR1 (plus :VOLT when an amplitude is given), so
+        moving the carrier costs milliseconds instead of the seconds a
+        *RST + re-upload takes. The baseband keeps playing untouched, which
+        means the chirp SHAPE is preserved and only its centre moves.
+        """
+        amplitudes = amplitudes or {}
+        for ch, f in carriers.items():
+            self.duc_cw_step(float(f), channel=int(ch),
+                             amplitude_vpp=amplitudes.get(ch))
+        return carriers
+
     def send_chirp_with_lo(self, f_start_hz, f_stop_hz, chirp_us, dead_us,
                             f_lo_hz, detect_us, amplitude_vpp=0.5, window_frac=0.05):
         """CH1: Gaussian-windowed chirp then silence.
            CH2: silence during chirp+dead, then exact CW sine during detection window.
            Both channels share the same buffer → identical period → phase-coherent shots.
            LO frequency is floating-point exact (no integer-cycles quantization).
-           Always runs at SAMPLE_RATE_DUAL (2.5 GS/s)."""
-        rate = SAMPLE_RATE_DUAL
+           Always runs at SAMPLE_RATE_DUAL (2.5 GS/s).
 
-        n_chirp  = round(chirp_us  * 1e-6 * rate)
-        n_dead   = round(dead_us   * 1e-6 * rate)
-        n_detect = round(detect_us * 1e-6 * rate)
-        n_total  = max(int(np.ceil((n_chirp + n_dead + n_detect) / 64)) * 64, 128)
-
-        # CH1: windowed chirp in first n_chirp samples, zeros for rest
-        ch1 = self._chirp_windowed_u16(f_start_hz, f_stop_hz, n_chirp, n_total,
-                                        rate, window_frac)
-
-        # CH2: zeros during chirp+dead, exact CW sine during detection window, zeros after
-        t_lo  = np.arange(n_detect, dtype=np.float64)
-        lo_active = np.sin(2 * np.pi * f_lo_hz / rate * t_lo) * self._gauss_win(n_detect, window_frac)
-        ch2_sig = np.zeros(n_total)
-        lo_start = n_chirp + n_dead
-        ch2_sig[lo_start:lo_start + n_detect] = lo_active
-        ch2 = self._real_to_u16(ch2_sig)
-
-        t_detect_actual = n_detect / rate * 1e6
-        t_dead_actual   = (n_total - n_chirp - n_detect) / rate * 1e6
-        print(f"[CH1] chirp {f_start_hz/1e6:.3f}→{f_stop_hz/1e6:.3f} MHz  "
-              f"active {n_chirp/rate*1e6:.3f} µs  ({n_chirp:,} samp)")
-        print(f"[CH2] LO {f_lo_hz/1e6:.6f} MHz (exact)  "
-              f"detect {t_detect_actual:.3f} µs  dead {t_dead_actual:.3f} µs  "
-              f"period {n_total/rate*1e6:.3f} µs  ({n_total:,} samp)")
-
-        with self._lock:
-            self._setup(channel=1, reset=True, sample_rate=rate)
-            self._upload(ch1, segnum=1)
-            self._play(amplitude_vpp, segnum=1)
-            self._active_seg[1] = 1
-
-            self._setup(channel=2, reset=False, sample_rate=rate)
-            self._upload(ch2, segnum=2)
-            self._play(amplitude_vpp, segnum=2)
-            self._active_seg[2] = 2
-
-        return n_chirp / rate, f_lo_hz
+           Thin wrapper over send_waveforms(mode='direct') — kept because the
+           GUI and the bench scripts call it by name."""
+        plan = self.send_waveforms(
+            {1: {"kind": "chirp", "f_start_hz": f_start_hz, "f_stop_hz": f_stop_hz,
+                 "gate": "chirp", "amplitude_vpp": amplitude_vpp},
+             2: {"kind": "cw", "freq_hz": f_lo_hz, "gate": "detect",
+                 "amplitude_vpp": amplitude_vpp}},
+            mode="direct", rate=SAMPLE_RATE_DUAL, window_frac=window_frac,
+            timing={"chirp_us": chirp_us, "dead_us": dead_us, "detect_us": detect_us})
+        return plan["n_chirp"] / plan["rate_eff"], f_lo_hz
 
     def send_chirp_with_lo_duc(self, f_carrier_chirp_hz, f_start_bb_hz, f_stop_bb_hz,
                                chirp_us, dead_us, f_lo_hz, detect_us,
                                amplitude_vpp=0.5, window_frac=0.05):
-        """DUC (IQM ONE) version: simultaneous chirp on CH1 and CW on CH2 at high frequencies.
+        """DUC (IQM ONE): upconverted chirp on CH1, gated exact CW on CH2.
 
-        CH1: analytic (single-sideband) Gaussian-windowed chirp.
-             NCO carrier = f_carrier_chirp_hz.
-             Baseband sweeps f_start_bb to f_stop_bb → RF output sweeps
-             f_carrier_chirp + f_start_bb to f_carrier_chirp + f_stop_bb.
-        CH2: gated CW at exactly f_lo_hz (NCO carrier = f_lo_hz, I=1 Q=0).
+        CH1 baseband sweeps f_start_bb → f_stop_bb on an NCO carrier at
+        f_carrier_chirp_hz, so the RF output sweeps carrier+start → carrier+stop.
+        CH2 is a gated carrier at exactly f_lo_hz (constant baseband, I=1 Q=0).
 
-        Both channels use IQM ONE with the DAC clock at 9 GS/s and x8 interpolation.
-        In DUC mode the DAC runs at the interpolated (high) rate while the segment
-        memory holds only the low-rate complex baseband (rate_cx = rate / interp),
-        so BOTH channels stay active (the 2.5 GS/s "dual max" is an ARB/direct-mode
-        memory limit, not a DUC limit). A 9 GS/s clock puts Nyquist at 4.5 GHz, so
-        carriers of 2.0–2.5 GHz are generated cleanly (a 2.5 GS/s clock cannot — the
-        carrier would sit above its 1.25 GHz Nyquist, near the sinc null → no output).
+        Thin wrapper over send_waveforms(mode='duc') — kept because the GUI and
+        the bench scripts call it by name. The samples it produces are identical
+        to the pre-refactor implementation (see tests/test_awg_builder.py).
         """
-        # DUC: DAC clock 9 GS/s, x8 interpolation → complex baseband 1.125 GS/s
-        # (≤ the 1.25 GS/s ONE-mode maximum, §5.9). rate/rate_cx selects :SOUR:INT below.
-        rate    = 9e9                   # DAC sample clock (:FREQ:RAST)
-        rate_cx = rate / 8.0            # 1.125 GS/s complex (baseband) sample rate
-
-        n_chirp  = round(chirp_us  * 1e-6 * rate_cx)
-        n_dead   = round(dead_us   * 1e-6 * rate_cx)
-        n_detect = round(detect_us * 1e-6 * rate_cx)
-        # Segment stores 2×n_total uint16 values; must be multiple of 64 → n_total multiple of 32
-        n_total = max(int(np.ceil((n_chirp + n_dead + n_detect) / 32)) * 32, 64)
-
-        # CH1: analytic chirp — I = cos(phase)·win, Q = sin(phase)·win
-        t = np.arange(n_chirp, dtype=np.float64) / rate_cx
-        T = t[-1] if n_chirp > 1 else 1e-9
-        phase = 2 * np.pi * (f_start_bb_hz * t +
-                              (f_stop_bb_hz - f_start_bb_hz) / (2 * T) * t ** 2)
-        win1 = self._gauss_win(n_chirp, window_frac)
-        I1 = np.zeros(n_total);  I1[:n_chirp] = np.cos(phase) * win1
-        Q1 = np.zeros(n_total);  Q1[:n_chirp] = np.sin(phase) * win1
-
-        # CH2: gated CW — I=win during detect window, Q=0 → output at exactly f_lo_hz
-        lo_start = n_chirp + n_dead
-        win2 = self._gauss_win(n_detect, window_frac)
-        I2 = np.zeros(n_total);  I2[lo_start:lo_start + n_detect] = win2
-        Q2 = np.zeros(n_total)
-
-        ch1_u16 = self._iq_to_u16(I1, Q1)
-        ch2_u16 = self._iq_to_u16(I2, Q2)
-
-        print(f"[DUC CH1] {(f_carrier_chirp_hz+f_start_bb_hz)/1e6:.3f}→"
-              f"{(f_carrier_chirp_hz+f_stop_bb_hz)/1e6:.3f} MHz  "
-              f"carrier {f_carrier_chirp_hz/1e6:.3f} MHz  "
-              f"active {n_chirp/rate_cx*1e6:.3f} µs  ({n_chirp:,} cx samp)")
-        print(f"[DUC CH2] LO {f_lo_hz/1e6:.6f} MHz (exact NCO)  "
-              f"detect {n_detect/rate_cx*1e6:.3f} µs  "
-              f"dead {n_dead/rate_cx*1e6:.3f} µs  "
-              f"period {n_total/rate_cx*1e6:.3f} µs  ({n_total:,} cx samp)")
-
-        def _duc_ch(ch, segnum, data_u16, ncof):
-            # Shared verified recipe (ordering + IQM readback guard) — see
-            # _duc_upload_ch. An earlier local copy set :SOUR:IQM ONE before
-            # :SOUR:INT / the final clock, which fw 1.237.0 silently ignores
-            # (IQM stayed NONE → garbled multi-tone output).
-            self._duc_upload_ch(ch, segnum, data_u16, ncof, rate, rate_cx,
-                                amplitude_vpp)
-
-        def _dump(ch):
-            # Read back the state that actually determines DUC behaviour, per channel,
-            # AFTER full setup. If IQModulation reads 'NONE' here the interleaved I/Q
-            # data is being misinterpreted (§5.9) -> wrong-frequency/garbled output.
-            self._dev.write(f":INST:CHAN {ch}")
-            print(f"  [CH{ch} state] "
-                  f"MODE={self._dev.query(':MODE?').strip()!r} "
-                  f"IQM={self._dev.query(':SOUR:IQM?').strip()!r} "
-                  f"INT={self._dev.query(':SOUR:INT?').strip()!r} "
-                  f"CFR1={self._dev.query(':NCO:CFR1?').strip()!r} "
-                  f"RAST={self._dev.query(':FREQ:RAST?').strip()!r} "
-                  f"SEGM={self._dev.query(':FUNC:MODE:SEGM?').strip()!r}")
-
-        with self._lock:
-            self._dev.write("*CLS; *RST")
-            time.sleep(0.5)
-            self._dev.query("*OPC?")
-            self._rate_sent.clear()
-
-            # Diagnostic: confirm the DUC/IQM option is actually installed on this unit.
-            print(f"  *OPT? -> {self._dev.query('*OPT?').strip()!r}")
-
-            # NOTE: :IQModulation must be set per-channel *after* :MODE DUC (done in
-            # _duc_ch). Setting it here, in DIRECT mode, is silently ignored.
-            self._cmd(":INST:CHAN 1")
-            self._cmd(":TRAC:DEL:ALL")
-
-            _duc_ch(1, 1, ch1_u16, f_carrier_chirp_hz)
-            self._active_seg[1] = 1
-            _duc_ch(2, 2, ch2_u16, f_lo_hz)
-            self._active_seg[2] = 2
-
-            # Diagnostic: read back final state on both channels.
-            _dump(1)
-            _dump(2)
-
-        return n_chirp / rate_cx, f_lo_hz
+        plan = self.send_waveforms(
+            {1: {"kind": "chirp", "carrier_hz": f_carrier_chirp_hz,
+                 "f_start_hz": f_start_bb_hz, "f_stop_hz": f_stop_bb_hz,
+                 "gate": "chirp", "sideband": "upper",
+                 "amplitude_vpp": amplitude_vpp},
+             2: {"kind": "cw", "carrier_hz": f_lo_hz, "freq_hz": 0.0,
+                 "gate": "detect", "sideband": "upper",
+                 "amplitude_vpp": amplitude_vpp}},
+            mode="duc", window_frac=window_frac,
+            timing={"chirp_us": chirp_us, "dead_us": dead_us, "detect_us": detect_us})
+        return plan["n_chirp"] / plan["rate_eff"], f_lo_hz
 
     # NOTE: an earlier send_chirp_with_lo_nco used :MODE NCO to "upconvert" an
     # uploaded chirp/envelope. Removed: NCO mode plays NO waveform memory — it

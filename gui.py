@@ -1,3 +1,26 @@
+"""AWG + scope control GUI for the CP-FTMW spectrometer bench.
+
+Reworked 2026-10-14. What changed and why:
+
+  * ONE waveform panel instead of one panel per experiment. Pick the AWG
+    mode at the top — DUC (internal upconversion, the mode this spectrometer
+    actually runs in) or Direct — then pick a signal per channel. The old
+    "Standard Waveform", "Chirp + CW", "DUC CW" and "DUC Chirp + CW" panels
+    were four special cases of that single choice, and standard waveforms
+    were reachable in direct mode only. Every signal is now available in
+    either mode, on either channel, and awg.send_waveforms() builds all of
+    them through one verified code path.
+
+  * Blocks side by side rather than one tall scrolling column.
+
+  * An Analysis block that owns the FFT settings — window, zero-padding, DC
+    removal, magnitude units, time gate — shared by every spectrum this GUI
+    draws, so the transform is something you chose rather than something
+    hard-coded.
+
+Still to come (see the GUI backlog): marker-output trigger, FID capture with
+N-shot software averaging, external trigger.
+"""
 import tkinter as tk
 from tkinter import ttk, scrolledtext, filedialog
 import threading
@@ -39,19 +62,36 @@ class _LogRedirect:
 
 
 class LabGUI:
+    # ── vocabulary shared between the widgets and awg.send_waveforms ──
+    MODES  = {"DUC  (upconverted, IQM ONE)": "duc", "Direct  (ARB samples)": "direct"}
+    KINDS  = {"Off": "off", "CW": "cw", "Chirp": "chirp",
+              "Square": "square", "Ramp": "ramp"}
+    GATES  = {"Continuous": "continuous", "Chirp window": "chirp",
+              "Detect window": "detect"}
+    SIDEBANDS = {"Upper": "upper", "Lower": "lower", "Both (DSB)": "both"}
+    CLOCKS = {"2.5 GS/s  (CH1+CH2)": SAMPLE_RATE_DUAL,
+              "9 GS/s  (CH1 only)":  SAMPLE_RATE_SINGLE}
+    WINDOWS = ("Rectangular", "Hann", "Hamming", "Blackman", "Kaiser")
+    MAGNITUDES = ("dBV", "dBm (50 Ω)", "Linear (V)")
+
     def __init__(self, root):
         self.root = root
-        self.root.title("AWG / Scope Control")
-        self.root.geometry("1100x780")
+        self.root.title("AWG / Scope Control — CP-FTMW bench")
+        w = min(1500, root.winfo_screenwidth() - 60)
+        h = min(960, root.winfo_screenheight() - 100)
+        self.root.geometry(f"{w}x{h}")
         self.awg   = None
         self.scope = None
-        self._awg_needs_reset = True   # *RST once after connect / rate change
         self._live_running = False
         self._live_gen     = 0
         self._sweep_stop   = threading.Event()
-        self._action_btns  = []   # all buttons disabled while busy (except Stop)
+        self._action_btns  = []   # disabled while busy (STOP ALL stays live)
         self._live_win     = None
-        self._setup_photo  = None  # path to current microwave-chain setup photo
+        self._setup_photo  = None
+        self._sent_baseband = {}  # ch -> baseband signature actually uploaded
+        # Builder methods need no connection, so an unconnected AWG can plan
+        # and snap frequencies for the live preview labels.
+        self._planner = AWG.__new__(AWG)
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
 
@@ -72,379 +112,724 @@ class LabGUI:
     # ── UI construction ───────────────────────────────────────────
 
     def _build_ui(self):
+        self._build_instrument_bar()
+
+        main = ttk.Frame(self.root)
+        main.pack(fill='both', expand=True, padx=8, pady=(0, 6))
+        main.columnconfigure(0, weight=0, minsize=700)
+        main.columnconfigure(1, weight=1)
+        main.rowconfigure(0, weight=1)
+
+        left = ttk.Frame(main)
+        left.grid(row=0, column=0, sticky='nsew', padx=(0, 8))
+        left.columnconfigure((0, 1), weight=1, uniform='blocks')
+
+        self._build_awg_block(left,    row=0, col=0, span=2)
+        self._build_scope_block(left,  row=1, col=0)
+        self._build_analysis_block(left, row=1, col=1)
+        self._build_sweep_block(left,  row=2, col=0)
+        self._build_setup_block(left,  row=2, col=1)
+
+        self._build_right(main)
+
+        self._on_mode_change()
+
+    def _build_instrument_bar(self):
         conn = ttk.LabelFrame(self.root, text="Instruments", padding=5)
-        conn.pack(fill='x', padx=8, pady=4)
-        ttk.Button(conn, text="Connect AWG",   command=self._connect_awg).pack(side='left', padx=4)
+        conn.pack(fill='x', padx=8, pady=(6, 4))
+        ttk.Button(conn, text="Connect AWG", command=self._connect_awg).pack(side='left', padx=4)
         self._awg_lbl = ttk.Label(conn, text="AWG: disconnected", foreground='red')
         self._awg_lbl.pack(side='left', padx=(0, 16))
         ttk.Button(conn, text="Connect Scope", command=self._connect_scope).pack(side='left', padx=4)
         self._scope_lbl = ttk.Label(conn, text="Scope: disconnected", foreground='red')
         self._scope_lbl.pack(side='left', padx=(0, 16))
 
-        stop_btn = tk.Button(conn, text="STOP ALL", command=self._stop,
-                             bg='red', fg='white', font=('', 10, 'bold'),
-                             relief='raised', padx=8)
-        stop_btn.pack(side='right', padx=8)
+        tk.Button(conn, text="STOP ALL", command=self._stop,
+                  bg='red', fg='white', font=('', 10, 'bold'),
+                  relief='raised', padx=8).pack(side='right', padx=8)
 
-        main = ttk.Frame(self.root)
-        main.pack(fill='both', expand=True, padx=8, pady=4)
-        self._build_controls(main)
-        self._build_right(main)
+    # ── AWG block ─────────────────────────────────────────────────
 
-    def _build_controls(self, parent):
-        outer = ttk.Frame(parent, width=310)
-        outer.pack(side='left', fill='y', padx=(0, 8))
-        outer.pack_propagate(False)
+    def _build_awg_block(self, parent, row, col, span=1):
+        f = ttk.LabelFrame(parent, text="AWG", padding=8)
+        f.grid(row=row, column=col, columnspan=span, sticky='nsew', pady=(0, 6))
+        f.columnconfigure((0, 1, 2), weight=1, uniform='awgcols')
 
-        vsb = ttk.Scrollbar(outer, orient='vertical')
-        vsb.pack(side='right', fill='y')
-        canvas = tk.Canvas(outer, yscrollcommand=vsb.set, highlightthickness=0)
-        canvas.pack(side='left', fill='both', expand=True)
-        vsb.config(command=canvas.yview)
+        head = ttk.Frame(f)
+        head.grid(row=0, column=0, columnspan=3, sticky='ew', pady=(0, 6))
+        ttk.Label(head, text="Mode", font=('', 9, 'bold')).pack(side='left')
+        self._mode_var = tk.StringVar(value=list(self.MODES)[0])
+        ttk.Combobox(head, textvariable=self._mode_var, values=list(self.MODES),
+                     width=26, state='readonly').pack(side='left', padx=(6, 14))
+        self._mode_var.trace_add('write', lambda *_: self._on_mode_change())
 
-        ctrl = ttk.Frame(canvas)
-        win_id = canvas.create_window((0, 0), window=ctrl, anchor='nw')
+        self._clock_var = tk.StringVar(value=list(self.CLOCKS)[0])
+        self._clock_lbl = ttk.Label(head, text="Clock")
+        self._clock_box = ttk.Combobox(head, textvariable=self._clock_var,
+                                       values=list(self.CLOCKS), width=20,
+                                       state='readonly')
+        self._clock_var.trace_add('write', lambda *_: self._update_awg_info())
+        self._duc_clock_lbl = ttk.Label(
+            head, text="9 GS/s DAC · X8 interpolation → 1.125 GS/s complex",
+            foreground='gray')
 
-        ctrl.bind('<Configure>', lambda _: canvas.configure(scrollregion=canvas.bbox('all')))
-        canvas.bind('<Configure>', lambda e: canvas.itemconfig(win_id, width=e.width))
-        # Scroll only while the pointer is over the control panel — a permanent
-        # bind_all would hijack the wheel everywhere (log, plot, live view).
-        canvas.bind('<Enter>', lambda _: canvas.bind_all(
-            '<MouseWheel>', lambda e: canvas.yview_scroll(int(-1 * e.delta / 120), 'units')))
-        canvas.bind('<Leave>', lambda _: canvas.unbind_all('<MouseWheel>'))
+        self._ch = {}
+        self._build_channel_panel(f, 1, 0)
+        self._build_channel_panel(f, 2, 1)
+        self._build_timing_panel(f, 2)
 
-        self._build_std_waveform(ctrl)
-        self._build_duc_cw_panel(ctrl)
-        self._build_chirp_panel(ctrl)
-        self._build_duc_panel(ctrl)
-        self._build_scope_panel(ctrl)
-        self._build_setup_panel(ctrl)
-        self._build_sweep_panel(ctrl)
+        btns = ttk.Frame(f)
+        btns.grid(row=2, column=0, columnspan=3, sticky='ew', pady=(8, 0))
+        btns.columnconfigure((0, 1, 2, 3), weight=1)
+        send = ttk.Button(btns, text="Send to AWG", command=self._send_waveforms)
+        send.grid(row=0, column=0, sticky='ew', padx=(0, 3))
+        self._retune_btn = ttk.Button(btns, text="Retune carriers (fast)",
+                                      command=self._retune)
+        self._retune_btn.grid(row=0, column=1, sticky='ew', padx=3)
+        copy_btn = ttk.Button(btns, text="Copy CH1 → CH2", command=self._copy_ch1_to_ch2)
+        copy_btn.grid(row=0, column=2, sticky='ew', padx=3)
+        ttk.Button(btns, text="Stop output", command=self._stop).grid(
+            row=0, column=3, sticky='ew', padx=(3, 0))
+        self._action_btns.extend([send, self._retune_btn, copy_btn])
 
-    # ── Standard Waveform panel ───────────────────────────────────
+        self._awg_warn = ttk.Label(f, text="", foreground='red',
+                                   font=('', 8), wraplength=680, justify='left')
+        self._awg_warn.grid(row=3, column=0, columnspan=3, sticky='w', pady=(4, 0))
 
-    def _build_std_waveform(self, parent):
-        f = ttk.LabelFrame(parent, text="Standard Waveform", padding=8)
-        f.pack(fill='x', pady=(0, 6))
+    def _build_channel_panel(self, parent, ch, col):
+        f = ttk.LabelFrame(parent, text=f"CH{ch}", padding=6)
+        f.grid(row=1, column=col, sticky='nsew', padx=(0, 6) if col == 0 else (3, 3))
         f.columnconfigure(1, weight=1)
-        f.columnconfigure(2, weight=1)
 
-        ttk.Label(f, text="Sample rate").grid(row=0, column=0, columnspan=3, sticky='w')
-        self._rate_var = tk.StringVar(value="9 GS/s  (CH1)")
-        ttk.Combobox(f, textvariable=self._rate_var,
-                     values=["9 GS/s  (CH1)", "2.5 GS/s  (CH1+2)"],
-                     width=14, state='readonly').grid(row=1, column=0, columnspan=3,
-                                                       sticky='ew', pady=(0, 6))
-        self._rate_var.trace_add('write', lambda *_: self._on_rate_change())
+        d = {"rows": {}}
+        self._ch[ch] = d
 
-        ttk.Label(f, text="CH1", font=('', 9, 'bold')).grid(row=2, column=1, pady=1)
-        ch2_hdr = ttk.Label(f, text="CH2", font=('', 9, 'bold'))
-        ch2_hdr.grid(row=2, column=2, pady=1)
-        self._ch2_std_widgets = [ch2_hdr]
-
-        rows = [
-            ("Waveform",   "wave1", "wave2", "Sine", "Sine", "combo"),
-            ("Freq (MHz)", "freq1", "freq2", "100",  "100",  "entry"),
-            ("Amp  (Vpp)", "amp1",  "amp2",  "0.5",  "0.5",  "entry"),
-        ]
-        for gr, (lbl, a1, a2, d1, d2, kind) in enumerate(rows, start=3):
-            ttk.Label(f, text=lbl).grid(row=gr, column=0, sticky='w', pady=1)
-            v1, v2 = tk.StringVar(value=d1), tk.StringVar(value=d2)
-            setattr(self, f'_{a1}_var', v1)
-            setattr(self, f'_{a2}_var', v2)
-            if kind == "combo":
-                w1 = ttk.Combobox(f, textvariable=v1, values=["Sine", "Square", "Ramp"],
-                                   width=6, state='readonly')
-                w2 = ttk.Combobox(f, textvariable=v2, values=["Sine", "Square", "Ramp"],
-                                   width=6, state='readonly')
-            else:
-                w1 = ttk.Entry(f, textvariable=v1, width=7)
-                w2 = ttk.Entry(f, textvariable=v2, width=7)
-            w1.grid(row=gr, column=1, sticky='ew', padx=2, pady=1)
-            w2.grid(row=gr, column=2, sticky='ew', padx=2, pady=1)
-            self._ch2_std_widgets.append(w2)
-
-        btn1 = ttk.Button(f, text="Send CH1", command=lambda: self._run_std_wave(1))
-        btn1.grid(row=gr+1, column=0, columnspan=2, sticky='ew', pady=(6, 2), padx=(0, 2))
-        btn2 = ttk.Button(f, text="Send CH2", command=lambda: self._run_std_wave(2))
-        btn2.grid(row=gr+1, column=2, sticky='ew', pady=(6, 2))
-        self._action_btns.extend([btn1, btn2])
-        self._ch2_std_widgets.append(btn2)
-
-        self._on_rate_change()
-
-    def _on_rate_change(self):
-        self._awg_needs_reset = True   # clock change → re-init segments on next send
-        dual = "2.5" in self._rate_var.get()
-        for w in self._ch2_std_widgets:
-            new_state = ('readonly' if isinstance(w, ttk.Combobox) else 'normal') if dual else 'disabled'
-            try:
-                w.config(state=new_state)
-            except tk.TclError:
-                pass
-
-    # ── Chirp + CW panel ──────────────────────────────────────────
-
-    def _build_duc_cw_panel(self, parent):
-        """Manual DUC CW at an EXACT frequency.
-
-        Fills a real gap: 'Standard Waveform' uses DIRECT mode, where the
-        frequency is quantised to a whole number of cycles in the buffer
-        (~4.4 MHz steps at 9 GS/s), so asking for 500 MHz actually produces
-        501.0 MHz. The DUC NCO has no such quantisation -- exact to the Hz --
-        but until now it was only reachable through the Sweep panel, i.e. you
-        couldn't just park a tone at one exact frequency by hand.
-
-        'Both channels' puts the IDENTICAL tone on CH1 and CH2 so one can
-        drive a DUT while the other is watched on a scope
-        (awg.duc_cw_setup_dual)."""
-        f = ttk.LabelFrame(parent, text="DUC CW  (exact frequency, NCO)", padding=8)
-        f.pack(fill='x', pady=4)
-
-        self._duccw_freq_var = tk.StringVar(value="500")
-        self._duccw_amp_var  = tk.StringVar(value="0.5")
-        self._duccw_ch_var   = tk.StringVar(value="CH1")
-
-        ttk.Label(f, text="Freq (MHz)").grid(row=0, column=0, sticky='w')
-        ttk.Entry(f, textvariable=self._duccw_freq_var, width=10).grid(
-            row=0, column=1, sticky='w', padx=4)
-        ttk.Label(f, text="Amp (Vpp)").grid(row=0, column=2, sticky='w', padx=(8, 0))
-        ttk.Entry(f, textvariable=self._duccw_amp_var, width=6).grid(
-            row=0, column=3, sticky='w', padx=4)
-
-        ttk.Label(f, text="Channel").grid(row=1, column=0, sticky='w', pady=(4, 0))
-        ttk.Combobox(f, textvariable=self._duccw_ch_var, width=12, state='readonly',
-                     values=["CH1", "CH2", "Both (CH2=monitor)"]).grid(
-            row=1, column=1, columnspan=2, sticky='w', padx=4, pady=(4, 0))
-
-        ttk.Button(f, text="Set / Retune", command=self._duc_cw_set).grid(
-            row=2, column=0, columnspan=2, sticky='we', pady=(6, 0), padx=(0, 4))
-        ttk.Button(f, text="Stop Output", command=self._duc_cw_stop).grid(
-            row=2, column=2, columnspan=2, sticky='we', pady=(6, 0), padx=(4, 0))
-        ttk.Label(f, text="Exact NCO frequency (no integer-cycle rounding).\n"
-                          "Retunes in ~ms once set up — change the frequency\n"
-                          "and press again to step by hand.",
-                  foreground="gray", justify='left').grid(
-            row=3, column=0, columnspan=4, sticky='w', pady=(6, 0))
-        for c in range(4):
-            f.columnconfigure(c, weight=1)
-
-    def _duc_cw_stop(self):
-        """Stop the output and forget the DUC state, so the next Set does a
-        full setup rather than an NCO retune into a stopped channel."""
-        self._duccw_state = None
-        self._stop()
-
-    def _duc_cw_set(self):
-        if not self._need_awg(): return
-
-        def work():
-            try:
-                freq = float(self._duccw_freq_var.get()) * 1e6
-                amp = float(self._duccw_amp_var.get())
-                sel = self._duccw_ch_var.get()
-            except Exception as e:
-                print(f"DUC CW param error: {e}\n")
-                return
-            dual = sel.startswith("Both")
-            ch = 2 if sel == "CH2" else 1
-            key = ("dual" if dual else ch, amp)
-            try:
-                # Retune only if this channel selection + amplitude is already
-                # set up -- an NCO write is milliseconds, whereas a full
-                # duc_cw_setup does *RST + re-upload and takes seconds.
-                if getattr(self, "_duccw_state", None) == key:
-                    self.awg.duc_cw_step(freq, channel=1 if dual else ch)
-                    if dual:
-                        self.awg.duc_cw_step(freq, channel=2)
-                    print(f"DUC CW retuned to {freq/1e6:.6f} MHz ({sel})\n")
-                else:
-                    if dual:
-                        self.awg.duc_cw_setup_dual(freq, amplitude_vpp=amp)
-                    else:
-                        self.awg.duc_cw_setup(freq, amplitude_vpp=amp, channel=ch)
-                    self._duccw_state = key
-                    print(f"DUC CW set up at {freq/1e6:.6f} MHz ({sel}, {amp} Vpp)\n")
-            except Exception as e:
-                self._duccw_state = None
-                print(f"DUC CW error: {e}\n")
-        self._thread(work)
-
-    def _build_chirp_panel(self, parent):
-        f = ttk.LabelFrame(parent, text="Chirp + CW  (CP-FTMW)", padding=8)
-        f.pack(fill='x', pady=(0, 6))
-
-        chirp_fields = [
-            ("Chirp start (MHz)", "c_start",   "10"),
-            ("Chirp stop  (MHz)", "c_stop",    "500"),
-            ("Chirp dur   (µs)",  "c_dur",     "1.0"),
-            ("Dead time   (µs)",  "c_dead",    "0.1"),
-            ("CH2 LO      (MHz)", "c_lo",      "100"),
-            ("Detect win  (µs)",  "c_detect",  "10.0"),
-            ("Amplitude   (Vpp)", "c_amp",     "0.5"),
-        ]
-        f.columnconfigure(1, weight=1)
-        for row, (lbl, attr, default) in enumerate(chirp_fields):
-            ttk.Label(f, text=lbl).grid(row=row, column=0, sticky='w', pady=1)
+        def combo(name, label, values, default, width=13):
+            lbl = ttk.Label(f, text=label)
             var = tk.StringVar(value=default)
-            setattr(self, f"_{attr}_var", var)
-            e = ttk.Entry(f, textvariable=var, width=8)
-            e.grid(row=row, column=1, sticky='ew', padx=(4, 0), pady=1)
-            var.trace_add('write', lambda *_: self._update_chirp_info())
+            box = ttk.Combobox(f, textvariable=var, values=values,
+                               width=width, state='readonly')
+            d[name] = var
+            d["rows"][name] = (lbl, box)
+            return var
 
-        r = len(chirp_fields)
-        ttk.Separator(f, orient='horizontal').grid(row=r, column=0, columnspan=2,
-                                                    sticky='ew', pady=4)
-        self._ch1_info = ttk.Label(f, text="", foreground='gray', font=('Courier', 8))
-        self._ch1_info.grid(row=r+1, column=0, columnspan=2, sticky='w')
-        self._ch2_info = ttk.Label(f, text="", foreground='gray', font=('Courier', 8))
-        self._ch2_info.grid(row=r+2, column=0, columnspan=2, sticky='w')
+        def entry(name, label, default):
+            lbl = ttk.Label(f, text=label)
+            var = tk.StringVar(value=default)
+            e = ttk.Entry(f, textvariable=var, width=11)
+            var.trace_add('write', lambda *_: self._update_awg_info())
+            d[name] = var
+            d["rows"][name] = (lbl, e)
+            return var
 
-        btn = ttk.Button(f, text="Generate Chirp+CW", command=self._run_chirp)
-        btn.grid(row=r+3, column=0, columnspan=2, sticky='ew', pady=(6, 2))
+        kind = combo("kind", "Signal", list(self.KINDS),
+                     "Chirp" if ch == 1 else "CW")
+        kind.trace_add('write', lambda *_: self._on_mode_change())
+        entry("carrier", "Carrier (MHz)", "2000" if ch == 1 else "2300")
+        entry("freq",    "Freq (MHz)",    "0" if ch == 2 else "100")
+        entry("f0",      "Start (MHz)",   "0")
+        entry("f1",      "Stop (MHz)",    "500")
+        sb = combo("sideband", "Sideband", list(self.SIDEBANDS), "Upper")
+        sb.trace_add('write', lambda *_: self._update_awg_info())
+        gate = combo("gate", "Gate", list(self.GATES),
+                     "Chirp window" if ch == 1 else "Detect window")
+        gate.trace_add('write', lambda *_: self._update_awg_info())
+        entry("amp", "Amplitude (Vpp)", "0.5")
+
+        d["info"] = ttk.Label(f, text="", foreground='#0a0', font=('Courier', 8),
+                              justify='left', wraplength=210)
+        d["info"].grid(row=20, column=0, columnspan=2, sticky='w', pady=(6, 0))
+
+    def _build_timing_panel(self, parent, col):
+        f = ttk.LabelFrame(parent, text="Timing  (one shared buffer)", padding=6)
+        f.grid(row=1, column=col, sticky='nsew', padx=(3, 0))
+        f.columnconfigure(1, weight=1)
+
+        self._timing_vars = {}
+        for r, (name, label, default) in enumerate([
+                ("chirp_us",  "Chirp dur (µs)", "1.0"),
+                ("dead_us",   "Dead time (µs)", "0.1"),
+                ("detect_us", "Detect win (µs)", "10.0"),
+                ("window_pct", "Edge taper (%)", "5")]):
+            ttk.Label(f, text=label).grid(row=r, column=0, sticky='w', pady=1)
+            var = tk.StringVar(value=default)
+            var.trace_add('write', lambda *_: self._update_awg_info())
+            ttk.Entry(f, textvariable=var, width=9).grid(
+                row=r, column=1, sticky='ew', padx=(4, 0), pady=1)
+            self._timing_vars[name] = var
+
+        ttk.Separator(f, orient='horizontal').grid(row=10, column=0, columnspan=2,
+                                                   sticky='ew', pady=5)
+        self._timing_info = ttk.Label(f, text="", foreground='gray',
+                                      font=('Courier', 8), justify='left',
+                                      wraplength=210)
+        self._timing_info.grid(row=11, column=0, columnspan=2, sticky='w')
+
+    # ── AWG panel plumbing ────────────────────────────────────────
+
+    def _mode(self):
+        return self.MODES.get(self._mode_var.get(), "duc")
+
+    def _clock_rate(self):
+        return self.CLOCKS.get(self._clock_var.get(), SAMPLE_RATE_DUAL)
+
+    def _kind(self, ch):
+        return self.KINDS.get(self._ch[ch]["kind"].get(), "off")
+
+    def _on_mode_change(self):
+        """Re-label and show/hide the fields each mode and signal actually uses."""
+        duc = self._mode() == "duc"
+        self._clock_lbl.pack_forget(); self._clock_box.pack_forget()
+        self._duc_clock_lbl.pack_forget()
+        if duc:
+            self._duc_clock_lbl.pack(side='left')
+        else:
+            self._clock_lbl.pack(side='left')
+            self._clock_box.pack(side='left', padx=(6, 0))
+        self._retune_btn.config(state='normal' if duc else 'disabled')
+
+        for ch, d in self._ch.items():
+            kind = self._kind(ch)
+            chirping = kind == "chirp"
+            tone = kind in ("cw", "square", "ramp")
+            show = {
+                "kind": True,
+                "carrier": duc and kind != "off",
+                "freq": tone,
+                "f0": chirping,
+                "f1": chirping,
+                "sideband": duc and kind != "off",
+                "gate": kind != "off",
+                "amp": kind != "off",
+            }
+            d["rows"]["freq"][0].config(
+                text="BB offset (MHz)" if duc else "Freq (MHz)")
+            d["rows"]["f0"][0].config(text="BB start (MHz)" if duc else "Start (MHz)")
+            d["rows"]["f1"][0].config(text="BB stop (MHz)" if duc else "Stop (MHz)")
+            for r, name in enumerate(["kind", "carrier", "freq", "f0", "f1",
+                                      "sideband", "gate", "amp"]):
+                lbl, widget = d["rows"][name]
+                if show[name]:
+                    lbl.grid(row=r, column=0, sticky='w', pady=1)
+                    widget.grid(row=r, column=1, sticky='ew', padx=(4, 0), pady=1)
+                else:
+                    lbl.grid_remove(); widget.grid_remove()
+        self._update_awg_info()
+
+    def _fnum(self, var, scale=1.0, default=None):
+        """Entry text → float, scaled. Returns default (or raises) if unusable."""
+        try:
+            return float(var.get()) * scale
+        except (ValueError, AttributeError):
+            if default is None:
+                raise
+            return default
+
+    def _timing(self):
+        return {
+            "chirp_us":  self._fnum(self._timing_vars["chirp_us"], 1.0, 1.0),
+            "dead_us":   self._fnum(self._timing_vars["dead_us"], 1.0, 0.1),
+            "detect_us": self._fnum(self._timing_vars["detect_us"], 1.0, 10.0),
+        }
+
+    def _window_frac(self):
+        return max(min(self._fnum(self._timing_vars["window_pct"], 0.01, 0.05), 0.5), 0.0)
+
+    def _channel_spec(self, ch, strict=True):
+        """Current CH widgets → an awg.send_waveforms channel spec."""
+        d = self._ch[ch]
+        kind = self._kind(ch)
+        if kind == "off":
+            return {"kind": "off"}
+        g = lambda name, dflt: self._fnum(d[name], 1e6, None if strict else dflt)
+        spec = {
+            "kind": kind,
+            "gate": self.GATES.get(d["gate"].get(), "continuous"),
+            "amplitude_vpp": self._fnum(d["amp"], 1.0, None if strict else 0.5),
+        }
+        if kind == "chirp":
+            spec["f_start_hz"] = g("f0", 0.0)
+            spec["f_stop_hz"] = g("f1", 0.0)
+        else:
+            spec["freq_hz"] = g("freq", 0.0)
+        if self._mode() == "duc":
+            spec["carrier_hz"] = g("carrier", 0.0)
+            spec["sideband"] = self.SIDEBANDS.get(d["sideband"].get(), "upper")
+        return spec
+
+    def _specs(self, strict=True):
+        return {ch: self._channel_spec(ch, strict) for ch in (1, 2)}
+
+    def _baseband_signature(self, ch, spec):
+        """What a retune CANNOT change: everything except carrier and level.
+
+        Retuning writes :NCO:CFR1 only, so the uploaded baseband stays as it
+        was. If any of these changed since the last Send, the fast path would
+        silently play the old shape at the new carrier.
+        """
+        return (self._mode(), spec.get("kind"), spec.get("gate"),
+                spec.get("sideband"), spec.get("freq_hz"),
+                spec.get("f_start_hz"), spec.get("f_stop_hz"),
+                tuple(sorted(self._timing().items())), self._window_frac(),
+                None if self._mode() == "duc" else self._clock_rate())
+
+    def _update_awg_info(self):
+        """Live preview: what the hardware will be asked to produce."""
+        try:
+            mode = self._mode()
+            specs = self._specs(strict=False)
+            active = {ch: s for ch, s in specs.items() if s["kind"] != "off"}
+            rate_eff = (AWG.DUC_DAC_RATE / AWG.DUC_INTERP if mode == "duc"
+                        else self._clock_rate())
+            plan = self._planner._plan_timing(mode, self._timing(), rate_eff)
+            n = plan["n_total"]
+
+            self._timing_info.config(
+                text=f"period  {plan['period_s']*1e6:8.3f} µs\n"
+                     f"rep     {1e-3/plan['period_s']:8.3f} kHz\n"
+                     f"samples {n:8,}\n"
+                     f"tail pad{plan['pad_s']*1e9:8.1f} ns")
+
+            warn = []
+            if mode == "direct" and len(active) > 1 and self._clock_rate() > SAMPLE_RATE_DUAL:
+                warn.append("Direct mode at 9 GS/s is single-channel (both DACs "
+                            "interleaved) — set CH2 to Off or pick the 2.5 GS/s clock.")
+
+            for ch in (1, 2):
+                d, s = self._ch[ch], specs[ch]
+                if s["kind"] == "off":
+                    d["info"].config(text="off", foreground='gray')
+                    continue
+                start, n_win = plan["windows"][s["gate"]]
+                gated = s["gate"] != "continuous"
+                carrier = s.get("carrier_hz", 0.0) if mode == "duc" else 0.0
+                lines = []
+                if s["kind"] == "chirp":
+                    lo, hi = carrier + s["f_start_hz"], carrier + s["f_stop_hz"]
+                    lines.append(f"{lo/1e6:.3f} → {hi/1e6:.3f} MHz")
+                    if n_win > 1:
+                        lines.append(f"{abs(hi-lo)/1e6:.1f} MHz in "
+                                     f"{n_win/rate_eff*1e6:.3f} µs")
+                else:
+                    f_req = s["freq_hz"]
+                    f_act = f_req if gated else AWG.snap_continuous(f_req, n_win, rate_eff)
+                    lines.append(f"{(carrier+f_act)/1e6:.6f} MHz")
+                    if not gated and f_act != f_req:
+                        lines.append(f"snapped {(f_act-f_req)/1e3:+.1f} kHz "
+                                     f"(step {rate_eff/n_win/1e3:.1f} kHz)")
+                    elif gated and f_req:
+                        lines.append("exact (gated burst)")
+                if mode == "duc" and s["kind"] in ("square", "ramp") \
+                        and s.get("sideband") != "both":
+                    lines.append("SSB shaping costs ~7-9 dB of DAC range")
+                lines.append(f"{s['gate']}: {n_win/rate_eff*1e6:.3f} µs "
+                             f"@ +{start/rate_eff*1e6:.3f} µs")
+                d["info"].config(text="\n".join(lines), foreground='#0a0')
+
+                # Nyquist / NCO range, reported where it is entered rather than
+                # only when Send fails.
+                try:
+                    self._planner._check_limits(mode, {ch: s}, rate_eff)
+                except ValueError as e:
+                    warn.append(str(e))
+                    d["info"].config(foreground='red')
+
+            if not active:
+                warn.append("Both channels are Off — nothing to send.")
+            self._awg_warn.config(text="  •  ".join(warn))
+        except (ValueError, TypeError, KeyError, ZeroDivisionError,
+                AttributeError, tk.TclError):
+            # Half-typed entry ("2", "-", ""): keep the last good preview rather
+            # than flashing an error at every keystroke. Narrow on purpose — a
+            # broad except here would swallow real bugs in the builder.
+            pass
+
+    def _copy_ch1_to_ch2(self):
+        """CH2 := CH1, the 'monitor copy' case: drive a DUT from CH1 while CH2
+        carries an identical signal to a scope."""
+        src, dst = self._ch[1], self._ch[2]
+        for name in ("kind", "carrier", "freq", "f0", "f1", "sideband", "gate", "amp"):
+            dst[name].set(src[name].get())
+        self._on_mode_change()
+        print("CH2 set to an identical copy of CH1.\n")
+
+    def _send_waveforms(self):
+        if not self._need_awg(): return
+        try:
+            mode = self._mode()
+            specs = self._specs(strict=True)
+            timing = self._timing()
+            frac = self._window_frac()
+            rate = None if mode == "duc" else self._clock_rate()
+        except Exception as e:
+            print(f"Invalid AWG parameter: {e}\n")
+            return
+
+        self._set_busy(True)
+        def run():
+            try:
+                if rate:
+                    self.awg.sample_rate = rate
+                self.awg.send_waveforms(specs, mode=mode, timing=timing,
+                                        rate=rate, window_frac=frac)
+                self._sent_baseband = {
+                    ch: self._baseband_signature(ch, s) for ch, s in specs.items()}
+                print("Sent.\n")
+            except Exception as e:
+                self._sent_baseband = {}
+                print(f"Send error: {e}\n")
+            finally:
+                self._set_busy(False)
+        self._thread(run)
+
+    def _retune(self):
+        """Carrier-only update: :NCO:CFR1 (+ :VOLT) per channel, milliseconds.
+
+        Refuses when the baseband changed, because the fast path does not
+        re-upload: it would play the previous shape at the new carrier and
+        look like a successful change.
+        """
+        if not self._need_awg(): return
+        if self._mode() != "duc":
+            print("Retune is a DUC-mode NCO write — in direct mode use Send.\n")
+            return
+        try:
+            specs = self._specs(strict=True)
+        except Exception as e:
+            print(f"Invalid AWG parameter: {e}\n")
+            return
+        if not self._sent_baseband:
+            print("Nothing uploaded yet — press Send to AWG first.\n")
+            return
+        carriers, amps, stale = {}, {}, []
+        for ch, s in specs.items():
+            if s["kind"] == "off":
+                continue
+            if self._baseband_signature(ch, s) != self._sent_baseband.get(ch):
+                stale.append(ch)
+            carriers[ch] = s["carrier_hz"]
+            amps[ch] = s["amplitude_vpp"]
+        if stale:
+            print(f"CH{', CH'.join(str(c) for c in stale)}: baseband parameters "
+                  f"changed since the last Send — press Send to AWG (a retune "
+                  f"only moves the carrier and would play the old shape).\n")
+            return
+        if not carriers:
+            print("Both channels are Off — nothing to retune.\n")
+            return
+
+        self._set_busy(True)
+        def run():
+            try:
+                t0 = time.perf_counter()
+                self.awg.retune(carriers, amps)
+                print(f"Retuned "
+                      f"{', '.join(f'CH{c}={f/1e6:.6f} MHz' for c, f in carriers.items())}"
+                      f"  ({(time.perf_counter()-t0)*1e3:.0f} ms)\n")
+            except Exception as e:
+                print(f"Retune error: {e}\n")
+            finally:
+                self._set_busy(False)
+        self._thread(run)
+
+    # ── Scope block ───────────────────────────────────────────────
+
+    def _build_scope_block(self, parent, row, col):
+        f = ttk.LabelFrame(parent, text="Scope", padding=8)
+        f.grid(row=row, column=col, sticky='nsew', padx=(0, 4), pady=(0, 6))
+        f.columnconfigure(1, weight=1)
+        f.columnconfigure(3, weight=1)
+
+        def field(r, c, label, var, values=None, width=8):
+            ttk.Label(f, text=label).grid(row=r, column=c, sticky='w', pady=1)
+            if values:
+                w = ttk.Combobox(f, textvariable=var, values=values,
+                                 width=width, state='readonly')
+            else:
+                w = ttk.Entry(f, textvariable=var, width=width)
+            w.grid(row=r, column=c + 1, sticky='ew', padx=(4, 10), pady=1)
+            return w
+
+        self._chan_var      = tk.StringVar(value="1")
+        self._trigsrc_var   = tk.StringVar(value="same as CH")
+        self._triglev_var   = tk.StringVar(value="0.0")
+        self._trigmode_var  = tk.StringVar(value="AUTO")
+        self._trigslope_var = tk.StringVar(value="RISe")
+        self._avg_var       = tk.StringVar(value="1")
+        self._nsdiv_var     = tk.StringVar(value="")
+        self._reclen_var    = tk.StringVar(value="")
+        self._maxpts_var    = tk.StringVar(value="10000")
+
+        field(0, 0, "Channel",    self._chan_var, ["1", "2", "3", "4"], 5)
+        field(0, 2, "Averages",   self._avg_var,
+              ["1", "8", "16", "64", "256", "512"], 6)
+        field(1, 0, "Trigger on", self._trigsrc_var,
+              ["same as CH", "1", "2", "3", "4"], 10)
+        field(1, 2, "Level (V)",  self._triglev_var, None, 6)
+        field(2, 0, "Trig mode",  self._trigmode_var, ["AUTO", "NORMal"], 8)
+        field(2, 2, "Slope",      self._trigslope_var, ["RISe", "FALL"], 6)
+        field(3, 0, "ns/div",     self._nsdiv_var, None, 8)
+        field(3, 2, "Rec len",    self._reclen_var, None, 8)
+        field(4, 0, "Max pts",    self._maxpts_var, None, 8)
+
+        ttk.Label(f, text="NORMal + averaging = coherent averaging; AUTO free-runs\n"
+                          "and washes it out. Blank ns/div or Rec len = leave as is.",
+                  foreground='gray', font=('', 8), justify='left').grid(
+            row=5, column=0, columnspan=4, sticky='w', pady=(4, 2))
+
+        b = ttk.Frame(f)
+        b.grid(row=6, column=0, columnspan=4, sticky='ew', pady=(2, 0))
+        b.columnconfigure((0, 1, 2, 3), weight=1)
+        setup = ttk.Button(b, text="Apply setup", command=self._setup_scope)
+        setup.grid(row=0, column=0, sticky='ew', padx=(0, 2))
+        plot = ttk.Button(b, text="Plot waveform", command=self._plot_waveform)
+        plot.grid(row=0, column=1, sticky='ew', padx=2)
+        live = ttk.Button(b, text="Live view…", command=self._open_live_view)
+        live.grid(row=0, column=2, sticky='ew', padx=2)
+        restore = ttk.Button(b, text="Restore", command=self._restore_scope)
+        restore.grid(row=0, column=3, sticky='ew', padx=(2, 0))
+        self._action_btns.extend([setup, plot, live, restore])
+
+    def _scope_setup_args(self):
+        src = self._trigsrc_var.get()
+        return dict(
+            channel=int(self._chan_var.get()),
+            n_averages=int(self._fnum(self._avg_var, 1.0, 1)),
+            trigger_channel=None if src.startswith("same") else int(src),
+            trigger_level=self._fnum(self._triglev_var, 1.0, 0.0),
+            trigger_mode=self._trigmode_var.get(),
+            trigger_slope=self._trigslope_var.get())
+
+    def _setup_scope(self):
+        if not self._need_scope(): return
+        args = self._scope_setup_args()
+        reclen = self._reclen_var.get().strip()
+        def do_setup():
+            self._set_busy(True)
+            try:
+                self.scope.setup(**args)
+                if reclen:
+                    self.scope.set_record_length(int(float(reclen)))
+                self._apply_timebase()
+            except Exception as e:
+                print(f"Setup error: {e}\n")
+            finally:
+                self._set_busy(False)
+        self._thread(do_setup)
+
+    def _restore_scope(self):
+        """Undo leftover measurement state (NORMal trigger, averaging, armed
+        single-sequence) — e.g. after an automated run."""
+        if not self._need_scope(): return
+        ch = int(self._chan_var.get())
+        def do_restore():
+            self._set_busy(True)
+            try:
+                self.scope.restore(channel=ch)
+            except Exception as e:
+                print(f"Restore error: {e}\n")
+            finally:
+                self._set_busy(False)
+        self._thread(do_restore)
+
+    # ── Analysis block ────────────────────────────────────────────
+
+    def _build_analysis_block(self, parent, row, col):
+        f = ttk.LabelFrame(parent, text="Analysis  (FFT of every spectrum shown)",
+                           padding=8)
+        f.grid(row=row, column=col, sticky='nsew', padx=(4, 0), pady=(0, 6))
+        f.columnconfigure(1, weight=1)
+        f.columnconfigure(3, weight=1)
+
+        self._win_var    = tk.StringVar(value="Hann")
+        self._kaiser_var = tk.StringVar(value="8.6")
+        self._pad_var    = tk.StringVar(value="×1")
+        self._dc_var     = tk.BooleanVar(value=True)
+        self._mag_var    = tk.StringVar(value="dBV")
+        self._fmin_var   = tk.StringVar(value="")
+        self._fmax_var   = tk.StringVar(value="")
+        self._tmin_var   = tk.StringVar(value="")
+        self._tmax_var   = tk.StringVar(value="")
+
+        ttk.Label(f, text="Window").grid(row=0, column=0, sticky='w', pady=1)
+        ttk.Combobox(f, textvariable=self._win_var, values=list(self.WINDOWS),
+                     width=11, state='readonly').grid(row=0, column=1, sticky='ew',
+                                                      padx=(4, 10), pady=1)
+        self._kaiser_lbl = ttk.Label(f, text="Kaiser β")
+        self._kaiser_box = ttk.Entry(f, textvariable=self._kaiser_var, width=6)
+        self._win_var.trace_add('write', lambda *_: self._sync_kaiser())
+
+        ttk.Label(f, text="Zero-pad").grid(row=1, column=0, sticky='w', pady=1)
+        ttk.Combobox(f, textvariable=self._pad_var,
+                     values=["×1", "×2", "×4", "×8"], width=11,
+                     state='readonly').grid(row=1, column=1, sticky='ew',
+                                            padx=(4, 10), pady=1)
+        ttk.Checkbutton(f, text="Remove DC", variable=self._dc_var).grid(
+            row=1, column=2, columnspan=2, sticky='w', pady=1)
+
+        ttk.Label(f, text="Magnitude").grid(row=2, column=0, sticky='w', pady=1)
+        ttk.Combobox(f, textvariable=self._mag_var, values=list(self.MAGNITUDES),
+                     width=11, state='readonly').grid(row=2, column=1, sticky='ew',
+                                                      padx=(4, 10), pady=1)
+
+        ttk.Label(f, text="Freq (MHz)").grid(row=3, column=0, sticky='w', pady=1)
+        fr = ttk.Frame(f); fr.grid(row=3, column=1, columnspan=3, sticky='ew', padx=(4, 0))
+        ttk.Entry(fr, textvariable=self._fmin_var, width=8).pack(side='left')
+        ttk.Label(fr, text=" … ").pack(side='left')
+        ttk.Entry(fr, textvariable=self._fmax_var, width=8).pack(side='left')
+
+        ttk.Label(f, text="Gate (µs)").grid(row=4, column=0, sticky='w', pady=1)
+        gt = ttk.Frame(f); gt.grid(row=4, column=1, columnspan=3, sticky='ew', padx=(4, 0))
+        ttk.Entry(gt, textvariable=self._tmin_var, width=8).pack(side='left')
+        ttk.Label(gt, text=" … ").pack(side='left')
+        ttk.Entry(gt, textvariable=self._tmax_var, width=8).pack(side='left')
+
+        ttk.Label(f, text="Blank = full range. The time gate sets the real\n"
+                          "resolution bandwidth; zero-padding only interpolates\n"
+                          "between bins, it does not resolve anything new.",
+                  foreground='gray', font=('', 8), justify='left').grid(
+            row=5, column=0, columnspan=4, sticky='w', pady=(6, 0))
+        self._sync_kaiser()
+
+    def _sync_kaiser(self):
+        if self._win_var.get() == "Kaiser":
+            self._kaiser_lbl.grid(row=0, column=2, sticky='w', pady=1)
+            self._kaiser_box.grid(row=0, column=3, sticky='ew', pady=1)
+        else:
+            self._kaiser_lbl.grid_remove(); self._kaiser_box.grid_remove()
+
+    def _window_array(self, n):
+        name = self._win_var.get()
+        if name == "Hann":      return np.hanning(n)
+        if name == "Hamming":   return np.hamming(n)
+        if name == "Blackman":  return np.blackman(n)
+        if name == "Kaiser":    return np.kaiser(n, self._fnum(self._kaiser_var, 1.0, 8.6))
+        return np.ones(n)
+
+    def _spectrum(self, t, v):
+        """Apply the Analysis settings to one capture.
+
+        Returns (freq_mhz, magnitude, y_label, caption). The amplitude is
+        corrected for the window's coherent gain, so switching windows changes
+        the leakage and the resolution — not the height of a tone.
+        """
+        t = np.asarray(t, dtype=np.float64)
+        v = np.asarray(v, dtype=np.float64)
+        t0 = self._fnum(self._tmin_var, 1e-6, None) if self._tmin_var.get().strip() else None
+        t1 = self._fnum(self._tmax_var, 1e-6, None) if self._tmax_var.get().strip() else None
+        if t0 is not None or t1 is not None:
+            m = np.ones(len(t), dtype=bool)
+            if t0 is not None: m &= t >= t0
+            if t1 is not None: m &= t <= t1
+            if m.sum() < 8:
+                raise ValueError(f"time gate keeps only {int(m.sum())} samples")
+            t, v = t[m], v[m]
+
+        if self._dc_var.get():
+            v = v - v.mean()
+        n = len(v)
+        dt = float(t[1] - t[0]) if n > 1 else 1.0
+        w = self._window_array(n)
+        cg = w.mean() or 1.0            # coherent gain → amplitude stays true
+        pad = int(self._pad_var.get().lstrip("×") or 1)
+        n_fft = n * pad
+
+        spec = np.fft.rfft(v * w, n=n_fft)
+        freqs = np.fft.rfftfreq(n_fft, dt)
+        amp = np.abs(spec) * 2.0 / (n * cg)      # peak volts per bin
+
+        units = self._mag_var.get()
+        if units == "dBV":
+            mag, ylabel = 20 * np.log10(amp + 1e-12), "Amplitude (dBV)"
+        elif units.startswith("dBm"):
+            p_mw = (amp / np.sqrt(2.0)) ** 2 / 50.0 * 1e3
+            mag, ylabel = 10 * np.log10(p_mw + 1e-12), "Power (dBm, 50 Ω)"
+        else:
+            mag, ylabel = amp, "Amplitude (V)"
+
+        fmin = self._fnum(self._fmin_var, 1e6, None) if self._fmin_var.get().strip() else None
+        fmax = self._fnum(self._fmax_var, 1e6, None) if self._fmax_var.get().strip() else None
+        keep = np.ones(len(freqs), dtype=bool)
+        if fmin is not None: keep &= freqs >= fmin
+        if fmax is not None: keep &= freqs <= fmax
+        if keep.sum() < 2:
+            raise ValueError("frequency range keeps fewer than 2 bins")
+
+        caption = (f"{self._win_var.get()}, pad {self._pad_var.get()}, "
+                   f"{n:,} pts over {n*dt*1e6:.3f} µs → RBW {1/(n*dt)/1e3:.1f} kHz"
+                   f"{', DC removed' if self._dc_var.get() else ''}")
+        return freqs[keep] * 1e-6, mag[keep], ylabel, caption
+
+    # ── Sweep block ───────────────────────────────────────────────
+
+    def _build_sweep_block(self, parent, row, col):
+        f = ttk.LabelFrame(parent, text="Frequency sweep  (CW level vs frequency)",
+                           padding=8)
+        f.grid(row=row, column=col, sticky='nsew', padx=(0, 4))
+        f.columnconfigure(1, weight=1)
+        f.columnconfigure(3, weight=1)
+
+        self._sweep_awgch_var = tk.StringVar(value="1")
+        self._sweep_chan_var  = tk.StringVar(value="1")
+        self._sweep_avg_var   = tk.StringVar(value="1")
+        self._settle_var      = tk.StringVar(value="200")
+        self._cycles_var      = tk.StringVar(value="8")
+        self._sweep_freqs_var = tk.StringVar(value="100:4400:100")
+
+        def field(r, c, label, var, values=None, width=8):
+            ttk.Label(f, text=label).grid(row=r, column=c, sticky='w', pady=1)
+            if values:
+                w = ttk.Combobox(f, textvariable=var, values=values, width=width,
+                                 state='readonly')
+            else:
+                w = ttk.Entry(f, textvariable=var, width=width)
+            w.grid(row=r, column=c + 1, sticky='ew', padx=(4, 10), pady=1)
+
+        field(0, 0, "AWG CH",   self._sweep_awgch_var, ["1", "2"], 5)
+        field(0, 2, "Scope CH", self._sweep_chan_var, ["1", "2", "3", "4"], 5)
+        field(1, 0, "Averages", self._sweep_avg_var,
+              ["1", "8", "16", "64", "256", "512"], 6)
+        field(1, 2, "Settle ms", self._settle_var, None, 6)
+        field(2, 0, "Cycles",   self._cycles_var, None, 6)
+        field(2, 2, "Freqs MHz", self._sweep_freqs_var, None, 10)
+
+        ttk.Label(f, text="Freqs: list \"100, 500\" or range \"start:stop:step\".\n"
+                          "Uses the AWG mode and that channel's amplitude above:\n"
+                          "DUC steps the NCO (exact, ms); Direct pre-loads segments.",
+                  foreground='gray', font=('', 8), justify='left').grid(
+            row=3, column=0, columnspan=4, sticky='w', pady=(4, 2))
+
+        btn = ttk.Button(f, text="Run sweep", command=self._run_sweep)
+        btn.grid(row=4, column=0, columnspan=4, sticky='ew', pady=(2, 0))
         self._action_btns.append(btn)
 
-        self._update_chirp_info()
+    # ── Setup (microwave-chain configuration) block ───────────────
 
-    def _update_chirp_info(self):
-        try:
-            rate      = SAMPLE_RATE_DUAL
-            chirp_us  = float(self._c_dur_var.get())
-            dead_us   = float(self._c_dead_var.get())
-            detect_us = float(self._c_detect_var.get())
-
-            n_chirp  = round(chirp_us  * 1e-6 * rate)
-            n_dead   = round(dead_us   * 1e-6 * rate)
-            n_detect = round(detect_us * 1e-6 * rate)
-            n_total  = max(int(np.ceil((n_chirp + n_dead + n_detect) / 64)) * 64, 128)
-            t_dead_actual = (n_total - n_chirp - n_detect) / rate * 1e6
-
-            self._ch1_info.config(
-                text=f"CH1  {n_chirp:,} samp  active {n_chirp/rate*1e6:.3f} µs  "
-                     f"period {n_total/rate*1e6:.3f} µs")
-            self._ch2_info.config(
-                text=f"CH2  {n_detect:,} samp detect  dead {t_dead_actual:.3f} µs  "
-                     f"LO freq exact")
-        except (ValueError, AttributeError, ZeroDivisionError):
-            pass
-
-    # ── DUC Chirp + CW panel (upconverted, IQM ONE mode) ─────────
-
-    def _build_duc_panel(self, parent):
-        f = ttk.LabelFrame(parent, text="DUC Chirp + CW  (upconverted, IQM ONE)", padding=8)
-        f.pack(fill='x', pady=(0, 6))
-        f.columnconfigure(1, weight=1)
-
-        # Carrier = NCO frequency for CH1.  BB start/stop = baseband offsets from carrier.
-        # RF output sweeps (carrier + BB_start) → (carrier + BB_stop).
-        # DAC clock 9 GS/s (x8 interp): max carrier ~4.5 GHz (Nyquist); BB_stop ≤ ~560 MHz
-        # (Nyquist of the 1.125 GS/s complex baseband rate).
-        duc_fields = [
-            ("Carrier     (MHz)", "duc_carrier",   "2000"),
-            ("BB start    (MHz)", "duc_bb_start",  "0"),
-            ("BB stop     (MHz)", "duc_bb_stop",   "500"),
-            ("Chirp dur   (µs)",  "duc_chirp_dur", "1.0"),
-            ("Dead time   (µs)",  "duc_dead",      "0.1"),
-            ("LO freq     (MHz)", "duc_lo",        "2300"),
-            ("Detect win  (µs)",  "duc_detect",    "10.0"),
-            ("Amplitude   (Vpp)", "duc_amp",       "0.5"),
-        ]
-        for row, (lbl, attr, default) in enumerate(duc_fields):
-            ttk.Label(f, text=lbl).grid(row=row, column=0, sticky='w', pady=1)
-            var = tk.StringVar(value=default)
-            setattr(self, f"_{attr}_var", var)
-            e = ttk.Entry(f, textvariable=var, width=8)
-            e.grid(row=row, column=1, sticky='ew', padx=(4, 0), pady=1)
-            var.trace_add('write', lambda *_: self._update_duc_info())
-
-        r = len(duc_fields)
-        ttk.Separator(f, orient='horizontal').grid(row=r, column=0, columnspan=2,
-                                                    sticky='ew', pady=4)
-        self._duc_info = ttk.Label(f, text="", foreground='gray', font=('Courier', 8))
-        self._duc_info.grid(row=r+1, column=0, columnspan=2, sticky='w')
-
-        duc_btn = ttk.Button(f, text="DUC Chirp+CW",
-                             command=self._run_chirp_duc)
-        duc_btn.grid(row=r+2, column=0, columnspan=2, sticky='ew', pady=(6, 2))
-        self._action_btns.append(duc_btn)
-
-        self._update_duc_info()
-
-    def _update_duc_info(self):
-        try:
-            carrier  = float(self._duc_carrier_var.get())
-            bb_start = float(self._duc_bb_start_var.get())
-            bb_stop  = float(self._duc_bb_stop_var.get())
-            f_lo     = float(self._duc_lo_var.get())
-            self._duc_info.config(
-                text=f"CH1 RF: {carrier+bb_start:.1f} → {carrier+bb_stop:.1f} MHz"
-                     f"   CH2 LO: {f_lo:.3f} MHz (NCO exact)")
-        except (ValueError, AttributeError):
-            pass
-
-    # ── Scope Monitor panel ────────────────────────────────────────
-
-    def _build_scope_panel(self, parent):
-        s = ttk.LabelFrame(parent, text="Scope Monitor", padding=8)
-        s.pack(fill='x', pady=(0, 6))
-
-        ttk.Label(s, text="Scope CH").grid(row=0, column=0, sticky='w', pady=2)
-        self._chan_var = tk.StringVar(value="1")
-        ttk.Combobox(s, textvariable=self._chan_var, values=["1", "2"],
-                     width=4, state='readonly').grid(row=0, column=1, padx=4, pady=2)
-
-        ttk.Label(s, text="ns/div").grid(row=1, column=0, sticky='w', pady=2)
-        self._nsdiv_var = tk.StringVar(value="")
-        ttk.Entry(s, textvariable=self._nsdiv_var, width=7).grid(
-            row=1, column=1, sticky='ew', padx=4, pady=2)
-
-        ttk.Label(s, text="Max pts").grid(row=2, column=0, sticky='w', pady=2)
-        self._maxpts_var = tk.StringVar(value="10000")
-        ttk.Entry(s, textvariable=self._maxpts_var, width=7).grid(
-            row=2, column=1, sticky='ew', padx=4, pady=2)
-
-        ttk.Button(s, text="Setup Scope", command=self._setup_scope).grid(
-            row=3, column=0, columnspan=2, sticky='ew', pady=2)
-
-        plot_btn = ttk.Button(s, text="Plot Waveform", command=self._plot_waveform)
-        plot_btn.grid(row=4, column=0, columnspan=2, sticky='ew', pady=2)
-        self._action_btns.append(plot_btn)
-
-        live_btn = ttk.Button(s, text="Live View…", command=self._open_live_view)
-        live_btn.grid(row=5, column=0, columnspan=2, sticky='ew', pady=2)
-        self._action_btns.append(live_btn)
-
-        restore_btn = ttk.Button(s, text="Restore Scope", command=self._restore_scope)
-        restore_btn.grid(row=6, column=0, columnspan=2, sticky='ew', pady=2)
-        self._action_btns.append(restore_btn)
-
-    # ── Setup (microwave-chain configuration) panel ────────────────
-
-    def _build_setup_panel(self, parent):
-        f = ttk.LabelFrame(parent, text="Setup  (microwave chain)", padding=8)
-        f.pack(fill='x', pady=(0, 6))
+    def _build_setup_block(self, parent, row, col):
+        f = ttk.LabelFrame(parent, text="Setup  (saved with every sweep)", padding=8)
+        f.grid(row=row, column=col, sticky='nsew', padx=(4, 0))
         f.columnconfigure(1, weight=1)
 
         ttk.Label(f, text="Name").grid(row=0, column=0, sticky='w', pady=1)
         self._setup_name_var = tk.StringVar(value="config_A")
-        ttk.Entry(f, textvariable=self._setup_name_var, width=8).grid(
+        ttk.Entry(f, textvariable=self._setup_name_var, width=10).grid(
             row=0, column=1, sticky='ew', padx=(4, 0), pady=1)
 
         ttk.Label(f, text="Description").grid(row=1, column=0, sticky='nw', pady=1)
-        self._setup_desc = tk.Text(f, width=8, height=4, wrap='word')
+        self._setup_desc = tk.Text(f, width=10, height=3, wrap='word')
         self._setup_desc.grid(row=1, column=1, sticky='ew', padx=(4, 0), pady=1)
         self._setup_desc.insert('1.0', "AWG CH1 -> x24 AMC -> ...")
 
         self._photo_lbl = ttk.Label(f, text="Photo: none", foreground='gray',
-                                    font=('Courier', 8), wraplength=200)
+                                    font=('Courier', 8), wraplength=250)
         self._photo_lbl.grid(row=2, column=0, columnspan=2, sticky='w', pady=(4, 1))
 
         pb = ttk.Frame(f)
         pb.grid(row=3, column=0, columnspan=2, sticky='ew')
         pb.columnconfigure((0, 1), weight=1)
-        ttk.Button(pb, text="Browse Photo…", command=self._browse_photo).grid(
+        ttk.Button(pb, text="Browse photo…", command=self._browse_photo).grid(
             row=0, column=0, sticky='ew', padx=(0, 2))
-        ttk.Button(pb, text="Show Setup", command=self._show_setup_photo).grid(
+        ttk.Button(pb, text="Show setup", command=self._show_setup_photo).grid(
             row=0, column=1, sticky='ew', padx=(2, 0))
 
     def _browse_photo(self):
@@ -479,67 +864,24 @@ class LabGUI:
                 self._setup_desc.get('1.0', 'end').strip(),
                 self._setup_photo)
 
-    # ── Sweep panel ────────────────────────────────────────────────
-
-    def _build_sweep_panel(self, parent):
-        w = ttk.LabelFrame(parent, text="Sweep", padding=8)
-        w.pack(fill='x', pady=(0, 6))
-        w.columnconfigure(1, weight=1)
-
-        ttk.Label(w, text="Scope CH").grid(row=0, column=0, sticky='w', pady=2)
-        self._sweep_chan_var = tk.StringVar(value="1")
-        ttk.Combobox(w, textvariable=self._sweep_chan_var, values=["1", "2"],
-                     width=4, state='readonly').grid(row=0, column=1, sticky='ew', padx=(4, 0), pady=2)
-
-        ttk.Label(w, text="Averages").grid(row=1, column=0, sticky='w', pady=2)
-        self._sweep_avg_var = tk.StringVar(value="1")
-        ttk.Combobox(w, textvariable=self._sweep_avg_var,
-                     values=["1", "8", "16", "64", "256", "512"],
-                     width=6, state='readonly').grid(row=1, column=1, sticky='ew', padx=(4, 0), pady=2)
-
-        ttk.Label(w, text="Settle (ms)").grid(row=2, column=0, sticky='w', pady=2)
-        self._settle_var = tk.StringVar(value="200")
-        ttk.Entry(w, textvariable=self._settle_var, width=6).grid(
-            row=2, column=1, sticky='ew', padx=(4, 0), pady=2)
-
-        ttk.Label(w, text="Cycles shown").grid(row=3, column=0, sticky='w', pady=2)
-        self._cycles_var = tk.StringVar(value="8")
-        ttk.Entry(w, textvariable=self._cycles_var, width=6).grid(
-            row=3, column=1, sticky='ew', padx=(4, 0), pady=2)
-
-        ttk.Label(w, text="AWG mode").grid(row=4, column=0, sticky='w', pady=2)
-        self._sweep_mode_var = tk.StringVar(value="DUC (NCO step)")
-        ttk.Combobox(w, textvariable=self._sweep_mode_var,
-                     values=["Direct (segments)", "DUC (NCO step)"],
-                     width=16, state='readonly').grid(
-            row=4, column=1, sticky='ew', padx=(4, 0), pady=2)
-
-        # Blank = DEFAULT_FREQS. Comma list ("100, 500, 2000") or
-        # "start:stop:step" ("100:4400:100"), all in MHz.
-        ttk.Label(w, text="Freqs (MHz)").grid(row=5, column=0, sticky='w', pady=2)
-        self._sweep_freqs_var = tk.StringVar(value="100:4400:100")
-        ttk.Entry(w, textvariable=self._sweep_freqs_var, width=6).grid(
-            row=5, column=1, sticky='ew', padx=(4, 0), pady=2)
-
-        btn = ttk.Button(w, text="Frequency Sweep", command=self._run_sweep)
-        btn.grid(row=6, column=0, columnspan=2, sticky='ew', pady=(6, 2))
-        self._sweep_btn = btn
-        self._action_btns.append(btn)
+    # ── Right-hand side: log + plot ───────────────────────────────
 
     def _build_right(self, parent):
         right = ttk.Frame(parent)
-        right.pack(side='left', fill='both', expand=True)
+        right.grid(row=0, column=1, sticky='nsew')
+        right.rowconfigure(1, weight=1)
+        right.columnconfigure(0, weight=1)
 
         log_frame = ttk.LabelFrame(right, text="Log", padding=4)
-        log_frame.pack(fill='both', expand=False, pady=(0, 4))
-        self._log = scrolledtext.ScrolledText(log_frame, height=10, state='disabled',
+        log_frame.grid(row=0, column=0, sticky='ew', pady=(0, 4))
+        self._log = scrolledtext.ScrolledText(log_frame, height=9, state='disabled',
                                               font=('Courier', 9))
         self._log.pack(fill='both', expand=True)
         sys.stdout = _LogRedirect(self._log, self.root)
 
         plot_frame = ttk.LabelFrame(right, text="Plot", padding=4)
-        plot_frame.pack(fill='both', expand=True)
-        self._fig = Figure(figsize=(6, 4), dpi=90)
+        plot_frame.grid(row=1, column=0, sticky='nsew')
+        self._fig = Figure(figsize=(6, 5), dpi=90)
         self._canvas = FigureCanvasTkAgg(self._fig, master=plot_frame)
         self._canvas.get_tk_widget().pack(fill='both', expand=True)
 
@@ -547,14 +889,6 @@ class LabGUI:
 
     def _thread(self, fn):
         threading.Thread(target=fn, daemon=True).start()
-
-    _MODE_TO_RATE = {
-        "9 GS/s  (CH1)":    SAMPLE_RATE_SINGLE,
-        "2.5 GS/s  (CH1+2)": SAMPLE_RATE_DUAL,
-    }
-
-    def _rate(self):
-        return self._MODE_TO_RATE.get(self._rate_var.get(), SAMPLE_RATE_SINGLE)
 
     def _set_busy(self, busy):
         if busy and self._live_running:
@@ -566,17 +900,15 @@ class LabGUI:
                 self.root.after(0, lambda b=btn: b.config(state=state))
             except Exception:
                 pass
+        if not busy:
+            self.root.after(0, lambda: self._retune_btn.config(
+                state='normal' if self._mode() == "duc" else 'disabled'))
 
     def _redraw(self):
         self.root.after(0, self._canvas.draw)
 
     def _status(self, label, text, color):
         self.root.after(0, lambda: label.config(text=text, foreground=color))
-
-    def _std_params(self):
-        return (float(self._freq1_var.get()) * 1e6,
-                float(self._amp1_var.get()),
-                1)
 
     @staticmethod
     def _parse_sweep_freqs(text):
@@ -615,13 +947,13 @@ class LabGUI:
             return False
         return True
 
-    # ── Instrument connections ─────────────────────────────────────
+    # ── Instrument connections ────────────────────────────────────
 
     def _connect_awg(self):
         def connect():
             try:
-                self.awg = AWG(sample_rate=self._rate())
-                self._awg_needs_reset = True
+                self.awg = AWG(sample_rate=self._clock_rate())
+                self._sent_baseband = {}
                 self._status(self._awg_lbl, "AWG: connected", "green")
             except Exception as e:
                 print(f"AWG connection failed: {e}\n")
@@ -639,111 +971,27 @@ class LabGUI:
                 self._status(self._scope_lbl, "Scope: error", "red")
         self._thread(connect)
 
-    # ── Standard waveform commands ────────────────────────────────
-
-    def _run_std_wave(self, channel=1):
-        if not self._need_awg(): return
-        try:
-            freq = float(getattr(self, f'_freq{channel}_var').get()) * 1e6
-            amp  = float(getattr(self, f'_amp{channel}_var').get())
-            wave = getattr(self, f'_wave{channel}_var').get()
-        except ValueError as e:
-            print(f"Invalid parameter: {e}\n")
-            return
-        rate = self._rate()
-        # Reset only on first send after connect / rate change — an unconditional
-        # reset on "Send CH1" (*RST + TRAC:DEL:ALL) would silently kill a running CH2.
-        reset = self._awg_needs_reset
-        self._set_busy(True)
-        def run():
-            try:
-                self.awg.sample_rate = rate
-                if wave == "Sine":
-                    self.awg.send_sine(freq, amp, channel=channel, reset=reset)
-                elif wave == "Square":
-                    self.awg.send_square(freq, amp, channel=channel, reset=reset)
-                elif wave == "Ramp":
-                    self.awg.send_ramp(freq, amp, channel=channel, reset=reset)
-                self._awg_needs_reset = False
-            except Exception as e:
-                print(f"Waveform error: {e}\n")
-            finally:
-                self._set_busy(False)
-        self._thread(run)
-
-    # ── Chirp + CW command ────────────────────────────────────────
-
-    def _run_chirp(self):
-        if not self._need_awg(): return
-        try:
-            f_start  = float(self._c_start_var.get())  * 1e6
-            f_stop   = float(self._c_stop_var.get())   * 1e6
-            chirp_us = float(self._c_dur_var.get())
-            dead_us  = float(self._c_dead_var.get())
-            f_lo      = float(self._c_lo_var.get())     * 1e6
-            detect_us = float(self._c_detect_var.get())
-            amp       = float(self._c_amp_var.get())
-        except ValueError as e:
-            print(f"Invalid chirp parameter: {e}\n")
-            return
-
-        self._set_busy(True)
-        def run():
-            try:
-                self.awg.send_chirp_with_lo(f_start, f_stop, chirp_us, dead_us,
-                                             f_lo, detect_us, amplitude_vpp=amp)
-            except Exception as e:
-                print(f"Chirp error: {e}\n")
-            finally:
-                self._set_busy(False)
-        self._thread(run)
-
-    def _run_chirp_duc(self):
-        if not self._need_awg(): return
-        try:
-            f_carrier  = float(self._duc_carrier_var.get())   * 1e6
-            f_start_bb = float(self._duc_bb_start_var.get())  * 1e6
-            f_stop_bb  = float(self._duc_bb_stop_var.get())   * 1e6
-            chirp_us   = float(self._duc_chirp_dur_var.get())
-            dead_us    = float(self._duc_dead_var.get())
-            f_lo       = float(self._duc_lo_var.get())         * 1e6
-            detect_us  = float(self._duc_detect_var.get())
-            amp        = float(self._duc_amp_var.get())
-        except ValueError as e:
-            print(f"Invalid DUC chirp parameter: {e}\n")
-            return
-
-        self._set_busy(True)
-        def run():
-            try:
-                self.awg.send_chirp_with_lo_duc(
-                    f_carrier, f_start_bb, f_stop_bb, chirp_us, dead_us,
-                    f_lo, detect_us, amplitude_vpp=amp)
-            except Exception as e:
-                print(f"DUC chirp error: {e}\n")
-            finally:
-                self._set_busy(False)
-        self._thread(run)
-
     def _stop(self):
         self._sweep_stop.set()
         self._live_running = False
         self._live_gen += 1
         self._set_busy(False)
-        if not self._need_awg(): return
+        self._sent_baseband = {}   # next Send does a full setup, not a retune
+        if self.awg is None:
+            return
         self._thread(self.awg.stop)
 
-    # ── Sweep ──────────────────────────────────────────────────────
+    # ── Sweep ─────────────────────────────────────────────────────
 
     def _run_sweep(self):
-        print("Sweep clicked\n")
         if not self._need_awg(): return
-        self._set_busy(True)   # disable buttons immediately — prevents double-click second thread
+        self._set_busy(True)   # immediately — prevents a double-click second thread
         try:
-            _, amp, awg_ch = self._std_params()
-            settle_s = float(self._settle_var.get()) / 1000.0
-            n_cycles = int(self._cycles_var.get())
-            use_duc = "DUC" in self._sweep_mode_var.get()
+            awg_ch = int(self._sweep_awgch_var.get())
+            amp = self._fnum(self._ch[awg_ch]["amp"], 1.0)
+            settle_s = self._fnum(self._settle_var, 1e-3, 0.2)
+            n_cycles = int(self._fnum(self._cycles_var, 1.0, 8))
+            use_duc = self._mode() == "duc"
             custom_freqs = self._parse_sweep_freqs(self._sweep_freqs_var.get())
         except Exception as e:
             print(f"Sweep param error: {e}\n")
@@ -751,19 +999,20 @@ class LabGUI:
             return
 
         name, desc, photo = self._setup_meta()
+        clock_rate = self._clock_rate()
 
         def sweep():
             self._sweep_stop.clear()
             records = []
-            n_avg = int(self._sweep_avg_var.get())
+            n_avg = int(self._fnum(self._sweep_avg_var, 1.0, 1))
             scope_ch = int(self._sweep_chan_var.get())
             try:
                 base_freqs = custom_freqs if custom_freqs is not None else DEFAULT_FREQS
                 # Drop frequencies above Nyquist — they would silently alias
                 # (the buffer wraps) and log a bogus "actual" frequency.
                 # DUC: the NCO reaches the 9 GS/s DAC Nyquist (4.5 GHz)
-                # regardless of the GUI channel-mode clock.
-                dac_rate = 9e9 if use_duc else self.awg.sample_rate
+                # regardless of the direct-mode clock choice.
+                dac_rate = AWG.DUC_DAC_RATE if use_duc else clock_rate
                 nyq = dac_rate / 2
                 freqs = [f for f in base_freqs if f <= nyq]
                 skipped = [f for f in base_freqs if f > nyq]
@@ -784,15 +1033,15 @@ class LabGUI:
                     print(f"  duc_cw_setup: {(time.perf_counter()-t_pre0):.1f} s\n")
                     segments = [(f, None) for f in freqs]
                 else:
-                    # Pre-load all segments once; the sweep loop then just switches
+                    # Pre-load all segments once; the loop then just switches.
                     print("Pre-loading waveform segments…\n")
+                    self.awg.sample_rate = clock_rate
                     t_pre0 = time.perf_counter()
                     self.awg.send_sine(freqs[0], amp, channel=awg_ch, reset=True)
                     t_pre1 = time.perf_counter()
                     print(f"  send_sine: {(t_pre1-t_pre0):.1f} s\n")
                     segments = self.awg.sweep_preload(freqs, channel=awg_ch)
-                    t_pre2 = time.perf_counter()
-                    print(f"  sweep_preload: {(t_pre2-t_pre1):.1f} s\n")
+                    print(f"  sweep_preload: {(time.perf_counter()-t_pre1):.1f} s\n")
 
                 if self.scope is not None:
                     self.scope.setup(channel=scope_ch, n_averages=n_avg)
@@ -805,7 +1054,8 @@ class LabGUI:
                 ref_vpp = None
                 freqs_plot, losses_plot = [], []
 
-                print(f"\n{'Target (MHz)':>14}  {'Actual (MHz)':>14}  {'Vpp (mV)':>10}  {'Loss (dB)':>10}")
+                print(f"\n{'Target (MHz)':>14}  {'Actual (MHz)':>14}  "
+                      f"{'Vpp (mV)':>10}  {'Loss (dB)':>10}")
                 print("-" * 56)
 
                 for (actual, segnum), f in zip(segments, freqs):
@@ -813,49 +1063,42 @@ class LabGUI:
                         print("Sweep aborted.\n")
                         break
 
-                    t0 = time.perf_counter()
                     if use_duc:
                         self.awg.duc_cw_step(f, channel=awg_ch)
                     else:
                         self.awg.sweep_step(segnum, amp, channel=awg_ch)
-                    t1 = time.perf_counter()
-                    print(f"  {'duc_cw_step' if use_duc else 'sweep_step'}: "
-                          f"{(t1-t0)*1000:.0f} ms\n")
 
-                    if self.scope is not None:
-                        t2 = time.perf_counter()
-                        self.scope.set_timebase(actual, n_cycles=n_cycles)
-                        t3 = time.perf_counter()
-                        print(f"  set_timebase: {(t3-t2)*1000:.0f} ms\n")
-                        vpp, wt, wv = self.scope.measure_vpp_auto(
-                            channel=scope_ch, settle=settle_s)
-                        t4 = time.perf_counter()
-                        print(f"  measure_vpp: {(t4-t3)*1000:.0f} ms\n")
-                        if ref_vpp is None:
-                            ref_vpp = vpp
-                        loss = 20 * np.log10(vpp / ref_vpp) if vpp > 0 else float('-inf')
-                        print(f"{f/1e6:>14.1f}  {actual/1e6:>14.3f}  {vpp*1e3:>10.1f}  {loss:>10.2f}")
-                        freqs_plot.append(actual / 1e6)
-                        losses_plot.append(loss)
-
-                        dt_s = float(wt[1] - wt[0]) if len(wt) > 1 else 0.0
-                        records.append({
-                            "target_hz": f, "actual_hz": actual,
-                            "vpp_v": vpp, "loss_db": loss,
-                            "dt_s": dt_s, "time": wt, "voltage": wv,
-                        })
-
-                        # Live per-step plot — drawn on the Tk main thread only.
-                        # Mutating self._fig from this worker thread races with
-                        # the previous iteration's canvas.draw and aborts the
-                        # sweep with a matplotlib error on the second step.
-                        # Pass list copies: the worker keeps appending.
-                        self.root.after(0, self._draw_sweep_step,
-                                        wt, wv, actual, vpp,
-                                        list(freqs_plot), list(losses_plot),
-                                        dac_rate)
-                    else:
+                    if self.scope is None:
                         print(f"{f/1e6:>14.1f}  {actual/1e6:>14.3f}  {'(no scope)':>10}")
+                        continue
+
+                    self.scope.set_timebase(actual, n_cycles=n_cycles)
+                    vpp, wt, wv = self.scope.measure_vpp_auto(
+                        channel=scope_ch, settle=settle_s)
+                    if ref_vpp is None:
+                        ref_vpp = vpp
+                    loss = 20 * np.log10(vpp / ref_vpp) if vpp > 0 else float('-inf')
+                    print(f"{f/1e6:>14.1f}  {actual/1e6:>14.3f}  "
+                          f"{vpp*1e3:>10.1f}  {loss:>10.2f}")
+                    freqs_plot.append(actual / 1e6)
+                    losses_plot.append(loss)
+
+                    dt_s = float(wt[1] - wt[0]) if len(wt) > 1 else 0.0
+                    records.append({
+                        "target_hz": f, "actual_hz": actual,
+                        "vpp_v": vpp, "loss_db": loss,
+                        "dt_s": dt_s, "time": wt, "voltage": wv,
+                    })
+
+                    # Live per-step plot — drawn on the Tk main thread only.
+                    # Mutating self._fig from this worker races with the
+                    # previous iteration's canvas.draw and aborts the sweep
+                    # with a matplotlib error on the second step. Pass list
+                    # copies: the worker keeps appending.
+                    self.root.after(0, self._draw_sweep_step,
+                                    wt, wv, actual, vpp,
+                                    list(freqs_plot), list(losses_plot),
+                                    dac_rate)
 
                 print("Sweep done.\n")
             except Exception as e:
@@ -866,15 +1109,15 @@ class LabGUI:
                         params = {
                             "amplitude_vpp": amp, "awg_ch": awg_ch,
                             "awg_mode": "duc_nco" if use_duc else "direct_segments",
-                            "dac_rate_hz": dac_rate,
+                            "dac_rate_hz": AWG.DUC_DAC_RATE if use_duc else clock_rate,
                             "scope_ch": scope_ch, "n_averages": n_avg,
                             "settle_ms": settle_s * 1000.0, "cycles_shown": n_cycles,
                             "sample_rate_hz": self.awg.sample_rate,
                             "n_samples": self.awg.n_samples,
                         }
                         if use_duc:
-                            params["interpolation"] = "X8"
-                            params["baseband_rate_hz"] = dac_rate / 8.0
+                            params["interpolation"] = f"X{AWG.DUC_INTERP}"
+                            params["baseband_rate_hz"] = AWG.DUC_DAC_RATE / AWG.DUC_INTERP
                         path = sweeplog.save_sweep(name, desc, photo, params, records)
                         print(f"Saved {len(records)} points -> {path}\n")
                     except Exception as e:
@@ -910,40 +1153,10 @@ class LabGUI:
         self._fig.tight_layout()
         self._canvas.draw_idle()
 
-    # ── Scope setup ────────────────────────────────────────────────
-
-    def _setup_scope(self):
-        if not self._need_scope(): return
-        ch = int(self._chan_var.get())
-        def do_setup():
-            self._set_busy(True)
-            try:
-                self.scope.setup(channel=ch, n_averages=1)
-            except Exception as e:
-                print(f"Setup error: {e}\n")
-            finally:
-                self._set_busy(False)
-        self._thread(do_setup)
-
-    def _restore_scope(self):
-        """Undo leftover measurement state (NORMal trigger on CH2, averaging,
-        armed single-sequence) — e.g. after compare_duc_direct.py."""
-        if not self._need_scope(): return
-        ch = int(self._chan_var.get())
-        def do_restore():
-            self._set_busy(True)
-            try:
-                self.scope.restore(channel=ch)
-            except Exception as e:
-                print(f"Restore error: {e}\n")
-            finally:
-                self._set_busy(False)
-        self._thread(do_restore)
-
-    # ── Waveform capture ───────────────────────────────────────────
+    # ── Waveform capture ──────────────────────────────────────────
 
     def _apply_timebase(self):
-        """Send ns/div to scope if the field is filled in."""
+        """Send ns/div to the scope if the field is filled in."""
         val = self._nsdiv_var.get().strip()
         if val and self.scope:
             try:
@@ -952,45 +1165,46 @@ class LabGUI:
                 print(f"Timebase error: {e}\n")
 
     def _scope_max_pts(self):
-        try:
-            return int(self._maxpts_var.get())
-        except ValueError:
-            return 10000
+        return int(self._fnum(self._maxpts_var, 1.0, 10000))
+
+    def _draw_capture(self, t, v, spec):
+        """Main thread only — see _draw_sweep_step."""
+        self._fig.clear()
+        ax1 = self._fig.add_subplot(211)
+        ax1.plot(t * 1e6, v * 1e3)
+        ax1.set_xlabel("Time (µs)")
+        ax1.set_ylabel("Voltage (mV)")
+        ax1.grid(True)
+        ax2 = self._fig.add_subplot(212)
+        if spec is None:
+            ax2.text(0.5, 0.5, "no spectrum", ha='center', va='center',
+                     transform=ax2.transAxes, color='red')
+        else:
+            freqs, mag, ylabel, caption = spec
+            ax2.plot(freqs, mag)
+            ax2.set_xlabel("Frequency (MHz)")
+            ax2.set_ylabel(ylabel)
+            ax2.set_title(caption, fontsize=8)
+            ax2.grid(True)
+        self._fig.tight_layout()
+        self._canvas.draw_idle()
 
     def _plot_waveform(self):
-        print("Plot waveform clicked\n")
         if not self._need_scope(): return
         ch = int(self._chan_var.get())
-
-        def draw(t, v, freqs, spectrum):
-            # Main thread only — see _draw_sweep_step.
-            self._fig.clear()
-            ax1 = self._fig.add_subplot(211)
-            ax1.plot(t * 1e9, v * 1e3)
-            ax1.set_xlabel("Time (ns)")
-            ax1.set_ylabel("Voltage (mV)")
-            ax1.grid(True)
-
-            ax2 = self._fig.add_subplot(212)
-            ax2.plot(freqs * 1e-6, spectrum)
-            ax2.set_xlabel("Frequency (MHz)")
-            ax2.set_ylabel("Amplitude (dBV)")
-            ax2.grid(True)
-
-            self._fig.tight_layout()
-            self._canvas.draw_idle()
 
         def capture():
             self._set_busy(True)
             try:
                 self._apply_timebase()
-                t, v = self.scope.get_waveform(channel=ch, max_points=self._scope_max_pts())
-
-                n, dt = len(v), t[1] - t[0]
-                freqs    = np.fft.rfftfreq(n, dt)
-                spectrum = 20 * np.log10(np.abs(np.fft.rfft(v)) * 2 / n + 1e-12)
-
-                self.root.after(0, draw, t, v, freqs, spectrum)
+                t, v = self.scope.get_waveform(channel=ch,
+                                               max_points=self._scope_max_pts())
+                try:
+                    spec = self._spectrum(t, v)
+                except Exception as e:
+                    print(f"Spectrum error: {e}\n")
+                    spec = None
+                self.root.after(0, self._draw_capture, t, v, spec)
             except Exception as e:
                 print(f"Capture error: {e}\n")
             finally:
@@ -998,7 +1212,7 @@ class LabGUI:
 
         self._thread(capture)
 
-    # ── Live view ──────────────────────────────────────────────────
+    # ── Live view ─────────────────────────────────────────────────
 
     def _open_live_view(self):
         if not self._need_scope(): return
@@ -1015,6 +1229,8 @@ class LabGUI:
         ctrl.pack(fill='x', side='bottom')
         self._live_start_btn = ttk.Button(ctrl, text="Start", command=self._toggle_live)
         self._live_start_btn.pack(side='left', padx=4)
+        ttk.Label(ctrl, text="Uses the Analysis settings; change them and the next "
+                             "frame follows.", foreground='gray').pack(side='left', padx=8)
         self._action_btns.append(self._live_start_btn)
 
         self._live_fig = Figure(figsize=(8, 5), dpi=90)
@@ -1043,21 +1259,24 @@ class LabGUI:
             gen = self._live_gen
             self._thread(lambda: self._live_loop(gen))
 
-    def _live_draw(self, gen, t, v, freqs, spectrum):
-        """Runs on the Tk main thread — the only place the live figure is touched.
-        Mutating the figure from the worker thread races with canvas draws."""
+    def _live_draw(self, gen, t, v, spec):
+        """Runs on the Tk main thread — the only place the live figure is
+        touched. Mutating it from the worker races with canvas draws."""
         if not (self._live_running and self._live_gen == gen):
             return
         if self._live_win is None or not self._live_win.winfo_exists():
             return
         self._live_fig.clear()
         ax1 = self._live_fig.add_subplot(211)
-        ax1.plot(t * 1e9, v * 1e3)
-        ax1.set_xlabel("Time (ns)"); ax1.set_ylabel("Voltage (mV)"); ax1.grid(True)
+        ax1.plot(t * 1e6, v * 1e3)
+        ax1.set_xlabel("Time (µs)"); ax1.set_ylabel("Voltage (mV)"); ax1.grid(True)
 
         ax2 = self._live_fig.add_subplot(212)
-        ax2.plot(freqs * 1e-6, spectrum)
-        ax2.set_xlabel("Frequency (MHz)"); ax2.set_ylabel("Amplitude (dBV)")
+        if spec is not None:
+            freqs, mag, ylabel, caption = spec
+            ax2.plot(freqs, mag)
+            ax2.set_xlabel("Frequency (MHz)"); ax2.set_ylabel(ylabel)
+            ax2.set_title(caption, fontsize=8)
         ax2.grid(True)
 
         self._live_fig.tight_layout()
@@ -1067,16 +1286,18 @@ class LabGUI:
         ch = int(self._chan_var.get())
         self._apply_timebase()
         max_pts = self._scope_max_pts()
+        warned = False
         while self._live_running and self._live_gen == gen:
             try:
                 t, v = self.scope.get_waveform(channel=ch, max_points=max_pts)
-
-                n, dt = len(v), t[1] - t[0]
-                freqs    = np.fft.rfftfreq(n, dt)
-                spectrum = 20 * np.log10(np.abs(np.fft.rfft(v)) * 2 / n + 1e-12)
-
-                self.root.after(0, self._live_draw, gen, t, v, freqs, spectrum)
-
+                try:
+                    spec = self._spectrum(t, v)
+                except Exception as e:
+                    spec = None
+                    if not warned:
+                        print(f"Spectrum error: {e}\n")
+                        warned = True
+                self.root.after(0, self._live_draw, gen, t, v, spec)
             except Exception as e:
                 print(f"Live view error: {e}\n")
 
