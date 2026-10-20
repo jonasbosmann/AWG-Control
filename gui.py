@@ -18,8 +18,14 @@ Reworked 2026-10-14. What changed and why:
     draws, so the transform is something you chose rather than something
     hard-coded.
 
-Still to come (see the GUI backlog): marker-output trigger, FID capture with
-N-shot software averaging, external trigger.
+The Marker box in the Timing panel puts a start-of-buffer pulse on an AWG
+marker output, which is what the scope should trigger on for anything that
+will be averaged -- it is played from the same segment memory, on the same
+sample clock, as the waveform. It is re-sent automatically after every Send,
+because the *RST inside a waveform upload wipes the segment it lives in.
+
+Still to come (see the GUI backlog): FID capture with N-shot software
+averaging, external trigger.
 """
 import tkinter as tk
 from tkinter import ttk, scrolledtext, filedialog
@@ -34,6 +40,7 @@ from matplotlib.figure import Figure
 
 from awg import AWG, SAMPLE_RATE_SINGLE, SAMPLE_RATE_DUAL
 from scope import Scope
+import reflock
 from measure import DEFAULT_FREQS
 import sweeplog
 
@@ -144,9 +151,141 @@ class LabGUI:
         self._scope_lbl = ttk.Label(conn, text="Scope: disconnected", foreground='red')
         self._scope_lbl.pack(side='left', padx=(0, 16))
 
+        ttk.Separator(conn, orient='vertical').pack(side='left', fill='y', padx=(0, 10))
+        self._ref_var = tk.BooleanVar(value=False)
+        self._ref_chk = ttk.Checkbutton(conn, text="Ext 10 MHz",
+                                        variable=self._ref_var,
+                                        command=self._apply_reference)
+        self._ref_chk.pack(side='left', padx=(0, 6))
+        self._ref_btn = ttk.Button(conn, text="Check lock",
+                                   command=self._check_lock)
+        self._ref_btn.pack(side='left', padx=(0, 2))
+        # Which AWG channel is cabled to the scope. The scope end comes from
+        # the Scope block's Channel field; the GUI cannot know the wiring, so
+        # both ends are stated explicitly in the log when the check runs.
+        ttk.Label(conn, text="AWG").pack(side='left')
+        self._ref_awgch = tk.StringVar(value="1")
+        ttk.Combobox(conn, textvariable=self._ref_awgch, values=["1", "2"],
+                     width=2, state='readonly').pack(side='left', padx=(2, 8))
+        self._ref_lbl = ttk.Label(conn, text="Ref: —", foreground='gray')
+        self._ref_lbl.pack(side='left', padx=(0, 16))
+
         tk.Button(conn, text="STOP ALL", command=self._stop,
                   bg='red', fg='white', font=('', 10, 'bold'),
                   relief='raised', padx=8).pack(side='right', padx=8)
+
+    # ── 10 MHz reference ──────────────────────────────────────────
+
+    def _apply_reference(self):
+        """Toggle the AWG between the external 10 MHz and its internal TCXO.
+
+        Wiring reminder: the 10 MHz goes to **REF IN**, the SMP connector
+        directly ABOVE the SMA CLK IN. Feeding CLK IN instead does nothing
+        (that input is only live once an external sample clock is selected).
+        """
+        want_ext = self._ref_var.get()
+        if not self.awg:
+            self._status(self._ref_lbl, "Ref: connect the AWG first", "red")
+            self._ref_var.set(not want_ext)
+            return
+
+        def work():
+            try:
+                if want_ext:
+                    self.awg.set_reference_external(10)
+                else:
+                    self.awg.set_reference_internal()
+            except Exception as e:
+                # set_reference_external raises when the firmware accepted the
+                # command but the readback disagrees -- usually nothing on
+                # REF IN.
+                print(f"reference: {e}\n")
+                self.root.after(0, lambda: self._ref_var.set(not want_ext))
+            self._refresh_reference()
+        self._thread(work)
+
+    def _refresh_reference(self):
+        """Read back what each instrument is actually using.
+
+        The AWG has NO lock query -- `:ROSC:SOUR?` reports what was accepted,
+        so EXT here means 'configured', not 'locked'; confirm a real lock with
+        check_reference.py. The scope does have one (`ROSc:STATe?`), and the
+        disagreement is the interesting case: an AWG on the OCXO while the
+        scope runs on its own clock is exactly the timebase-stretch problem
+        the shared reference exists to remove, and it is invisible otherwise.
+        """
+        def work():
+            awg_txt, scope_txt, colour = "—", "", "gray"
+            ext = locked = None
+            if self.awg:
+                try:
+                    st = self.awg.reference_status()
+                    ext = "EXT" in st["source"]
+                    awg_txt = f"AWG {st['source']}"
+                    if ext and st["freq_mhz"]:
+                        awg_txt += f" {st['freq_mhz']:g}M"
+                except Exception as e:
+                    awg_txt, colour = "AWG ?", "red"
+                    print(f"reference readback failed: {e}\n")
+            if self.scope:
+                try:
+                    sst = self.scope.reference_status()
+                    locked = sst["external"] and sst["locked"]
+                    scope_txt = f"  |  scope {sst['state'] or sst['source']}"
+                except Exception:
+                    scope_txt = "  |  scope ?"
+            if ext is True:
+                # orange = AWG on the OCXO but the scope is not; green = both.
+                colour = "orange" if locked is False else "green"
+            elif ext is False:
+                colour = "gray"
+            if ext is not None:
+                self.root.after(0, lambda v=ext: self._ref_var.set(v))
+            self._status(self._ref_lbl, f"Ref: {awg_txt}{scope_txt}", colour)
+        self._thread(work)
+
+    def _check_lock(self):
+        """Measure the AWG's clock error against the reference-locked scope.
+
+        This is the real lock test, and it needs no extra cabling: the scope's
+        timebase is on the OCXO, so it is a frequency standard, and whatever
+        AWG->scope connection you already use for measurements is enough. The
+        `Ext 10 MHz` checkbox only shows what the AWG ACCEPTED -- `:ROSC:SOUR?`
+        reads EXT whether or not a reference is actually present on REF IN.
+
+        Reconfigures both instruments (CW tone on the AWG, timebase and record
+        length on the scope), so it is a deliberate action, not a background
+        poll.
+        """
+        if not (self.awg and self.scope):
+            self._status(self._ref_lbl, "Ref: need AWG + scope", "red")
+            return
+
+        def work():
+            self._set_busy(True)
+            try:
+                awg_ch = int(self._ref_awgch.get())
+                sc_ch = int(self._chan_var.get())
+                print(f"lock check: AWG CH{awg_ch} -> scope CH{sc_ch} "
+                      f"(set the Scope block's Channel field if that is wrong)\n")
+                res = reflock.check_lock(
+                    self.awg, self.scope,
+                    awg_channel=awg_ch, scope_channel=sc_ch)
+                print(reflock.verdict_text(res) + "\n")
+                if not res["conclusive"]:
+                    colour = "orange"
+                else:
+                    colour = "green" if res["locked"] else "red"
+                self._status(
+                    self._ref_lbl,
+                    f"Ref: {res['ppm']:+.2f} ± {res['ppm_sd']:.2f} ppm",
+                    colour)
+            except Exception as e:
+                print(f"lock check failed: {e}\n")
+                self._status(self._ref_lbl, "Ref: check failed", "red")
+            finally:
+                self._set_busy(False)
+        self._thread(work)
 
     # ── AWG block ─────────────────────────────────────────────────
 
@@ -258,6 +397,31 @@ class LabGUI:
                 row=r, column=1, sticky='ew', padx=(4, 0), pady=1)
             self._timing_vars[name] = var
 
+        ttk.Separator(f, orient='horizontal').grid(row=5, column=0, columnspan=2,
+                                                   sticky='ew', pady=4)
+        # Marker output: the trigger anything averaged should use. Rigid to
+        # the waveform because it comes out of the same segment on the same
+        # clock, unlike the AWG's external trigger (3.6 ns of jitter).
+        self._mark_on = tk.BooleanVar(value=False)
+        ttk.Checkbutton(f, text="Marker out (trigger)", variable=self._mark_on,
+                        command=self._update_awg_info).grid(
+            row=6, column=0, columnspan=2, sticky='w')
+        row = ttk.Frame(f)
+        row.grid(row=7, column=0, columnspan=2, sticky='ew', pady=1)
+        ttk.Label(row, text="CH").pack(side='left')
+        self._mark_ch = tk.StringVar(value="1")
+        ttk.Combobox(row, textvariable=self._mark_ch, values=["1", "2"],
+                     width=3, state='readonly').pack(side='left', padx=(2, 6))
+        ttk.Label(row, text="M").pack(side='left')
+        self._mark_num = tk.StringVar(value="1")
+        ttk.Combobox(row, textvariable=self._mark_num,
+                     values=["1", "2", "3", "4"], width=3,
+                     state='readonly').pack(side='left', padx=(2, 6))
+        ttk.Label(row, text="width ns").pack(side='left')
+        self._mark_ns = tk.StringVar(value="100")
+        ttk.Entry(row, textvariable=self._mark_ns, width=6).pack(
+            side='left', padx=(2, 0))
+
         ttk.Separator(f, orient='horizontal').grid(row=10, column=0, columnspan=2,
                                                    sticky='ew', pady=5)
         self._timing_info = ttk.Label(f, text="", foreground='gray',
@@ -324,6 +488,40 @@ class LabGUI:
             if default is None:
                 raise
             return default
+
+    def _marker_cfg(self):
+        """Marker settings. `enabled` is the tick box; the rest stays valid
+        either way, so unticking can switch off the marker the user actually
+        selected instead of a hardcoded CH1 M1."""
+        return {"enabled": bool(self._mark_on.get()),
+                "channel": int(self._mark_ch.get()),
+                "marker": int(self._mark_num.get()),
+                "width_ns": max(self._fnum(self._mark_ns, 1.0, 100.0), 1.0)}
+
+    def _apply_marker(self, plan, mode, specs, cfg):
+        """Put the marker back after an upload, or switch it off.
+
+        Has to run after every Send: send_waveforms() starts with a *RST,
+        which deletes the segments the marker data lives in. The array length
+        follows the segment as :TRAC:DEF saw it -- 2*n_total uint16 for a DUC
+        (interleaved I/Q), n_total real samples in direct mode.
+        """
+        ch, num = cfg["channel"], cfg["marker"]
+        if not cfg["enabled"]:
+            try:
+                self.awg.marker_off(ch, num)
+            except Exception:
+                pass
+            return
+        if specs.get(ch, {}).get("kind", "off") == "off":
+            print(f"Marker: CH{ch} is switched off, so it has no segment to "
+                  f"carry a marker. Set CH{ch} to something, or move the "
+                  f"marker to the other channel.\n")
+            return
+        n_pts = 2 * plan["n_total"] if mode == "duc" else plan["n_total"]
+        frac = min(cfg["width_ns"] * 1e-9 / plan["period_s"], 0.95)
+        self.awg.marker_pulse(ch, segnum=ch, n_wave_points=n_pts,
+                              marker=num, high_frac=frac, level_vpp=1.0)
 
     def _timing(self):
         return {
@@ -461,6 +659,7 @@ class LabGUI:
             timing = self._timing()
             frac = self._window_frac()
             rate = None if mode == "duc" else self._clock_rate()
+            marker = self._marker_cfg()
         except Exception as e:
             print(f"Invalid AWG parameter: {e}\n")
             return
@@ -470,8 +669,10 @@ class LabGUI:
             try:
                 if rate:
                     self.awg.sample_rate = rate
-                self.awg.send_waveforms(specs, mode=mode, timing=timing,
-                                        rate=rate, window_frac=frac)
+                plan = self.awg.send_waveforms(specs, mode=mode,
+                                               timing=timing, rate=rate,
+                                               window_frac=frac)
+                self._apply_marker(plan, mode, specs, marker)
                 self._sent_baseband = {
                     ch: self._baseband_signature(ch, s) for ch, s in specs.items()}
                 print("Sent.\n")
@@ -955,6 +1156,7 @@ class LabGUI:
                 self.awg = AWG(sample_rate=self._clock_rate())
                 self._sent_baseband = {}
                 self._status(self._awg_lbl, "AWG: connected", "green")
+                self._refresh_reference()
             except Exception as e:
                 print(f"AWG connection failed: {e}\n")
                 self._status(self._awg_lbl, "AWG: error", "red")
@@ -966,6 +1168,7 @@ class LabGUI:
                 self.scope = Scope()
                 self.scope.setup(channel=int(self._chan_var.get()), n_averages=1)
                 self._status(self._scope_lbl, "Scope: connected", "green")
+                self._refresh_reference()
             except Exception as e:
                 print(f"Scope connection failed: {e}\n")
                 self._status(self._scope_lbl, "Scope: error", "red")

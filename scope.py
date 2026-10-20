@@ -10,6 +10,7 @@ class Scope:
     def __init__(self):
         self._lock = threading.Lock()
         self._pre = {}   # cached: xincr, ymult, yzero, rl (cleared on timebase change)
+        self._width = None   # bytes per returned sample; see get_waveform
         rm = pyvisa.ResourceManager()
         self._dev = rm.open_resource(_RESOURCE)
         self._dev.read_termination = '\n'
@@ -43,6 +44,78 @@ class Scope:
             # a stale reply was consumed as the IDN — drain again and retry
         print("Scope:", idn)
         self._dev.timeout = 10000
+
+    def reference_status(self):
+        """Is the scope's timebase locked to the external 10 MHz?
+
+        Unlike the Proteus, the MSO64B DOES expose a real lock state:
+        `ROSc:SOUrce?` -> INTERnal|EXTERnal and `ROSc:STATe?` -> LOCKED|
+        UNLOCKed (bench-confirmed 2026-10-19). Worth checking at connect
+        time: the setting is nonvolatile but `File > Default Setup` clears
+        it back to internal, and a silent fallback is invisible on screen
+        while costing 350-875 kHz of line position at 350 GHz.
+
+        Returns {'source': str, 'state': str, 'external': bool,
+                 'locked': bool}.
+        """
+        with self._lock:
+            src = self._dev.query("ROSc:SOUrce?").strip().upper()
+            try:
+                state = self._dev.query("ROSc:STATe?").strip().upper()
+            except Exception:
+                state = ""
+        return {"source": src, "state": state,
+                "external": src.startswith("EXT"),
+                "locked": state.startswith("LOCK")}
+
+    def aux_out_source(self):
+        """What the rear AUX OUT connector is currently emitting."""
+        with self._lock:
+            return self._dev.query("AUXout:SOUrce?").strip().upper()
+
+    def set_aux_out(self, source="REFOut"):
+        """Choose what the rear AUX OUT connector emits.
+
+        REFOut    10 MHz reference clock, derived from whichever reference
+                  the timebase is using. With the scope locked to the
+                  external OCXO this is a buffered copy of it -- which is
+                  how a reference gets onto a scope channel for the AWG beat
+                  test without spending a third splitter arm.
+        ATRIGger  a pulse on each A-trigger event. Power-on default.
+
+        Bench-probed 2026-10-19: only those two are accepted on this unit.
+        REFerence / REFCLK / CLOCK / AFG all return ESR=32 and are ignored
+        (no AFG option fitted). Equivalent UI path is
+        Utility > I/O > AUX OUT > Reference Clock.
+
+        Levels: >=1.0 V high, <=0.25 V low into 50 ohm (~0.75-1.0 Vpp), so a
+        scope channel at 50 ohm and ~200 mV/div shows it comfortably.
+        """
+        expect = {"REFOUT": "REFOUT", "ATRIGGER": "ATRIGGER",
+                  "ATRIG": "ATRIGGER"}.get(source.upper())
+        if expect is None:
+            raise ValueError(
+                f"{source!r}: valid values on this unit are REFOut and ATRIGger")
+        with self._lock:
+            self._dev.write("*CLS")
+            self._dev.write(f"AUXout:SOUrce {source}")
+            got = self._dev.query("AUXout:SOUrce?").strip().upper()
+            esr = self._dev.query("*ESR?").strip()
+        if got != expect:
+            raise RuntimeError(
+                f"AUX OUT not set: asked {source!r}, reads {got!r} (ESR={esr})")
+        return got
+
+    def require_external_reference(self):
+        """Raise unless the timebase is locked to the external reference."""
+        st = self.reference_status()
+        if not (st["external"] and st["locked"]):
+            raise RuntimeError(
+                f"scope is NOT locked to the external 10 MHz: "
+                f"ROSc:SOUrce?={st['source']!r} ROSc:STATe?={st['state']!r}. "
+                "Acquisition badge > Timebase Reference Source > External "
+                "(1 ppm). A File > Default Setup clears this.")
+        return st
 
     def setup(self, channel=1, n_averages=1, trigger_channel=None, trigger_level=0.0,
               trigger_mode="AUTO", trigger_slope="RISe"):
@@ -131,7 +204,32 @@ class Scope:
             for ch in range(1, n_channels + 1):
                 self._dev.write(f"SELect:CH{ch} {'ON' if ch in wanted else 'OFF'}")
 
-    def set_max_sample_rate(self, capture_seconds):
+    def save_state(self):
+        """Snapshot the few settings a measurement helper is likely to
+        disturb, so it can hand the scope back as it found it. Channel
+        display states are included because turning the others off to chase
+        a sample-rate tier is rude if the user was watching them."""
+        with self._lock:
+            st = {"horiz_mode": self._dev.query("HORizontal:MODE?").strip(),
+                  "scale": self._dev.query("HORizontal:MODE:SCAle?").strip(),
+                  "reclen": self._dev.query("HORizontal:MODE:RECOrdlength?").strip(),
+                  "trig_src": self._dev.query("TRIGger:A:EDGE:SOUrce?").strip(),
+                  "display": {ch: self._dev.query(f"SELect:CH{ch}?").strip()
+                              for ch in (1, 2, 3, 4)}}
+        return st
+
+    def restore_state(self, st):
+        """Put back what save_state() captured."""
+        with self._lock:
+            for ch, on in st["display"].items():
+                self._dev.write(f"SELect:CH{ch} {'ON' if on in ('1', 'ON') else 'OFF'}")
+            self._dev.write(f"HORizontal:MODE {st['horiz_mode']}")
+            self._dev.write(f"HORizontal:MODE:RECOrdlength {st['reclen']}")
+            self._dev.write(f"HORizontal:MODE:SCAle {st['scale']}")
+            self._dev.write(f"TRIGger:A:EDGE:SOUrce {st['trig_src']}")
+        self._pre.clear()
+
+    def set_max_sample_rate(self, capture_seconds, interpolate=2.0):
         """Force MANUAL horizontal mode with sample rate pinned at the
         scope's maximum, and record length sized to capture exactly
         `capture_seconds` at whatever that maximum turns out to be --
@@ -149,14 +247,36 @@ class Scope:
         automatically and silently override it. MANUAL mode is what makes
         both settings actually hold.
 
-        Returns the achieved sample rate (Hz), queried after requesting MAX
-        rather than assumed, so this adapts automatically if the channel
-        count or scope model changes what "max" actually is.
+        `interpolate` multiplies the real-time ceiling. The ADC here runs at
+        25 GS/s, but asking for 50 GS/s measurably IMPROVES shot-to-shot
+        coherence -- 0.9860 against 0.9612 at 2.25 GHz, bench-measured
+        2026-10-20 -- because the interpolated samples land on a finer grid
+        relative to the trigger, and the scope's averager stacks on that
+        grid. The extra samples carry no new information and double the
+        bytes, so pass interpolate=1.0 when transfer time matters more than
+        the last percent of coherence.
+
+        Returns the achieved sample rate (Hz), queried after setting it
+        rather than assumed.
         """
         self._pre.clear()
         with self._lock:
             self._dev.write("HORizontal:MODE MANual")
-            self._dev.write("HORizontal:MODE:SAMPLERate MAX")
+            # "SAMPLERate MAX" is NOT accepted on this firmware -- it raises a
+            # command error (ESR 32) and is silently ignored, so this used to
+            # leave the rate at whatever the previous session had set and
+            # return that, which looked exactly like a successful maximise.
+            # Bench-found 2026-10-20 after it quietly ran a measurement at
+            # 6.25 GS/s. ACQuire:MAXSamplerate? gives the real-time ceiling
+            # (25 GS/s on this unit); writing a huge number is no good either,
+            # because the scope happily accepts 2500 GS/s of INTERPOLATED
+            # samples.
+            try:
+                top = float(self._dev.query("ACQuire:MAXSamplerate?"))
+            except Exception:
+                top = float(self._dev.query("HORizontal:SAMPLERate?"))
+            want = top * max(float(interpolate), 1.0)
+            self._dev.write(f"HORizontal:MODE:SAMPLERate {want:.0f}")
             rate = float(self._dev.query("HORizontal:SAMPLERate?"))
             record_length = max(int(round(capture_seconds * rate)), 1)
             self._dev.write(f"HORizontal:MODE:RECOrdlength {record_length}")
@@ -183,14 +303,84 @@ class Scope:
         with self._lock:
             self._dev.write(f"HORizontal:POSition {percent:.0f}")
 
-    def get_waveform(self, channel=1, max_points=10000):
-        """Read current waveform buffer without stopping acquisition.
+    def get_waveform(self, channel=1, max_points=10000, fresh=False,
+                     acq_timeout=10.0, absolute_time=False, width=None):
+        """Read the waveform buffer.
 
         Preamble (xincr, ymult, yzero, record length) is cached and reused across
         calls until the timebase changes — saves 4 queries per live-view frame.
+
+        channel may be an int (1-4) or a source name such as "MATH1" or
+        "REF1", which is how an on-screen math average is read back rather
+        than recomputed here.
+
+        fresh=False (default) reads whatever is in the buffer without arming an
+        acquisition. That is right for live view, and WRONG for anything that
+        needs independent shots: if the scope is not currently triggering, every
+        call returns the IDENTICAL stale frame. Verified 2026-10-19 — five
+        consecutive calls returned byte-identical arrays, which silently faked a
+        coherence of exactly 1.000 in a shot-to-shot phase measurement.
+
+        fresh=True arms exactly one acquisition and waits for it to complete
+        (same handshake as measure_vpp), so successive calls really are
+        successive shots. Use it for averaging, coherence, or any statistics
+        over repeats. It raises on timeout rather than handing back a stale
+        frame, because a silent stale frame is the failure mode that matters.
+
+        absolute_time=True puts t=0 at the TRIGGER instant instead of at the
+        first sample, using WFMOutpre:XZEro -- queried every call and never
+        cached, because it is the one preamble field that legitimately changes
+        shot to shot. The trigger interpolator places the trigger BETWEEN two
+        samples, so without this correction each shot's time origin is
+        quantised to the sample grid; at 800 MHz and 12.5 GS/s that alone is
+        +-23 deg of apparent shot-to-shot phase. Required for coherence or any
+        phase statistic, irrelevant for amplitude and live view.
+
+        width is bytes per returned sample (DATa:WIDth). The default of 1 is
+        8 bits, which is BELOW this scope's own ADC and far below what an
+        averaged record holds: measured 2026-10-20, a 64-average read at
+        width 1 came back bit-identical across a quiet stretch -- RMS exactly
+        0.000 mV -- because every sample truncated to the same code, making
+        the noise improvement from averaging invisible. Pass width=2 for
+        anything where sub-LSB detail matters (averaging, noise, SNR). The
+        preamble's ymult/yzero follow the width, so the volts are right
+        either way; the cache is cleared whenever the width changes.
         """
+        if width is not None and width != self._width:
+            with self._lock:
+                self._dev.write(f"DATa:WIDth {int(width)}")
+            self._width = int(width)
+            self._pre.clear()       # ymult/yzero scale with the width
+        if fresh:
+            with self._lock:
+                self._dev.write("ACQuire:STATE STOP")
+                self._dev.write("ACQuire:STOPAfter SEQuence")
+                self._dev.write("ACQuire:STATE RUN")
+                deadline = time.perf_counter() + acq_timeout
+                while time.perf_counter() < deadline:
+                    if self._dev.query("ACQuire:STATE?").strip() in (
+                            '0', '0.0', 'STOP', 'STOPPED'):
+                        break
+                    time.sleep(0.005)
+                else:
+                    self._dev.write("ACQuire:STOPAfter RUNSTop")
+                    self._dev.write("ACQuire:STATE RUN")
+                    raise RuntimeError(
+                        f"no trigger within {acq_timeout:.0f} s on the configured "
+                        "source — refusing to return a stale frame")
+                self._pre.clear()       # force a fresh preamble for this shot
         with self._lock:
-            self._dev.write(f"DATa:SOUrce CH{channel}")
+            src = channel if isinstance(channel, str) else f"CH{channel}"
+            # The preamble is per SOURCE, not just per timebase: ymult/yzero
+            # differ between channels at different V/div, and a MATH source
+            # returns volts directly (ymult 1.0) rather than ADC codes.
+            # Reusing one source's scaling for another silently returns a
+            # waveform scaled by the wrong factor -- MATH1 read straight
+            # after CH3 came back as 0.0 mVpp that way.
+            if self._pre.get('src') != src:
+                self._pre.clear()
+                self._pre['src'] = src
+            self._dev.write(f"DATa:SOUrce {src}")
             self._dev.write("DATa:ENCdg ASCIi")
             self._dev.write("DATa:STARt 1")
             if 'xincr' not in self._pre:
@@ -201,8 +391,17 @@ class Scope:
             pts = min(max_points, self._pre['rl'])
             self._dev.write(f"DATa:STOP {pts}")
             raw_str = self._dev.query("CURVe?")
-        raw = np.array([int(x) for x in raw_str.split(',')])
-        time_s    = np.arange(len(raw)) * self._pre['xincr']
+            # per-shot, never cached: this is the sub-sample trigger position
+            xzero = (float(self._dev.query("WFMOutpre:XZEro?"))
+                     if absolute_time else 0.0)
+            if fresh:                       # back to free-running for live view
+                self._dev.write("ACQuire:STOPAfter RUNSTop")
+                self._dev.write("ACQuire:STATE RUN")
+        # float, not int: CH sources return integer codes but MATH returns
+        # floating point, and dtype=float on the split list is also quicker
+        # than a per-sample Python int().
+        raw = np.array(raw_str.split(','), dtype=float)
+        time_s    = xzero + np.arange(len(raw)) * self._pre['xincr']
         voltage_v = raw * self._pre['ymult'] + self._pre['yzero']
         return time_s, voltage_v
 

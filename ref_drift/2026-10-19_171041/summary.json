@@ -1,0 +1,27 @@
+{
+  "started": "2026-10-19_171041",
+  "minutes": 1.2,
+  "n_pairs": 3,
+  "awg_channel": 2,
+  "scope_channel": 3,
+  "n_reps_per_point": 3,
+  "states": {
+    "int": {
+      "n": 3,
+      "mean_ppm": 0.04005548404073522,
+      "wander_sd_ppm": 0.014482976227702863,
+      "range_ppm": 0.028958744587489114,
+      "noise_floor_ppm": 0.022064568383419737,
+      "wander_over_noise": 0.6563906429543391
+    },
+    "ext": {
+      "n": 3,
+      "mean_ppm": 0.02214614182162301,
+      "wander_sd_ppm": 0.022877565723063892,
+      "range_ppm": 0.044096313193501636,
+      "noise_floor_ppm": 0.022673900094956206,
+      "wander_over_noise": 1.0089823818246861
+    }
+  },
+  "int_over_ext_wander": 0.6330645665286814
+}

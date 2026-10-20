@@ -54,6 +54,10 @@ class AWG:
         self._active_seg = {}
         self._sweep_amp  = {}        # tracks last :VOLT sent per channel during sweep
         self._rate_sent  = {}        # last :FREQ:RAST actually sent per channel
+        self._duc_n_total = {}       # complex samples per DUC buffer, per channel
+        self._ref_cfg = None         # (freq_mhz, bypass) once an external ref
+                                     # is requested; re-applied after every *RST
+        self._byp_supported = None   # None=unprobed, False=absent on this fw
         self._lock = threading.Lock()
         rm = pyvisa.ResourceManager()
         self._dev = rm.open_resource(_RESOURCE)
@@ -90,31 +94,182 @@ class AWG:
         if errs:
             raise RuntimeError(f"AWG error after {context}: {'; '.join(errs)}")
 
-    def set_reference_external(self, freq_mhz=10):
-        """Lock the AWG's clock to an external 10/100 MHz reference (e.g.
-        the scope's REF OUT) instead of its own internal 1 ppm TCXO.
+    # ── 10 MHz reference ──────────────────────────────────────────────
+    @staticmethod
+    def _rosc_freq_mhz(raw):
+        """Normalise a :ROSC:FREQ? reply ('10M', '1e7', '10000000') to MHz."""
+        s = raw.strip().upper().replace("HZ", "").replace(" ", "")
+        if s.endswith("M"):
+            s = s[:-1]
+        else:
+            try:
+                v = float(s)
+            except ValueError:
+                return None
+            return v / 1e6 if v > 1e3 else v
+        try:
+            return float(s)
+        except ValueError:
+            return None
 
-        Needs a physical cable: scope REF OUT (BNC) -> AWG REF IN (BNC).
-        Without this, even software-aligned averaging
-        (chirp_quality.align_and_average()) can only correct a constant
-        per-shot time OFFSET between AWG and scope -- independent,
-        unsynchronized clocks also drift the whole waveform's timebase
-        slightly differently on every shot (worse at higher frequency,
-        since more phase accumulates per ppm of clock mismatch over the
-        same duration), which a simple time-shift alignment cannot undo.
-        Sharing one reference removes that drift at the source.
+    def _query_bypass_locked(self):
+        """Read :ROSC:BYP?, or None if this firmware has no such command.
+
+        CONFIRMED ABSENT on fw 1.237.0 (bench, 2026-10-19): the query gets no
+        reply at all, times out after the full 10 s, and leaves
+        '208, syntax error in scpi' in the queue. :ROSC:BYPass only appears in
+        Programming Manual rev 1.6. So probe at most once, with a short
+        timeout, and remember the answer.
         """
-        freq_kw = {10: "10M", 100: "100M"}[freq_mhz]
+        if self._byp_supported is False:
+            return None
+        old = self._dev.timeout
+        try:
+            self._dev.timeout = 1500
+            val = self._dev.query(":ROSC:BYP?").strip().upper()
+            self._byp_supported = True
+            return val
+        except Exception:
+            self._byp_supported = False
+            return None
+        finally:
+            self._dev.timeout = old
+            for _ in range(10):     # clear the queued syntax error
+                try:
+                    if self._dev.query(":SYST:ERR?").startswith("0"):
+                        break
+                except Exception:
+                    break
+
+    def _reference_status_locked(self):
+        src = self._dev.query(":ROSC:SOUR?").strip().upper()
+        raw = self._dev.query(":ROSC:FREQ?").strip()
+        return {"source": src, "freq_raw": raw,
+                "freq_mhz": self._rosc_freq_mhz(raw),
+                "bypass": self._query_bypass_locked()}
+
+    def reference_status(self):
+        """What reference the AWG is CONFIGURED to use.
+
+        There is no lock-status query on this instrument, so this reports
+        what was accepted, NOT whether the PLL actually acquired. Confirm a
+        real lock on the bench with check_reference.py.
+        """
         with self._lock:
-            self._cmd(":ROSC:SOUR EXT")
-            self._cmd(f":ROSC:FREQ {freq_kw}")
+            return self._reference_status_locked()
+
+    def set_reference_external(self, freq_mhz=10, bypass=None):
+        """Lock the AWG's clock to the external 10 MHz reference.
+
+        Bench chain (as built 2026-10-14): Wenzel 501-27501-11 OCXO ->
+        ZX10R-2-183-S+ 2-way splitter -> 6 dB pad -> AWG REF IN (SMP,
+        50 ohm AC coupled, 0.6-1.7 Vpp window; the pad lands ~0.98 Vpp
+        there). The other splitter arm feeds the scope's rear Ref In, so
+        both instruments run off one timebase.
+
+        Two separate things this buys, worth not conflating:
+          * ABSOLUTE frequency accuracy, set by this instrument's reference
+            alone. The internal TCXO's 1-2.5 ppm is 350-875 kHz of line
+            position at 350 GHz after the x24 chain -- it shifts every line
+            equally and so survives every internal consistency check.
+          * AWG<->scope COHERENCE, set by the DIFFERENCE between the two
+            clocks. chirp_quality.align_and_average() can only remove a
+            constant per-shot time OFFSET; independent clocks also STRETCH
+            the timebase differently shot to shot, and no time-shift
+            alignment can undo that. It has to die in hardware.
+
+        :ROSC:FREQ is sent FIRST, deliberately: it defaults to 100M, so
+        switching the source first leaves the PLL hunting for a 100 MHz
+        input that is not on the cable. Both settings are read back
+        afterwards because fw 1.237.0 accepts and silently ignores some
+        commands (see the :SOUR:IQM trap in _duc_upload_ch).
+
+        Order no longer matters: `*RST` restores :ROSC:SOUR to its INT
+        default, but every reset in this file goes through _reset_locked(),
+        which re-applies and re-verifies whatever was requested here. Call it
+        once and it stays.
+
+        bypass: NOT AVAILABLE on this unit. :ROSC:BYPass appears only in
+        Programming Manual rev 1.6; fw 1.237.0 answers the query with a
+        timeout and '208, syntax error in scpi' (bench-confirmed 2026-10-19).
+        Passing bypass= raises rather than hanging. Left in place for a
+        future firmware.
+        """
+        with self._lock:
+            got = self._apply_reference_locked(freq_mhz, bypass)
+            self._ref_cfg = (freq_mhz, bypass)
+        byp = f", BYP {got['bypass']}" if got["bypass"] else ""
+        print(f"AWG reference: EXT {freq_mhz} MHz{byp} "
+              f"(configured; lock itself is not queryable)")
+        return got
+
+    def _apply_reference_locked(self, freq_mhz, bypass=None):
+        """Send and verify the external-reference settings. Caller holds _lock."""
+        freq_kw = {10: "10M", 100: "100M"}[freq_mhz]
+        self._cmd(f":ROSC:FREQ {freq_kw}")          # MUST precede :ROSC:SOUR
+        self._cmd(":ROSC:SOUR EXT")
+        if bypass is not None:
+            if self._byp_supported is None:
+                self._query_bypass_locked()         # probe once
+            if self._byp_supported is False:
+                raise RuntimeError(
+                    ":ROSC:BYPass does not exist on this firmware (1.237.0) -- "
+                    "it was added in Programming Manual rev 1.6. Call "
+                    "set_reference_external() without bypass=.")
+            self._cmd(f":ROSC:BYP {'ON' if bypass else 'OFF'}")
+        got = self._reference_status_locked()
+        ok_freq = (got["freq_mhz"] is not None
+                   and abs(got["freq_mhz"] - freq_mhz) < 0.01)
+        if "EXT" not in got["source"] or not ok_freq:
+            raise RuntimeError(
+                f"external reference NOT applied: :ROSC:SOUR? -> {got['source']!r}, "
+                f":ROSC:FREQ? -> {got['freq_raw']!r} "
+                f"(wanted EXT / {freq_mhz} MHz). Is the 10 MHz cable on REF IN?")
+        return got
+
+    def set_reference_internal(self):
+        """Back to the internal TCXO (1-2.5 ppm).
+
+        Mainly for the INT/EXT toggle test: a static readback cannot tell
+        'locked' apart from 'command ignored', but watching the beat against
+        the reference start and stop can.
+        """
+        with self._lock:
+            # Clear the remembered request FIRST. Otherwise _reset_locked()
+            # and _ensure_reference_locked() keep re-asserting the external
+            # reference behind your back -- which silently invalidated the
+            # INT-vs-EXT control measurement on 2026-10-19 (both read 0 ppm
+            # because "internal" was never actually internal).
+            self._ref_cfg = None
+            self._cmd(":ROSC:SOUR INT")
+            got = self._reference_status_locked()
+        if "INT" not in got["source"]:
+            raise RuntimeError(
+                f"internal reference NOT applied: :ROSC:SOUR? -> {got['source']!r}")
+        print("AWG reference: INT (internal TCXO, 1-2.5 ppm)")
+        return got
+
+    def _reset_locked(self, opc=False):
+        """`*CLS; *RST` plus everything a reset silently clears. Holds _lock.
+
+        *RST returns :ROSC:SOUR to its INT default, so EVERY reset drops an
+        external reference lock. Six paths in this file reset inline instead
+        of going through _setup(), and each one was quietly un-locking the
+        AWG mid-measurement -- `duc_cw_setup()` among them, which is what the
+        GUI calls for every DUC send. Route all resets through here.
+        """
+        self._dev.write("*CLS; *RST")
+        time.sleep(0.5)
+        if opc:
+            self._dev.query("*OPC?")
+        self._rate_sent.clear()
+        if self._ref_cfg is not None:
+            self._apply_reference_locked(*self._ref_cfg)
 
     def _setup(self, channel=1, reset=True, sample_rate=None):
         rate = sample_rate if sample_rate is not None else self.sample_rate
         if reset:
-            self._dev.write("*CLS; *RST")
-            time.sleep(0.5)
-            self._rate_sent.clear()
+            self._reset_locked()
         self._cmd(f":INST:CHAN {channel}")
         # A previous DUC run leaves the channel in DUC mode (survives reset=False),
         # where real waveforms would be misread as interleaved I/Q — force DIRect.
@@ -146,10 +301,132 @@ class AWG:
         self._drain_errs(f"TRAC:DATA (segment {segnum})")
         print("  OK    TRAC:DATA")
 
+    # ── markers ───────────────────────────────────────────────────────
+    MARKER_POINTS_PER_BYTE = 8      # 9 GS/s model: 1 marker byte per 8 points
+
+    @staticmethod
+    def _marker_format(rate, marker):
+        """(waveform points per marker byte, byte value for 'high').
+
+        BENCH-DETERMINED 2026-10-19 at BOTH operating points, and the manual
+        is wrong about both of them.
+
+        Manual Table 8.1 claims bit0..3 = M1..M4 with bits 4-7 "N/A". In fact
+        **each byte holds TWO marker points**: low nibble bits0-3 = M1..M4 for
+        the first point, high nibble bits4-7 = the same four for the second.
+        Setting only bit0 gives a ~0.89 ns sub-pulse per byte and adjacent
+        "high" bytes do NOT merge -- 16 bytes of 0x01 came out as 16 separate
+        0.89 ns pulses 1.8 ns apart. 0x11 merges them into one clean pulse.
+
+        Manual S8.3.1/S8.3.2 also give different points-per-byte for the
+        9 GS/s and 2.5 GS/s models. Measured, the rule is the same for both:
+        **marker bytes = (:TRAC:DEF length) / 4.**
+            2.5 GS/s Direct : 2048-point segment -> 512 bytes, 1.6 ns each
+            9   GS/s DUC    : 8192-long  segment -> 2048 bytes, 1.8 ns each
+        In DUC that works out as one marker point per complex baseband sample
+        (0.889 ns = 8 DAC samples), which matches the known 8-sample marker
+        granularity. Too short an array misbehaves badly rather than erroring:
+        1024 bytes where 2048 were needed produced a single 1.85 us pulse.
+
+        `rate` is kept in the signature for the day a model or mode breaks
+        this unified rule; it is currently unused.
+        """
+        return 4, (1 << (marker - 1)) | (1 << (marker - 1 + 4))
+
+    def marker_pulse(self, channel, segnum, n_wave_points, marker=1,
+                     high_frac=0.05, delay_bytes=0, level_vpp=1.0,
+                     offset_v=0.0, enable=True, points_per_byte=None):
+        """Put a start-of-segment pulse on `marker` of `channel`.
+
+        This is the trigger coherent averaging needs: the marker is played
+        from the same segment memory, on the same sample clock, as the
+        waveform -- so it is phase-rigid to the output even when the AWG's
+        own trigger jitters (3.6 ns on this model). The scope triggers on it
+        instead of on the RF, which removes cycle ambiguity entirely.
+
+        IMPORTANT -- markers belong to the CHANNEL'S segment. A marker on CH1
+        is rigid to whatever CH1 is playing, NOT to CH2. Put the marker on the
+        same channel as the signal, or configure both channels inside one
+        reset so their segments stay aligned.
+
+        n_wave_points is the segment length in the units :TRAC:DEF was given.
+        Format (Desktop Manual ch.8, 9 GS/s model): one marker byte per eight
+        waveform points, bit0=M1, bit1=M2, bit2=M3, bit3=M4, bits 4-7 unused.
+
+        UNVERIFIED IN DUC MODE: a DUC/IQM-ONE segment is defined with
+        2*n_total uint16 (interleaved I/Q), and the manual does not say
+        whether "waveform points" there means the complex samples or the
+        uint16 count. That is a factor of two in pulse position and width.
+        Override `points_per_byte` (8 or 16) once the bench says which.
+
+        high_frac: fraction of the segment the pulse stays high.
+        delay_bytes: whole marker-bytes of delay from segment start; each is
+        `points_per_byte` samples. Sub-byte trim is :MARK:DEL:FINE, not this.
+        """
+        ppb, high_val = self._marker_format(self.sample_rate, marker)
+        if points_per_byte:
+            ppb = points_per_byte
+        n_bytes = int(n_wave_points) // ppb
+        if n_bytes < 1:
+            raise ValueError(
+                f"segment of {n_wave_points} points gives no marker bytes at "
+                f"{ppb} points/byte")
+        n_high = max(int(round(n_bytes * high_frac)), 1)
+        bit = high_val
+        data = np.zeros(n_bytes, dtype=np.uint8)
+        start = int(delay_bytes) % n_bytes
+        idx = (np.arange(n_high) + start) % n_bytes
+        data[idx] = bit
+
+        with self._lock:
+            self._cmd(f":INST:CHAN {channel}")
+            self._cmd(f":TRAC:SEL {segnum}")
+            self._cmd(f":MARK:SEL {marker}")
+            self._cmd(f":MARK:VOLT:PTOP {level_vpp:.3f}")
+            self._cmd(f":MARK:VOLT:OFFS {offset_v:.3f}")
+            raw = data.tobytes()
+            nb = str(len(raw))
+            self._dev.write_raw(f":MARK:DATA #{len(nb)}{nb}".encode() + raw + b"\n")
+            time.sleep(0.2)
+            self._drain_errs(f"MARK:DATA (CH{channel} M{marker}, seg {segnum})")
+            self._cmd(f":MARK {'ON' if enable else 'OFF'}")
+        print(f"  marker CH{channel} M{marker}: {n_bytes} bytes, "
+              f"{n_high} high ({high_frac*100:.1f}%), {level_vpp} Vpp, "
+              f"{'ON' if enable else 'OFF'}")
+        return {"n_bytes": n_bytes, "n_high": n_high,
+                "points_per_byte": ppb, "bit": bit}
+
+    def marker_off(self, channel, marker=1):
+        """Disable a marker output without touching its data."""
+        with self._lock:
+            self._cmd(f":INST:CHAN {channel}")
+            self._cmd(f":MARK:SEL {marker}")
+            self._cmd(":MARK OFF")
+
+    def _ensure_reference_locked(self):
+        """Re-assert the external reference if the configuration cleared it.
+
+        Entering 9 GS/s DIRECT mode (interleaved DACs, CH2 disabled) resets
+        :ROSC back to INT/100M. Measured 2026-10-19: setting the reference
+        BEFORE that configuration survives 0/3, setting it AFTER survives
+        3/3. 2.5 GS/s Direct and 9 GS/s DUC never clear it. So the reference
+        has to be re-checked at the END of a configuration sequence, not just
+        after *RST. Cheap: two queries, and it only writes when it has to.
+        Caller holds _lock.
+        """
+        if self._ref_cfg is None:
+            return
+        want_mhz = self._ref_cfg[0]
+        st = self._reference_status_locked()
+        if "EXT" in st["source"] and st["freq_mhz"] is not None                 and abs(st["freq_mhz"] - want_mhz) < 0.01:
+            return
+        self._apply_reference_locked(*self._ref_cfg)
+
     def _play(self, amplitude_vpp=0.5, segnum=1):
         self._cmd(f":FUNC:MODE:SEGM {segnum}")
         self._cmd(f":VOLT {amplitude_vpp:.3f}")
         self._cmd(":OUTP ON")
+        self._ensure_reference_locked()
 
     @property
     def freq_step_hz(self):
@@ -511,7 +788,7 @@ class AWG:
                             f"output would alias")
 
     def send_waveforms(self, specs, mode="duc", timing=None, rate=None,
-                       window_frac=0.05, verbose=True):
+                       window_frac=0.05, verbose=True, coherent=True):
         """Play one spec per channel, both built into ONE shared buffer period.
 
         mode='duc'    : 9 GS/s DAC clock, X8 interpolation (1.125 GS/s complex
@@ -522,9 +799,20 @@ class AWG:
         mode='direct' : real samples at `rate` (defaults to 2.5 GS/s whenever a
                         second channel is active — one DAC per channel).
 
-        Returns the plan dict: period, window sample counts, and the per-channel
+        coherent=True (DUC only) puts every carrier on the grid that makes
+        the output repeat buffer to buffer, which is what coherent averaging
+        needs -- the DUC NCO free-runs and is not reset at segment start, so
+        an off-grid carrier randomises the phase of every shot. For a GATED
+        waveform this is free: the baseband is shifted by the same residual
+        and the absolute frequency is held exactly. For a CONTINUOUS one the
+        output moves by up to half a grid step (grid = 1/period), which is
+        unavoidable. Set coherent=False for a measurement that wants an exact
+        frequency and does not care about shot-to-shot phase, e.g. a
+        chain-response sweep. See _snap_specs_to_grid.
+
+        Returns the plan dict: period, window sample counts, the per-channel
         info (including the frequency actually produced after integer-cycle
-        snapping) so a caller can display what the hardware was really told.
+        snapping), and plan["coherent_grid"] recording any carrier that moved.
         """
         mode  = mode.lower()
         specs = {int(ch): dict(s or {"kind": "off"}) for ch, s in specs.items()}
@@ -548,6 +836,18 @@ class AWG:
 
         self._check_limits(mode, active, rate_eff)
         plan = self._plan_timing(mode, timing, rate_eff)
+        # Must run AFTER the period is known and BEFORE the samples are
+        # built, so a shifted baseband is actually the one uploaded.
+        plan["rate_dac"] = rate_dac
+        plan["coherent_grid"] = (
+            self._snap_specs_to_grid(active, plan, verbose)
+            if (mode == "duc" and coherent) else [])
+        plan["grid_hz"] = (self.coherent_step_hz(
+            plan["n_total"], rate_dac, int(round(rate_dac / rate_eff)))
+            if mode == "duc" else None)
+        if plan["coherent_grid"]:
+            # the baseband moved, so Nyquist/NCO headroom has to be re-checked
+            self._check_limits(mode, active, rate_eff)
         built = {ch: self._build_channel(mode, s, plan, window_frac)
                  for ch, s in active.items()}
         plan["channels"] = {ch: info for ch, (_, info) in built.items()}
@@ -580,10 +880,7 @@ class AWG:
 
         with self._lock:
             if mode == "duc":
-                self._dev.write("*CLS; *RST")
-                time.sleep(0.5)
-                self._dev.query("*OPC?")
-                self._rate_sent.clear()
+                self._reset_locked(opc=True)
                 if verbose:
                     # Confirms the DUC/IQM option is actually installed on this unit.
                     print(f"  *OPT? -> {self._dev.query('*OPT?').strip()!r}")
@@ -636,11 +933,19 @@ class AWG:
         moving the carrier costs milliseconds instead of the seconds a
         *RST + re-upload takes. The baseband keeps playing untouched, which
         means the chirp SHAPE is preserved and only its centre moves.
+
+        NOTE ON THE COHERENT GRID: send_waveforms() snaps each carrier onto
+        the achievable grid and shifts that channel's baseband to compensate.
+        This path cannot do the second half -- the baseband is already in
+        segment memory -- so a carrier handed here is used exactly as given
+        and may well be off grid, which costs shot-to-shot phase. It warns
+        when that happens. Re-send rather than retune when the result is
+        going to be averaged.
         """
         amplitudes = amplitudes or {}
         for ch, f in carriers.items():
             self.duc_cw_step(float(f), channel=int(ch),
-                             amplitude_vpp=amplitudes.get(ch))
+                             amplitude_vpp=amplitudes.get(ch), warn_grid=True)
         return carriers
 
     def send_chirp_with_lo(self, f_start_hz, f_stop_hz, chirp_us, dead_us,
@@ -788,6 +1093,9 @@ class AWG:
              garbled multi-tone real waveform instead of a clean carrier.
         """
         int_kw = {2: "X2", 4: "X4", 8: "X8"}[round(rate / rate_cx)]
+        # One warning site covering every DUC path; silent when on grid.
+        self._warn_off_grid(ncof, len(data_u16) // 2, rate,
+                            round(rate / rate_cx), ch)
         self._cmd(f":INST:CHAN {ch}")
         self._cmd(":MODE DUC")
         self._dev.write(f":SOUR:INT {int_kw}")   # known-spurious err 22
@@ -804,13 +1112,20 @@ class AWG:
         self._cmd(":INIT:CONT ON")
         self._upload(data_u16, segnum=segnum)
         self._cmd(f":FUNC:MODE:SEGM {segnum}")
+        if not 0 < amp <= self.MAX_VPP:
+            raise ValueError(
+                f"CH{ch} amplitude {amp:.3f} Vpp is outside this unit's "
+                f"0.001-{self.MAX_VPP} Vpp range; the instrument would reject "
+                f"the write and silently keep the previous level")
         self._cmd(f":VOLT {amp:.3f}")
+        self._duc_n_total[ch] = len(data_u16) // 2
         self._cmd(":NCO:SIXD1 ON")
         self._cmd(f":NCO:CFR1 {ncof:.0f}")
         self._cmd(":OUTP ON")
+        self._ensure_reference_locked()
 
     def send_cw_direct_sync(self, freq_hz, amplitude_vpp=0.5,
-                            sync_pulse_ns=40, sync_amp_vpp=0.8):
+                            sync_pulse_ns=40, sync_amp_vpp=0.5):
         """Direct-mode CW on CH1 + sync pulse on CH2 (2.5 GS/s dual). Returns actual Hz."""
         rate = SAMPLE_RATE_DUAL
         if freq_hz > rate / 2:
@@ -834,7 +1149,7 @@ class AWG:
         return actual
 
     def send_chirp_direct_sync(self, f_start_hz, f_stop_hz, chirp_us, dead_us,
-                               amplitude_vpp=0.5, sync_pulse_ns=40, sync_amp_vpp=0.8,
+                               amplitude_vpp=0.5, sync_pulse_ns=40, sync_amp_vpp=0.5,
                                window_frac=0.05):
         """Direct-mode windowed chirp on CH1 + sync pulse on CH2 (2.5 GS/s dual).
         Returns chirp active duration (s)."""
@@ -858,14 +1173,36 @@ class AWG:
         return n_chirp / rate
 
     def send_cw_duc_sync(self, carrier_hz, amplitude_vpp=0.5, n_total=4096,
-                         sync_pulse_ns=40, sync_amp_vpp=0.8, sync_carrier_hz=None):
+                         sync_pulse_ns=40, sync_amp_vpp=0.5, sync_carrier_hz=None,
+                         coherent=True):
         """DUC/IQM-ONE CW on CH1 (pure carrier at carrier_hz) + gated-burst sync on
-        CH2 at buffer start (9 GS/s DAC, X8). Returns carrier_hz."""
+        CH2 at buffer start (9 GS/s DAC, X8). Returns the carrier ACTUALLY used.
+
+        coherent=True snaps the carrier to the 1/period grid so its phase
+        repeats shot to shot. The baseband here is a constant, so there is
+        nothing to absorb the residual with and the output really does move,
+        by up to half a grid step -- for n_total=4096 that is up to 137 kHz.
+        Pass a larger n_total for a finer grid, or coherent=False when an
+        exact frequency matters more than shot-to-shot phase.
+        """
         rate = 9e9
         rate_cx = rate / 8.0
         n_total = max(int(np.ceil(n_total / 32)) * 32, 64)   # 2*n_total multiple of 64
         n_pulse = max(int(sync_pulse_ns * 1e-9 * rate_cx), 1)
+        step = self.coherent_step_hz(n_total, rate, 8)
+        if coherent:
+            snapped, residual = self.snap_duc_carrier(carrier_hz, n_total,
+                                                      rate, 8)
+            if abs(residual) > self.GRID_TOL_HZ:
+                print(f"  [grid {step/1e3:.3f} kHz] carrier "
+                      f"{carrier_hz/1e6:.6f} -> {snapped/1e6:.6f} MHz "
+                      f"({residual:+.1f} Hz); a constant baseband cannot "
+                      f"absorb this, the output moves")
+                carrier_hz = snapped
         sync_carrier = sync_carrier_hz if sync_carrier_hz is not None else carrier_hz
+        if coherent:
+            sync_carrier = self.snap_duc_carrier(sync_carrier, n_total,
+                                                 rate, 8)[0]
 
         # CH1: constant complex baseband (I=1,Q=0) -> pure carrier via NCO.
         ch1 = self._iq_to_u16(np.ones(n_total), np.zeros(n_total))
@@ -875,7 +1212,7 @@ class AWG:
         print(f"[DUC CW] CH1 {carrier_hz/1e6:.4f} MHz  "
               f"CH2 burst {n_pulse/rate_cx*1e9:.1f} ns @ {sync_carrier/1e6:.1f} MHz")
         with self._lock:
-            self._dev.write("*CLS; *RST"); time.sleep(0.5); self._dev.query("*OPC?")
+            self._reset_locked(opc=True)
             self._rate_sent.clear()
             self._cmd(":INST:CHAN 1"); self._cmd(":TRAC:DEL:ALL")
             self._duc_upload_ch(1, 1, ch1, carrier_hz, rate, rate_cx, amplitude_vpp)
@@ -884,6 +1221,227 @@ class AWG:
             self._active_seg[2] = 2
         return carrier_hz
 
+    # -- DUC phase-coherent carrier grid ------------------------------
+    #
+    # BENCH-MEASURED 2026-10-20 (run_marker_coherence.py, run_nco_resolution.py).
+    #
+    # The DUC NCO free-runs: it is NOT reset at segment start. The baseband
+    # buffer repeats every T = n_total / (rate/interp), so the OUTPUT repeats
+    # shot to shot only if the carrier fits a whole number of cycles into that
+    # buffer. Measured at 808.59 MHz, 25 shots spread over 60 s, triggered on
+    # the AWG's own marker:
+    #     on grid    coherence 0.998   (99.8% of amplitude survives averaging)
+    #     100 kHz off          0.208   (the random-phase floor for 25 shots)
+    # so this is not a refinement, it is the difference between averaging
+    # working and not working at all.
+    #
+    # The NCO quantises its tuning word to 9e9 / 2^32 = 2.095 Hz (measured:
+    # coherence holds for a request up to 1.0 Hz off a grid point and dies by
+    # 1.5 Hz, bracketing q/2). Every grid point is k * rate / (interp*n_total),
+    # which for a power-of-two n_total is exactly representable in that word,
+    # and the integer-Hz ':NCO:CFR1 %.0f' write rounds by at most 0.5 Hz --
+    # less than q/2 -- so it always lands back on the grid point. Writing
+    # whole Hz is therefore safe; asking for an off-grid carrier is not.
+    #
+    # Note what this does NOT allow: moving a CW carrier off the grid by
+    # putting the remainder in the baseband. A baseband tone must itself
+    # repeat in the buffer, so it can only sit on the same grid. For a CHIRP
+    # it does work -- the baseband chirp is a transient, not a periodic tone,
+    # so its start/stop can be shifted by the residual while the buffer still
+    # repeats exactly. Finer CW spacing needs a LONGER buffer, nothing else.
+
+    # The grid is just "a whole number of carrier cycles per buffer period",
+    # so it is 1/period. Everything below restates that in different units.
+    # DIRECT mode needs none of it: there the whole waveform lives in the
+    # buffer and repeats by construction. Only the DUC has a carrier running
+    # free underneath the buffer.
+    # A carrier that averages coherently has to satisfy TWO conditions, and
+    # the second one is easy to miss.
+    #
+    #   1. BUFFER GRID. The NCO free-runs and is not reset at segment start,
+    #      so the output only repeats if the carrier fits a whole number of
+    #      cycles into the buffer:  f = k * rate_cx / n_total.
+    #   2. NCO WORD. The carrier must also be a value the NCO can actually
+    #      hold. Measured 2026-10-20: the tuning quantum is 2.095 Hz, i.e.
+    #      rate / 2**32 (coherence survives a request 1.0 Hz off a grid point
+    #      and dies by 1.5 Hz, bracketing q/2; 2**31 and 2**33 are both ruled
+    #      out).
+    #
+    # Writing n_total = 2**a * d with d odd, condition 2 forces k to be a
+    # multiple of d, so the ACHIEVABLE carrier spacing is
+    #
+    #       rate_cx / 2**a        NOT rate_cx / n_total
+    #
+    # These are equal only when n_total is a power of two. They diverge
+    # violently otherwise: the default CP-FTMW timing gives n_total = 12512 =
+    # 2**5 * 391, where the buffer grid is 89.9 kHz but the achievable step is
+    # 35.2 MHz. Snapping to the buffer grid there leaves up to 1.05 Hz of
+    # unrepresentable residual, which walks a full cycle of phase in about a
+    # second and destroys any average longer than that.
+    #
+    # Coarse is not a problem for a GATED waveform -- the baseband absorbs the
+    # whole residual and the absolute frequency is held exactly. It only
+    # limits a CONTINUOUS tone. Use a power-of-two n_total when a CW carrier
+    # needs fine placement.
+    #
+    # DIRECT mode needs none of this: the whole waveform lives in the buffer
+    # and repeats by construction. Only the DUC has a carrier running free
+    # underneath it.
+    # Instrument-queried 2026-10-20: ":VOLT? MAX" is 0.55 on this unit in
+    # BOTH direct and DUC mode. Asking for more returns "204, data out of
+    # range in scpi" and the amplitude silently stays where it was -- the
+    # sync-burst defaults were 0.8 Vpp and had been failing exactly that way.
+    MAX_VPP = 0.55
+
+    NCO_BITS = 32         # measured 2026-10-20; q = 9 GS/s / 2**32 = 2.095 Hz
+    GRID_TOL_HZ = 1.0     # under q/2 -> the NCO lands on the grid point anyway
+
+    @staticmethod
+    def nco_step_hz(rate=9e9):
+        """The NCO's own frequency quantum."""
+        return rate / 2 ** AWG.NCO_BITS
+
+    @staticmethod
+    def buffer_grid_hz(n_total, rate=9e9, interp=8):
+        """Carrier spacing that repeats buffer to buffer, ignoring the NCO."""
+        return (rate / interp) / n_total
+
+    @staticmethod
+    def coherent_step_hz(n_total, rate=9e9, interp=8):
+        """Spacing of carriers that are on the buffer grid AND representable.
+
+        Equals buffer_grid_hz() when n_total is a power of two, and is
+        coarser by the odd part of n_total otherwise.
+        """
+        n = int(n_total)
+        a = (n & -n).bit_length() - 1              # power of two dividing n
+        a = min(a, AWG.NCO_BITS - 3)               # interp 8 = 2**3
+        return (rate / interp) / 2 ** a
+
+    @staticmethod
+    def snap_duc_carrier(freq_hz, n_total, rate=9e9, interp=8):
+        """Nearest ACHIEVABLE coherent carrier. Returns (snapped, residual).
+
+        residual = asked minus achievable. For a GATED waveform add it to the
+        baseband and the absolute frequency is preserved exactly; for a
+        CONTINUOUS one there is nothing to add it to and the output moves.
+        """
+        step = AWG.coherent_step_hz(n_total, rate, interp)
+        snapped = round(freq_hz / step) * step
+        return snapped, freq_hz - snapped
+
+    @staticmethod
+    def duc_grid_hz(n_total, rate=9e9, interp=8):
+        """Deprecated alias for coherent_step_hz()."""
+        return AWG.coherent_step_hz(n_total, rate, interp)
+
+    @staticmethod
+    def _warn_off_grid(freq_hz, n_total, rate=9e9, interp=8, ch=None):
+        """Warn if a DUC carrier will not repeat shot to shot.
+
+        Called from _duc_upload_ch so it covers EVERY DUC path rather than
+        the few that remember to check. Silent once the carrier is on the
+        achievable grid, which is the normal case after snapping.
+        """
+        snapped, residual = AWG.snap_duc_carrier(freq_hz, n_total, rate, interp)
+        if abs(residual) <= AWG.GRID_TOL_HZ:
+            return
+        step = AWG.coherent_step_hz(n_total, rate, interp)
+        where = f"CH{ch} " if ch is not None else ""
+        print(f"  !! {where}carrier {freq_hz/1e6:.6f} MHz is {residual:+.1f} Hz"
+              f" off the {step/1e3:.3f} kHz achievable coherent grid -- its"
+              " phase will NOT repeat shot to shot and coherent averaging"
+              f" will cancel it. Nearest usable carrier {snapped/1e6:.6f} MHz.")
+
+    def _snap_specs_to_grid(self, active, plan, verbose=True):
+        """Put every DUC carrier on the achievable coherent grid, in place.
+
+        The carrier moves onto coherent_step_hz(), and the SAME residual is
+        then subtracted back out in the baseband, so the output frequency
+        stays where it was asked for. How exactly depends on the channel:
+
+          GATED (chirp or burst) -- windowed to zero at both ends, so it
+            never wraps and its baseband frequency is unconstrained. The
+            absolute frequency is held EXACTLY, whatever the carrier did.
+
+          CONTINUOUS -- the buffer wraps, so _build_channel snaps the
+            baseband to a whole cycle count. That is the buffer grid, which
+            is FINER than the achievable carrier step whenever n_total is not
+            a power of two. Carrier on the coarse grid plus baseband on the
+            fine grid still repeats, so the output lands on the fine buffer
+            grid: residual error at most half of buffer_grid_hz(), not half
+            of the carrier step. This is why the residual is pushed into the
+            baseband here rather than left in the carrier -- with the default
+            CP-FTMW timing it is the difference between a 45 kHz error and a
+            17.6 MHz one.
+
+        Double sideband is the exception: carrier+f and carrier-f cannot both
+        be held by one shift, so it is snapped and left uncompensated.
+
+        Returns a list of per-channel dicts recording what moved, including
+        output_error_hz -- how far the output really ended up from the
+        request, which is 0 for every gated channel.
+        """
+        n_total = plan["n_total"]
+        rate_eff = plan["rate_eff"]
+        rate_dac = plan.get("rate_dac", self.DUC_DAC_RATE)
+        interp = int(round(rate_dac / rate_eff))
+        step = self.coherent_step_hz(n_total, rate_dac, interp)
+        buf = self.buffer_grid_hz(n_total, rate_dac, interp)
+        if verbose and step > buf * 1.5:
+            print(f"  [grid] n_total {n_total} is not a power of two, so only "
+                  f"every {round(step/buf)}th buffer-grid point is a usable "
+                  f"carrier:\n         carrier step {step/1e6:.3f} MHz, "
+                  f"buffer grid {buf/1e3:.1f} kHz. The baseband takes up the "
+                  f"difference.")
+        report = []
+        for ch in sorted(active):
+            spec = active[ch]
+            carrier = float(spec.get("carrier_hz", 0.0))
+            if carrier == 0.0:
+                continue
+            snapped, residual = self.snap_duc_carrier(carrier, n_total,
+                                                      rate_dac, interp)
+            if abs(residual) <= self.GRID_TOL_HZ:
+                continue
+            kind = spec.get("kind", "off")
+            sideband = spec.get("sideband", "upper")
+            gated = spec.get("gate", "continuous") != "continuous"
+            spec["carrier_hz"] = snapped
+
+            shift, err = 0.0, -residual
+            if sideband in ("upper", "lower"):
+                shift = residual if sideband == "upper" else -residual
+                if kind == "chirp":
+                    spec["f_start_hz"] = float(spec.get("f_start_hz", 0.0)) + shift
+                    spec["f_stop_hz"] = float(spec.get("f_stop_hz", 0.0)) + shift
+                    err = 0.0
+                else:
+                    f_new = float(spec.get("freq_hz", 0.0)) + shift
+                    spec["freq_hz"] = f_new
+                    # A continuous tone gets rounded to a whole cycle count by
+                    # _build_channel; that rounding is the only error left.
+                    err = 0.0 if gated else (
+                        self.snap_continuous(f_new, n_total, rate_eff) - f_new)
+            report.append({"channel": ch, "carrier_asked_hz": carrier,
+                           "carrier_hz": snapped, "residual_hz": residual,
+                           "compensated": shift != 0.0,
+                           "baseband_shift_hz": shift,
+                           "output_error_hz": err})
+            if verbose:
+                if not shift:
+                    tail = (f"DSB cannot be compensated, output moves "
+                            f"{-residual:+.1f} Hz")
+                elif err == 0.0:
+                    tail = "baseband shifted, output frequency held exactly"
+                else:
+                    tail = (f"baseband shifted; continuous, so the output "
+                            f"lands on the {buf/1e3:.1f} kHz buffer grid "
+                            f"({err:+.1f} Hz)")
+                print(f"  [grid {step/1e3:.3f} kHz] CH{ch} carrier "
+                      f"{carrier/1e6:.6f} -> {snapped/1e6:.6f} MHz "
+                      f"({residual:+.1f} Hz); {tail}")
+        return report
     def duc_cw_setup(self, freq_hz, amplitude_vpp=0.5, channel=1, n_total=4096):
         """One-time DUC/IQM-ONE CW setup for an NCO-stepped frequency sweep.
 
@@ -903,7 +1461,7 @@ class AWG:
         print(f"[DUC CW sweep] CH{channel} start {freq_hz/1e6:.4f} MHz  "
               f"(9 GS/s DAC, X8, NCO-stepped)")
         with self._lock:
-            self._dev.write("*CLS; *RST"); time.sleep(0.5); self._dev.query("*OPC?")
+            self._reset_locked(opc=True)
             self._rate_sent.clear()
             self._cmd(f":INST:CHAN {channel}"); self._cmd(":TRAC:DEL:ALL")
             self._duc_upload_ch(channel, 1, ch1, freq_hz, rate, rate_cx, amplitude_vpp)
@@ -939,7 +1497,7 @@ class AWG:
         print(f"[DUC CW dual] CH1+CH2 both {freq_hz/1e6:.4f} MHz "
               f"(CH2 = monitor copy of CH1)")
         with self._lock:
-            self._dev.write("*CLS; *RST"); time.sleep(0.5); self._dev.query("*OPC?")
+            self._reset_locked(opc=True)
             self._rate_sent.clear()
             self._cmd(":INST:CHAN 1"); self._cmd(":TRAC:DEL:ALL")
             self._duc_upload_ch(1, 1, data, freq_hz, rate, rate_cx, amplitude_vpp)
@@ -948,7 +1506,60 @@ class AWG:
             self._active_seg[2] = 2
         return freq_hz
 
-    def duc_cw_step(self, freq_hz, channel=1, amplitude_vpp=None):
+    def duc_iq_setup_dual(self, i_arr, q_arr, carrier_hz, amplitude_vpp=0.5):
+        """Upload the SAME arbitrary complex baseband to CH1 and CH2, one reset.
+
+        Built for FID-style transient tests: CH2 carries the signal and CH1 is
+        an aligned copy whose only job is to clock the marker. Both segments
+        have to be the same length, or they loop at different rates and the
+        marker walks relative to the signal.
+
+        i_arr/q_arr are the complex baseband, each scaled to +-1, at
+        rate/interp = 1.125 GS/s. The length must be a multiple of 32.
+
+        The CARRIER must sit on the coherent grid (duc_grid_hz) or the output
+        will not repeat shot to shot. A TRANSIENT baseband -- one that has
+        decayed to zero before the buffer ends -- may sit anywhere, because it
+        never has to join up across the buffer boundary. That is what lets a
+        FID be placed at an arbitrary absolute frequency and still average
+        coherently, and it is the one case where the grid residual really can
+        be pushed into the baseband. A CW baseband tone cannot do this.
+        """
+        rate = 9e9
+        rate_cx = rate / 8.0
+        i_arr = np.asarray(i_arr, dtype=float)
+        q_arr = np.asarray(q_arr, dtype=float)
+        if i_arr.size != q_arr.size:
+            raise ValueError("I and Q must be the same length")
+        n_total = int(i_arr.size)
+        if n_total % 32 or n_total < 64:
+            raise ValueError(f"baseband length {n_total} must be a multiple "
+                             f"of 32 and at least 64")
+        if not 0 < carrier_hz <= rate / 2:
+            raise ValueError(f"{carrier_hz/1e6:.1f} MHz outside DUC NCO range "
+                             f"(0-{rate/2e9:g} GHz]")
+        peak = float(max(np.abs(i_arr).max(), np.abs(q_arr).max()))
+        if peak > 1.0 + 1e-9:        # tolerate float roundoff
+            raise ValueError(f"baseband peaks at {peak:.3f}; scale to +-1 "
+                             f"before upload or it will clip")
+        data = self._iq_to_u16(i_arr, q_arr)
+        print(f"[DUC IQ dual] CH1+CH2 carrier {carrier_hz/1e6:.4f} MHz, "
+              f"{n_total} complex samples = {n_total/rate_cx*1e6:.4f} us buffer")
+        with self._lock:
+            self._reset_locked(opc=True)
+            self._rate_sent.clear()
+            self._cmd(":INST:CHAN 1")
+            self._cmd(":TRAC:DEL:ALL")
+            self._duc_upload_ch(1, 1, data, carrier_hz, rate, rate_cx,
+                                amplitude_vpp)
+            self._active_seg[1] = 1
+            self._duc_upload_ch(2, 2, data, carrier_hz, rate, rate_cx,
+                                amplitude_vpp)
+            self._active_seg[2] = 2
+        return carrier_hz
+
+    def duc_cw_step(self, freq_hz, channel=1, amplitude_vpp=None,
+                    warn_grid=False):
         """Retune the NCO carrier of a channel prepared by duc_cw_setup().
 
         Only :NCO:CFR1 changes — the constant baseband keeps playing. *OPC?
@@ -966,6 +1577,14 @@ class AWG:
         if not 0 < freq_hz <= 4.5e9:
             raise ValueError(f"{freq_hz/1e6:.1f} MHz outside DUC NCO range "
                              f"(0–4.5 GHz]")
+        # This path only moves the NCO -- the baseband already in segment
+        # memory cannot be re-shifted, so an off-grid carrier here really
+        # is off grid. Silent by default because frequency sweeps step
+        # this hundreds of times and do not care about shot-to-shot
+        # phase; retune() turns it on, which is the interactive route.
+        if warn_grid and channel in self._duc_n_total:
+            self._warn_off_grid(freq_hz, self._duc_n_total[channel],
+                                self.DUC_DAC_RATE, self.DUC_INTERP, channel)
         with self._lock:
             self._dev.write(f":INST:CHAN {channel}")
             self._dev.write(f":NCO:CFR1 {freq_hz:.0f}")
@@ -1037,7 +1656,7 @@ class AWG:
               f"{n_total/rate_cx*1e6:.3f} us), depth {depth_db:.2f} dB p-p "
               f"(m={m:.4f}), peak {amplitude_vpp:.4f} Vpp")
         with self._lock:
-            self._dev.write("*CLS; *RST"); time.sleep(0.5); self._dev.query("*OPC?")
+            self._reset_locked(opc=True)
             self._rate_sent.clear()
             self._cmd(f":INST:CHAN {channel}"); self._cmd(":TRAC:DEL:ALL")
             self._duc_upload_ch(channel, 1, data, carrier_hz, rate, rate_cx,
@@ -1051,16 +1670,47 @@ class AWG:
 
     def send_chirp_duc_sync(self, f_carrier_chirp_hz, f_start_bb_hz, f_stop_bb_hz,
                             chirp_us, dead_us, amplitude_vpp=0.5, window_frac=0.05,
-                            sync_pulse_ns=40, sync_amp_vpp=0.8, sync_carrier_hz=None):
+                            sync_pulse_ns=40, sync_amp_vpp=0.5, sync_carrier_hz=None,
+                            coherent=True):
         """DUC/IQM-ONE analytic chirp on CH1 + gated-burst sync on CH2 at buffer
-        start (9 GS/s DAC, X8). Returns chirp active duration (s)."""
+        start (9 GS/s DAC, X8). Returns chirp active duration (s).
+
+        coherent=True snaps the carrier to the grid that makes the output
+        repeat buffer to buffer (1/period) and shifts the baseband span by the
+        same residual, so the chirp still sweeps exactly the absolute
+        frequencies asked for. The chirp is windowed to zero at both ends and
+        never wraps, so nothing constrains its baseband -- this correction is
+        free. Without it the free-running NCO randomises the carrier phase of
+        every shot and coherent averaging cancels the FID (measured
+        2026-10-20: 0.998 on grid against 0.21-0.37 off it).
+        """
         rate = 9e9
         rate_cx = rate / 8.0
         n_chirp = round(chirp_us * 1e-6 * rate_cx)
         n_dead  = round(dead_us  * 1e-6 * rate_cx)
         n_total = max(int(np.ceil((n_chirp + n_dead) / 32)) * 32, 64)
         n_pulse = max(int(sync_pulse_ns * 1e-9 * rate_cx), 1)
+        step = self.coherent_step_hz(n_total, rate, 8)
+
+        if coherent:
+            snapped, residual = self.snap_duc_carrier(f_carrier_chirp_hz,
+                                                      n_total, rate, 8)
+            if abs(residual) > self.GRID_TOL_HZ:
+                # upper sideband (exp(+j.phase)), so output = carrier + baseband
+                f_start_bb_hz += residual
+                f_stop_bb_hz += residual
+                print(f"  [grid {step/1e3:.3f} kHz] carrier "
+                      f"{f_carrier_chirp_hz/1e6:.6f} -> {snapped/1e6:.6f} MHz "
+                      f"({residual:+.1f} Hz); baseband shifted, chirp span "
+                      f"held exactly")
+                f_carrier_chirp_hz = snapped
         sync_carrier = sync_carrier_hz if sync_carrier_hz is not None else f_carrier_chirp_hz
+        if coherent:
+            # CH2's burst has a DC baseband, so there is nothing to shift --
+            # its carrier just snaps. It is a sync pulse; its exact frequency
+            # does not matter, but its phase repeating does.
+            sync_carrier = self.snap_duc_carrier(sync_carrier, n_total,
+                                                 rate, 8)[0]
 
         # CH1: analytic (single-sideband) windowed chirp.
         t = np.arange(n_chirp, dtype=np.float64) / rate_cx
@@ -1078,7 +1728,7 @@ class AWG:
               f"{(f_carrier_chirp_hz+f_stop_bb_hz)/1e6:.1f} MHz  active {n_chirp/rate_cx*1e6:.3f} us  "
               f"period {n_total/rate_cx*1e6:.3f} us  CH2 burst {n_pulse/rate_cx*1e9:.1f} ns")
         with self._lock:
-            self._dev.write("*CLS; *RST"); time.sleep(0.5); self._dev.query("*OPC?")
+            self._reset_locked(opc=True)
             self._rate_sent.clear()
             self._cmd(":INST:CHAN 1"); self._cmd(":TRAC:DEL:ALL")
             self._duc_upload_ch(1, 1, ch1, f_carrier_chirp_hz, rate, rate_cx, amplitude_vpp)
