@@ -748,3 +748,83 @@ K and combine in software with the conjugate phases.
 6. **Throughput is still unmeasured.** Only the *phase* half of the
    scope-vs-PC averaging question is settled (§5). Transfer rates, ASCII vs
    binary and FastFrame all remain open.
+
+### 24. The envelope ripple is a reflection (pad test), and the delay was wrong
+
+2026-10-23. `run_pad_test.py`, chirp 2.0-2.5 GHz, 3.4 us, 0.5 Vpp, 50 GS/s,
+16 hardware averages, **5 independent repeats per condition**, AWG CH2 ->
+scope CH3 direct, marker CH1 M1 -> CH4. Vertical scale pinned at 65.4 mV/div
+across both runs: the front-end attenuator setting changes the scope's input
+match, which is one of the two reflection coefficients being measured, so it
+must not move between conditions.
+
+| | no pad | 7 dB pad |
+|---|---|---|
+| ripple depth | 0.7563 +- 0.0013 dB pp | 0.1890 +- 0.0010 dB pp |
+| G1.G2 | 0.04351 | 0.01088 |
+| round-trip delay | 5.9484 +- 0.0072 ns | 5.9606 +- 0.0042 ns |
+| direct signal | 376.7 +- 2.7 mVpp | 170.9 +- 0.6 mVpp |
+| tilt | -3.42 dB/GHz | -3.54 dB/GHz |
+
+**It is a reflection.** The pad measures 6.87 dB in band (from the direct
+signal, not from its label), so a pure through-path reflection predicts a
+13.73 dB round-trip change; measured 12.04 dB.
+
+**The 1.69 dB shortfall is expected, and a pad test cannot avoid it.**
+Inserting a pad does not only attenuate the existing standing wave, it adds
+its own port reflection, and the resonance between that port and the far end
+never crosses the pad, so it is not suppressed. At a typical 20 dB pad return
+loss that term is of order 0.02, the same scale as the 0.01 discrepancy. A
+shortfall of this size is not evidence that part of the ripple is internal.
+
+The delay is the strongest evidence: 5.9484 vs 5.9606 ns, a 0.012 ns
+difference against 0.007 and 0.004 ns of scatter. Same physical path,
+attenuated.
+
+**Correction to 18-19: the round trip is 5.95 ns, not 7.39 ns.** The old
+number picked the peak FFT bin of the detrended envelope, and I quoted the bin
+width (2.5 ns) as the uncertainty. `ripple_fit()` in run_chirp_flatness.py now
+uses the FFT only to locate the ripple and takes the delay and depth from a
+least-squares sinusoid fit refined across +-1 bin. Repeat scatter is
+0.004-0.007 ns, about 400x tighter than the bin. Depth is now the fitted
+sinusoid amplitude rather than the detrended peak-to-peak, which had included
+everything else in the envelope.
+
+With the corrected delay the 50 cm cable nearly accounts for it:
+
+| | |
+|---|---|
+| 50 cm cable at VF 0.66 | 5.05 ns |
+| measured round trip | 5.95 ns |
+| left for instrument internals | 0.89 ns, about 9 cm each in the AWG output stage and the scope front end |
+
+Ordinary, where 7.39 ns demanded 2.6 ns and was not. If the two ports are
+comparable, each is about 13.6 dB return loss, VSWR 1.53 - normal for a bare
+instrument pair with no isolator.
+
+Cross-checks: the tilt is unchanged within 0.12 dB/GHz, so the pad is flat and
+the tilt is the chain's (DAC sinc + cable loss), not a mismatch. The no-pad
+detrended pp of 0.819 dB reproduces 19's 0.85 dB, so this replicates the
+earlier measurement - what the repeat bought was the pairing and the error
+bar, and that is what moved the delay.
+
+**Method note.** The first attempt sent the chirp with `send_chirp_duc_sync()`,
+which puts the chirp on AWG CH1 and a 40 ns sync burst on CH2. With CH2 cabled
+to scope CH3 the analysis fitted a "chirp" 0.035 us long sweeping
+2.2786-2.5846 GHz - entirely an artifact of a 40 ns constant tone at the
+carrier. Use `send_waveforms()` with the same chirp on both channels and CH1's
+RF off, as run_chirp_averaging.py does. The tell is a measured sweep that
+disagrees with what was programmed.
+
+### 25. Open / next
+
+1. **Cable swap (was item 23c) is now cheap and decisive.** At 0.01 ns
+   resolution, adding a known 50 cm gives the velocity factor directly from
+   the change, and T_cable = 2L/v then separates cable from internals with no
+   assumption about VF. This is the one remaining piece of item 23. Step (a),
+   widening the chirp, turned out not to be needed - the fit, not the span,
+   was what limited the delay.
+2. Re-run `run_phase_cycling.py` once the receiver is in place, so the 52 dB
+   residual becomes a real measure of chirp breakthrough and detector ringing.
+3. Rep rate: the buffer free-runs. Once the Quantum Composers sets global
+   timing the marker-to-shot relationship needs re-checking.
