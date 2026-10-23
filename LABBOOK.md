@@ -818,12 +818,23 @@ disagrees with what was programmed.
 
 ### 25. Open / next
 
-1. **Cable swap (was item 23c) is now cheap and decisive.** At 0.01 ns
-   resolution, adding a known 50 cm gives the velocity factor directly from
-   the change, and T_cable = 2L/v then separates cable from internals with no
-   assumption about VF. This is the one remaining piece of item 23. Step (a),
-   widening the chirp, turned out not to be needed - the fit, not the span,
-   was what limited the delay.
+1. ~~Cable swap (item 23c).~~ **DROPPED, and item 23 is closed.** It would
+   have split the 5.95 ns into cable and instrument internals, but that
+   standing wave exists only between an AWG and a scope with 50 cm of coax
+   between them - a bench-test configuration. In the instrument the AWG
+   drives the multiplier chain and the scope sees the receiver IF, so neither
+   port survives. Step (a), widening the chirp, was not needed either: the
+   fit, not the span, was what limited the delay.
+
+   What carries over is the **tilt, -3.42 dB/GHz**, which is the AWG's own
+   output response over 2.0-2.5 GHz (DAC sinc + cable loss) and not a
+   mismatch - the pad did not change it. That is about 1.4 dB of slope across
+   the chirp band presented to the first multiplier stage; how much it matters
+   depends on how hard that stage is driven. And the method: `run_pad_test.py`
+   plus `ripple_fit()` is chain-agnostic, so the same ~3 minute measurement
+   localises any later mismatch (between multiplier stages, at the filters, at
+   the mixer IF port) to better than 0.01 ns and says whether it is a
+   reflection.
 2. Re-run `run_phase_cycling.py` once the receiver is in place, so the 52 dB
    residual becomes a real measure of chirp breakthrough and detector ringing.
 3. Rep rate: the buffer free-runs. Once the Quantum Composers sets global
