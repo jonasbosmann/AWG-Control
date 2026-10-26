@@ -839,3 +839,64 @@ disagrees with what was programmed.
    residual becomes a real measure of chirp breakthrough and detector ringing.
 3. Rep rate: the buffer free-runs. Once the Quantum Composers sets global
    timing the marker-to-shot relationship needs re-checking.
+
+### 26. Plan for the week of 2026-10-26
+
+Three facts established 2026-10-26 that set this plan:
+
+- **Some** of the 2026-10-07 Mini-Circuits basket has arrived; which parts is
+  not recorded, so an inventory comes before any Phase 1 bench work.
+- The Quantum Composers pulse generator exists but is committed to the
+  ablation experiment.
+- That same experiment has a vacuum chamber and pulsed nozzle the
+  spectrometer could share.
+
+**The QC and the chamber are the same setup, so the QC is a scheduling
+constraint and not an availability one** - when the spectrometer sits on that
+chamber the QC is there too. In the meantime the AWG's own `:TRIG:TIMer`
+(200 ns - 2 s internal timed trigger) covers the rep-rate work. Item 25.3 was
+parked waiting on hardware that does not have to be waited for.
+
+**Mon-Tue: the acquisition architecture into production code.** Section 21
+established it - K phased chirp/FID cycles in one buffer, one marker,
+hardware-average the whole record across gas pulses, split into K, combine
+with conjugate phases - but it exists only inside `run_phase_cycling.py`.
+Promote `build_cycles()` into `awg.py` with its NCO de-rotation and its
+exact-time segment cutting (both were traps that cost a measurement each,
+section 21), add the scope-side counterpart, add split-and-combine.
+
+**Tue-Wed: rep rate.** `:INIT:CONT OFF` + `:TRIG:TIMer` to run at a real tens
+of Hz instead of free-running at 249 kHz, then re-check the marker-to-shot
+relationship there. This also rewrites section 22's throughput conclusion: at
+20 Hz the scope's 32 shots/s rearm is no longer the bottleneck, the gas pulse
+is, which changes whether FastFrame is worth its complexity. Re-derive with
+numbers rather than carrying the old framing forward.
+
+**Wed-Thu: the GUI FID panel.** The item deferred by the user 2026-10-14.
+Every precondition is now measured rather than assumed - marker trigger, grid
+snapping, and the scope-vs-PC averaging question. Acquire-FID -> N shots ->
+averaged FID -> spectrum, into the existing Analysis block.
+
+**Thu-Fri: parts.** Inventory against the `Parts list` sheet of
+assembly_parts_and_order_2026-10-07.xlsx first; it determines how far Phase 1
+runs. Then as far up steps 1.1-1.6 as the parts allow, thru-then-amp so pads
+and cables cancel. **Hard stop before 1.7** - the -6 dBm LO trim is a gate
+with a damage limit 4 dB above it, not a casual measurement.
+
+**Three things with lead times, any day, near-zero bench time:**
+
+1. **The ACST questions.** The internal IF amp's P1dB and overload recovery
+   time is the sole remaining determinant of dead time and has been open since
+   August. Also: is -2 dBm LO an operating max or a damage limit; is there DC
+   on the IF port; out-of-band input tolerance as a written dBc number.
+2. **The mm-wave detector for 310-370 GHz.** Hard gate before Phase 3 (step
+   3.2 is a standing safety rule - measure the power at the receive-horn
+   position before the MixAMC is ever in the beam, which is damaged at 0 dBm).
+   Nothing on hand, long lead time. Start the quote now.
+3. **Survey the chamber.** Optical access for a >=0.5 m free-space path,
+   window and flange options at 310-370 GHz, and the nozzle's trigger
+   interface.
+
+**Dropped:** further AWG-to-scope characterisation. Item 23 is closed, the
+bare bench is understood, and the next flatness measurement worth taking is
+through real hardware.
