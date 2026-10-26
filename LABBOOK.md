@@ -900,3 +900,77 @@ with a damage limit 4 dB above it, not a casual measurement.
 **Dropped:** further AWG-to-scope characterisation. Item 23 is closed, the
 bare bench is understood, and the next flatness measurement worth taking is
 through real hardware.
+
+### 27. Phase cycling moved into the AWG core and the GUI
+
+2026-10-26. Section 21's architecture -- K phased chirp/FID cycles in one
+buffer, one marker, hardware-average across gas pulses, split into K and
+recombine with the conjugate phases -- existed only inside
+`run_phase_cycling.py`. It is now a real capability of `send_waveforms()`
+and has a panel in the GUI.
+
+It went through the **core path**, not a parallel `send_phase_cycled()`, so
+grid snapping, `_check_limits`, the amplitude guard and the `2*n_total`
+marker alignment all apply unchanged. Two divergent send paths is what
+produced the CH1/CH2 mix-up on 2026-10-23.
+
+**`_plan_timing`** takes `timing["n_cycles"]`. The granularity round-up now
+lands on ONE cycle rather than the whole buffer, so every cycle starts on a
+boundary and `t_cycle` is exact; `n_total = n_cycle * n_cycles`.
+
+**`_build_channel`** lays K copies at `k*n_cycle`, each with a programmed
+phase. Two things it has to get right:
+
+- the phase goes **inside the phase argument**, not as a post-multiply.
+  Multiplying a real direct-mode waveform by `exp(i.phi)` and taking the
+  real part scales it by `cos(phi)` -- an amplitude error wearing a phase's
+  clothes. Inside the argument it is exact for every kind and both modes.
+- the free-running NCO's advance `2.pi.f_c.k.t_cycle` is subtracted, reduced
+  to a fraction of a turn first (it reaches ~1e5 turns, and carrying that in
+  radians throws away precision for nothing).
+
+`info["phases_emitted_rad"]` records the **emitted** phase, which a lower
+sideband inverts -- the recombination needs that, not the programmed one.
+
+**`phasecycle.py`** is new and shared by the GUI and the bench script, so
+there is one copy of the analysis. `split_cycles()` cuts at exact times and
+interpolates; it warns below ~20 samples per carrier cycle. `combine()`
+returns both the conjugate-phase and the straight sum, so the artifact level
+stays measured rather than assumed.
+
+**GUI**: a "Phase cycling" block under AWG spanning both columns (Scope and
+Analysis moved to row 2, sweep and Setup to row 3) with cycles, pattern
+(none / 2-step / 4-step / custom degrees), which channels to cycle, the
+analysis window, averages, sample rate and an Acquire button. Acquire
+configures the scope **from the plan that is actually playing** -- a record
+shorter than the buffer silently truncates the last cycles, and the Scope
+block cannot know the buffer length.
+
+Three things the GUI had been getting away with until now:
+
+- it called `get_waveform` with the default `fresh=False` everywhere. For an
+  averaged measurement that is the stale-frame trap from section 5 -- a
+  byte-identical frame returned with no error whenever the scope is not
+  triggering, which once reported a coherence of exactly 1.000 for a
+  completely broken setup. Acquire uses `fresh=True, width=2`.
+- the phase list now joins `_baseband_signature`, so Retune refuses after a
+  pattern change instead of playing the old shape at a new carrier.
+- **K must be a whole number of patterns.** A partial repetition leaves
+  `sum(exp(-i.phi))` unbalanced and the artifacts stop cancelling, which is
+  the entire point of cycling. The GUI warns, with the nearest good K.
+
+**`tests/test_phasecycle_build.py`** is new and runs with no instruments. It
+pins `_plan_timing`, asserts `_build_channel` is **bit-identical for K=1**
+against a recorded baseline across 8 spec variants in both modes, and checks
+the NCO de-rotation to 0.0001 deg. The de-rotation trap cost a measurement
+on 2026-10-20 and is now caught without a scope.
+
+Verified on the bench, both paths:
+
+| | cycled sum | correlations | artifacts | worst phase error |
+|---|---|---|---|---|
+| 2026-10-20 (bench script, old code) | 4.00x | ±1.000 | 52 dB | 0.0° |
+| `run_phase_cycling.py 4 2.0` | 4.00x | ±1.000 | **52.0 dB** | 0.1° |
+| through the GUI's own handlers | 4.00x | ±1.000 | **52.5 dB** | 0.1° |
+
+K=1 is unchanged and Retune correctly refuses after a phase change.
