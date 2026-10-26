@@ -974,3 +974,87 @@ Verified on the bench, both paths:
 | through the GUI's own handlers | 4.00x | ±1.000 | **52.5 dB** | 0.1° |
 
 K=1 is unchanged and Retune correctly refuses after a phase change.
+
+### 28. Phase cycling measured against injected artifacts
+
+2026-10-26, `run_phase_cycle_artifact.py`. Section 27 measured the artifacts
+that happened to be present, which on a bare AWG-to-scope path are already
+52 dB down -- so it proved the cycling does no harm, but not that it works.
+There was nothing to reject.
+
+So two artifacts of **known size and known coherence order** were injected
+into the same buffer as the chirp, placed outside its sweep so each could be
+measured by an exact complex projection with no contribution from the chirp:
+
+| | frequency | phase in cycle k | coherence order |
+|---|---|---|---|
+| chirp | 1.99-2.49 GHz | phi_k | m = +1 |
+| tone | 2.64 GHz | 0, every cycle | m = 0 |
+| tone | 1.84 GHz | -phi_k (an image) | m = -1 |
+
+both tones at 30% of the chirp. Writing a component's response to a chirp of
+phase phi as exp(i.m.phi), an N-step cycle passes order m only when m-1 is a
+multiple of N. Measured, 4 cycles, 50 GS/s, 16 averages:
+
+| pattern | chirp m=+1 | m=0 artifact | m=-1 image |
+|---|---|---|---|
+| no cycling | 4.00x | -0.0 dB | -0.0 dB |
+| 2-step | 4.00x | **-51.8 dB** | -0.0 dB |
+| 4-step | 4.00x | **-48.3 dB** | **-52.7 dB** |
+
+**The 2-step row is the one to read.** Its m = -1 column is identical to no
+cycling at all: the image -- a receiver I/Q imbalance or a folded mirror
+sideband -- passes untouched and adds coherently with the signal, so it does
+not look like an artifact. Use the 2-step on a bare bench where only
+breakthrough and ringing exist; use the 4-step once there is a receiver. The
+~-50 dB floor is the bench, not the method -- it matches the residual
+measured with nothing injected (section 27).
+
+**Correction to my own metric.** The raw gain column read 4.00 / 3.93 / 3.81
+and I nearly reported that as a loss of chirp. It is not: that metric divides
+by a single cycle which still *contains* both artifacts, so the denominator
+stays inflated as they are cancelled out of the numerator. Band-limited to
+the chirp band it is exactly 4.00x in all three cases. Both columns are
+printed now so the difference is visible rather than hidden.
+
+**A free cross-check.** The two tones were injected at identical amplitude
+and came back at 52.6 and 72.4 mV. Across the 0.80 GHz between them that is
+-3.46, -3.42 and -3.58 dB/GHz over three runs. The pad test of 2026-10-23
+(section 24) measured **-3.42 dB/GHz** by a completely different route -- the
+chirp envelope against instantaneous frequency. Two independent measurements
+of the AWG's output tilt agreeing to a few hundredths.
+
+**What phase cycling does NOT remove.** If the same molecules are hit by more
+than one chirp, consecutive chirps produce a Hahn echo carrying phase
+2.phi_k - phi_(k-1). De-rotating by phi_k leaves phi_k - phi_(k-1), which for
+a uniform N-step pattern is the **constant** 2.pi/N, so it adds coherently
+and no number of steps removes it -- 2-, 4- and 6-step all pass it at 1.00.
+Scrambling the order within a balanced set halves it to 0.53 while holding
+m = 0 and the image at exactly zero.
+
+There is a structural protection: with uniform spacing T the echo from chirps
+k-1 and k refocuses at 2t_k - t_(k-1) = t_(k+1), exactly when the next chirp
+fires, and the same holds for any pair. **In a rigidly uniform train every
+two-pulse echo lands under a later chirp and never inside a detect window**,
+which is an argument for never making the spacing adaptive.
+
+**Suitability for laser ablation is open and needs a sample.** With a ~30 us
+window the 4-step survives in nearly every timing scenario, so the pattern is
+not the problem; re-excitation is. At 560-1700 m/s through a 10-20 mm beam
+the transit is 6-36 us against a cycle of 1.4-6 us, so each molecule sees
+roughly 3-25 chirps. Test order when there is a sample: (a) stable gas first,
+vary K and plot the per-cycle amplitude `combine()` already reports -- flat is
+fine, a knee gives the usable K; (b) then ablation, separating the plume
+envelope from saturation by stepping the train's delay from the Q-switch,
+since the envelope moves with the delay and saturation does not; (c) break
+the uniform spacing on one cycle and look for an echo in a detect window.
+
+Also worth a number: on a 30 us window the dead time alone swings K by a
+factor of five, which is a factor of two in sensitivity. That is what the
+open ACST question about the MixAMC IF amp's overload recovery is worth.
+
+**Technical note:** `phase_cycling_2026-10-26.pdf`, 3 pages, also filed in
+Jonas/Promotion/LabBook/26-10-26. Built by `make_phase_cycling_note.py`; the
+selection numbers are computed at build time rather than quoted. The shared
+layout engine was lifted out of `make_nco_note.py` into `notestyle.py`, and
+the NCO note verified to rebuild with byte-identical text.
