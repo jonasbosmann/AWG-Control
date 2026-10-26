@@ -80,6 +80,11 @@ class LabGUI:
               "9 GS/s  (CH1 only)":  SAMPLE_RATE_SINGLE}
     WINDOWS = ("Rectangular", "Hann", "Hamming", "Blackman", "Kaiser")
     MAGNITUDES = ("dBV", "dBm (50 Ω)", "Linear (V)")
+    # Phase patterns, in degrees; the list repeats if K is longer than it.
+    PHASE_PATTERNS = {"None (all 0°)": [0.0],
+                      "2-step  0,180": [0.0, 180.0],
+                      "4-step  0,90,180,270": [0.0, 90.0, 180.0, 270.0],
+                      "Custom…": None}
 
     def __init__(self, root):
         self.root = root
@@ -96,6 +101,9 @@ class LabGUI:
         self._live_win     = None
         self._setup_photo  = None
         self._sent_baseband = {}  # ch -> baseband signature actually uploaded
+        self._last_plan    = None # plan dict from the last successful Send,
+                                  # so Acquire can set the scope up from the
+                                  # buffer that is actually playing
         # Builder methods need no connection, so an unconnected AWG can plan
         # and snap frequencies for the live preview labels.
         self._planner = AWG.__new__(AWG)
@@ -132,10 +140,14 @@ class LabGUI:
         left.columnconfigure((0, 1), weight=1, uniform='blocks')
 
         self._build_awg_block(left,    row=0, col=0, span=2)
-        self._build_scope_block(left,  row=1, col=0)
-        self._build_analysis_block(left, row=1, col=1)
-        self._build_sweep_block(left,  row=2, col=0)
-        self._build_setup_block(left,  row=2, col=1)
+        # Phase cycling sits directly under AWG because it is a special kind
+        # of AWG setting, and spans both columns so it stays one row tall —
+        # the left column does not scroll.
+        self._build_phasecycle_block(left, row=1, col=0, span=2)
+        self._build_scope_block(left,  row=2, col=0)
+        self._build_analysis_block(left, row=2, col=1)
+        self._build_sweep_block(left,  row=3, col=0)
+        self._build_setup_block(left,  row=3, col=1)
 
         self._build_right(main)
 
@@ -429,6 +441,79 @@ class LabGUI:
                                       wraplength=210)
         self._timing_info.grid(row=11, column=0, columnspan=2, sticky='w')
 
+    def _build_phasecycle_block(self, parent, row, col, span=1):
+        """K phased chirp/FID cycles per buffer, and the combination.
+
+        One buffer holds K cycles and fires ONE marker, so the scope takes a
+        single hardware-averaged acquisition per gas pulse instead of one
+        per FID — its ~21 ms rearm is the measured throughput ceiling. Each
+        cycle's chirp carries a programmed phase; combining with the
+        conjugate phases adds whatever followed the chirp and cancels
+        whatever ignored it (breakthrough, ringing, DC offset, pickup).
+        """
+        f = ttk.LabelFrame(parent, text="Phase cycling  (K chirps per buffer)",
+                           padding=6)
+        f.grid(row=row, column=col, columnspan=span, sticky='nsew',
+               padx=0, pady=(0, 6))
+        for c in (1, 3, 5):
+            f.columnconfigure(c, weight=1)
+
+        def field(r, c, label, var, values=None, width=9):
+            ttk.Label(f, text=label).grid(row=r, column=c, sticky='w', pady=1)
+            if values:
+                w = ttk.Combobox(f, textvariable=var, values=values,
+                                 width=width, state='readonly')
+            else:
+                w = ttk.Entry(f, textvariable=var, width=width)
+            w.grid(row=r, column=c + 1, sticky='ew', padx=(4, 12), pady=1)
+            return w
+
+        self._pc_n = tk.StringVar(value="1")
+        self._pc_pattern = tk.StringVar(value=list(self.PHASE_PATTERNS)[0])
+        self._pc_custom = tk.StringVar(value="0, 180")
+        self._pc_window = tk.StringVar(value="chirp")
+        self._pc_avg = tk.StringVar(value="16")
+        self._pc_rate = tk.StringVar(value="50")
+
+        field(0, 0, "Cycles K", self._pc_n, width=6)
+        field(0, 2, "Pattern", self._pc_pattern,
+              values=list(self.PHASE_PATTERNS), width=16)
+        self._pc_custom_lbl = ttk.Label(f, text="Degrees")
+        self._pc_custom_box = ttk.Entry(f, textvariable=self._pc_custom,
+                                        width=16)
+
+        ttk.Label(f, text="Apply to").grid(row=1, column=0, sticky='w', pady=1)
+        applyf = ttk.Frame(f)
+        applyf.grid(row=1, column=1, sticky='w', padx=(4, 12))
+        self._pc_apply = {}
+        for ch in (1, 2):
+            # CH1 is the chirp, CH2 the LO. Cycling the LO as well would
+            # cancel the phase step at the mixer, so CH2 is off by default.
+            v = tk.BooleanVar(value=(ch == 1))
+            self._pc_apply[ch] = v
+            ttk.Checkbutton(applyf, text=f"CH{ch}", variable=v,
+                            command=self._update_awg_info).pack(side='left')
+
+        field(1, 2, "Analyse", self._pc_window,
+              values=["chirp", "detect"], width=16)
+        field(0, 4, "Averages", self._pc_avg, width=6)
+        field(1, 4, "GS/s", self._pc_rate, values=["50", "25"], width=6)
+
+        self._pc_btn = ttk.Button(f, text="Acquire + combine",
+                                  command=self._acquire_phasecycle)
+        self._pc_btn.grid(row=2, column=0, columnspan=2, sticky='w', pady=(6, 0))
+        self._action_btns.append(self._pc_btn)
+
+        self._pc_info = ttk.Label(f, text="", foreground='gray',
+                                  font=('Courier', 8), justify='left')
+        self._pc_info.grid(row=2, column=2, columnspan=4, sticky='w',
+                           pady=(6, 0))
+
+        self._pc_n.trace_add('write', lambda *_: self._update_awg_info())
+        self._pc_pattern.trace_add('write', lambda *_: self._sync_pattern())
+        self._pc_custom.trace_add('write', lambda *_: self._update_awg_info())
+        self._sync_pattern()
+
     # ── AWG panel plumbing ────────────────────────────────────────
 
     def _mode(self):
@@ -528,7 +613,45 @@ class LabGUI:
             "chirp_us":  self._fnum(self._timing_vars["chirp_us"], 1.0, 1.0),
             "dead_us":   self._fnum(self._timing_vars["dead_us"], 1.0, 0.1),
             "detect_us": self._fnum(self._timing_vars["detect_us"], 1.0, 10.0),
+            "n_cycles":  self._n_cycles(),
         }
+
+    def _n_cycles(self):
+        return max(int(self._fnum(self._pc_n, 1.0, 1.0)), 1)
+
+    def _sync_pattern(self):
+        """Show the degrees entry only for a custom pattern."""
+        if self.PHASE_PATTERNS.get(self._pc_pattern.get()) is None:
+            self._pc_custom_lbl.grid(row=0, column=4, sticky='w', pady=1)
+            self._pc_custom_box.grid(row=0, column=5, sticky='ew',
+                                     padx=(4, 12), pady=1)
+        else:
+            self._pc_custom_lbl.grid_remove()
+            self._pc_custom_box.grid_remove()
+        self._update_awg_info()
+
+    def _phase_list(self):
+        """The pattern as radians, or [0.0] if it is off or unreadable."""
+        pat = self.PHASE_PATTERNS.get(self._pc_pattern.get())
+        if pat is None:
+            try:
+                pat = [float(x) for x in
+                       self._pc_custom.get().replace(";", ",").split(",")
+                       if x.strip()]
+            except ValueError:
+                pat = []
+            if not pat:
+                return [0.0]
+        return [float(np.radians(d)) for d in pat]
+
+    def _phase_cfg(self):
+        return {"n_cycles": self._n_cycles(),
+                "phases_rad": self._phase_list(),
+                "channels": {ch: bool(v.get())
+                             for ch, v in self._pc_apply.items()},
+                "window": self._pc_window.get(),
+                "n_avg": max(int(self._fnum(self._pc_avg, 1.0, 16.0)), 1),
+                "rate": float(self._fnum(self._pc_rate, 1e9, 50e9))}
 
     def _window_frac(self):
         return max(min(self._fnum(self._timing_vars["window_pct"], 0.01, 0.05), 0.5), 0.0)
@@ -553,6 +676,8 @@ class LabGUI:
         if self._mode() == "duc":
             spec["carrier_hz"] = g("carrier", 0.0)
             spec["sideband"] = self.SIDEBANDS.get(d["sideband"].get(), "upper")
+        if self._pc_apply[ch].get():
+            spec["phases"] = self._phase_list()
         return spec
 
     def _specs(self, strict=True):
@@ -568,6 +693,9 @@ class LabGUI:
         return (self._mode(), spec.get("kind"), spec.get("gate"),
                 spec.get("sideband"), spec.get("freq_hz"),
                 spec.get("f_start_hz"), spec.get("f_stop_hz"),
+                # The phase pattern IS the baseband: changing it rewrites
+                # every cycle's samples, so Retune must refuse.
+                tuple(spec.get("phases") or ()),
                 tuple(sorted(self._timing().items())), self._window_frac(),
                 None if self._mode() == "duc" else self._clock_rate())
 
@@ -582,8 +710,11 @@ class LabGUI:
             plan = self._planner._plan_timing(mode, self._timing(), rate_eff)
             n = plan["n_total"]
 
+            cyc = (f"cycle   {plan['t_cycle']*1e6:8.3f} µs × {plan['n_cycles']}\n"
+                   if plan["n_cycles"] > 1 else "")
             self._timing_info.config(
-                text=f"period  {plan['period_s']*1e6:8.3f} µs\n"
+                text=f"{cyc}"
+                     f"period  {plan['period_s']*1e6:8.3f} µs\n"
                      f"rep     {1e-3/plan['period_s']:8.3f} kHz\n"
                      f"samples {n:8,}\n"
                      f"tail pad{plan['pad_s']*1e9:8.1f} ns")
@@ -634,6 +765,41 @@ class LabGUI:
 
             if not active:
                 warn.append("Both channels are Off — nothing to send.")
+
+            # phase-cycling preview + the ways it can be set up pointlessly
+            k = plan["n_cycles"]
+            cycled = [c for c, s in specs.items()
+                      if s["kind"] != "off" and s.get("phases")]
+            ph = self._phase_list()
+            deg = ", ".join(f"{np.degrees(p):.0f}" for p in
+                            (ph * ((k // len(ph)) + 1))[:k])
+            self._pc_info.config(
+                text=(f"phases  {deg}°\n"
+                      f"on      {', '.join('CH%d' % c for c in cycled) or '—'}"
+                      if k > 1 else "single cycle — K=1"),
+                foreground='gray')
+            if k > 1 and not cycled:
+                warn.append(f"Cycles is {k} but no channel is phase-cycled — "
+                            f"every cycle would be identical.")
+            if k == 1 and len(ph) > 1 and cycled:
+                warn.append("A phase pattern does nothing with K=1 — "
+                            "raise Cycles.")
+            if self.PHASE_PATTERNS.get(self._pc_pattern.get()) is None \
+                    and ph == [0.0] and self._pc_custom.get().strip():
+                warn.append("Custom phases unreadable — "
+                            "use comma-separated degrees.")
+            if k > 1 and cycled and len(ph) > 1 and k % len(ph):
+                # A partial repetition leaves sum(exp(-i.phi)) unbalanced, so
+                # the artifacts no longer cancel — the whole point of cycling.
+                warn.append(f"K={k} is not a whole number of {len(ph)}-step "
+                            f"patterns, so the cycle is unbalanced and "
+                            f"artifacts will not cancel. Use K="
+                            f"{len(ph) * max(round(k / len(ph)), 1)}.")
+            for c in cycled:
+                if specs[c]["gate"] == "continuous":
+                    warn.append(f"CH{c} is continuous and phase-cycled: the "
+                                f"phase steps at every cycle boundary, so it "
+                                f"is no longer continuous.")
             self._awg_warn.config(text="  •  ".join(warn))
         except (ValueError, TypeError, KeyError, ZeroDivisionError,
                 AttributeError, tk.TclError):
@@ -675,9 +841,11 @@ class LabGUI:
                 self._apply_marker(plan, mode, specs, marker)
                 self._sent_baseband = {
                     ch: self._baseband_signature(ch, s) for ch, s in specs.items()}
+                self._last_plan = plan
                 print("Sent.\n")
             except Exception as e:
                 self._sent_baseband = {}
+                self._last_plan = None
                 print(f"Send error: {e}\n")
             finally:
                 self._set_busy(False)
@@ -1414,6 +1582,171 @@ class LabGUI:
                 self._set_busy(False)
 
         self._thread(capture)
+
+    # ── Phase cycling ─────────────────────────────────────────────
+
+    def _acquire_phasecycle(self):
+        """Capture one averaged K-cycle record and combine the cycles.
+
+        The scope is configured from the plan that is actually playing, not
+        from the Scope block's record-length and timebase fields — a record
+        shorter than the buffer silently truncates the last cycles, and the
+        Scope block has no idea how long the buffer is. Which CHANNELS to
+        use still comes from the Scope block.
+        """
+        if not self._need_awg() or not self._need_scope():
+            return
+        plan = self._last_plan
+        if plan is None:
+            print("Phase cycling: press Send to AWG first — the scope is set "
+                  "up from the buffer that is actually playing.\n")
+            return
+        try:
+            cfg = self._phase_cfg()
+            sig_ch = int(self._chan_var.get())
+            src = self._trigsrc_var.get()
+            trig_ch = sig_ch if src.startswith("same") else int(src)
+            trig_lev = self._fnum(self._triglev_var, 1.0, 0.0)
+        except Exception as e:
+            print(f"Invalid phase-cycling parameter: {e}\n")
+            return
+        if plan["n_cycles"] != cfg["n_cycles"]:
+            print(f"Phase cycling: the buffer playing has "
+                  f"{plan['n_cycles']} cycles but the field says "
+                  f"{cfg['n_cycles']} — press Send to AWG.\n")
+            return
+        if trig_ch == sig_ch:
+            print(f"Phase cycling: trigger and signal are both CH{sig_ch}. "
+                  f"Trigger on the marker channel instead, or the cycles "
+                  f"cannot be located.\n")
+            return
+
+        # Which channel's emitted phases to combine with: the one whose spec
+        # actually carried a phase list. Emitted, not programmed — a lower
+        # sideband inverts the sense (see _build_channel).
+        emitted, src_ch = None, None
+        for ch, info in sorted(plan.get("channels", {}).items()):
+            if info.get("n_cycles", 1) > 1 and info.get("phases_emitted_rad"):
+                emitted, src_ch = info["phases_emitted_rad"], ch
+                break
+        if emitted is None:
+            emitted = cfg["phases_rad"]
+
+        def run():
+            self._set_busy(True)
+            try:
+                import phasecycle
+                rate, n_avg = cfg["rate"], cfg["n_avg"]
+                npts = int(round(plan["period_s"] * rate))
+                with self.scope._lock:
+                    self.scope._dev.write("HORizontal:MODE MANual")
+                    self.scope._dev.write(
+                        f"HORizontal:MODE:SAMPLERate {rate:.0f}")
+                    self.scope._dev.write(
+                        f"HORizontal:MODE:RECOrdlength {npts}")
+                    self.scope._dev.query("*OPC?")
+                self.scope._pre.clear()
+                self.scope.set_horizontal_position(2)
+                self.scope.setup(channel=sig_ch, n_averages=n_avg,
+                                 trigger_channel=trig_ch,
+                                 trigger_level=trig_lev,
+                                 trigger_mode="NORMal")
+                print(f"Phase cycling: {plan['n_cycles']} cycles × "
+                      f"{plan['t_cycle']*1e6:.3f} µs, {rate/1e9:g} GS/s, "
+                      f"{npts:,} pts, {n_avg}-average on CH{trig_ch}"
+                      + (f", phases from CH{src_ch}" if src_ch else ""))
+
+                # fresh=True arms one acquisition and raises rather than
+                # handing back a stale frame; width=2 because the 8-bit
+                # default reads an averaged record as 0.000 mV rms.
+                t, v = self.scope.get_waveform(
+                    sig_ch, max_points=npts, fresh=True, width=2,
+                    absolute_time=True, acq_timeout=30.0)
+
+                win_s = (plan["n_chirp"] if cfg["window"] == "chirp"
+                         else plan["n_detect"]) / plan["rate_eff"]
+                t0 = None
+                if cfg["window"] == "detect":
+                    # the detect window has no burst to find, so anchor it
+                    # off the chirp and step in by chirp+dead
+                    first = phasecycle.find_first(t, v)
+                    if first is None:
+                        raise ValueError("no chirp found to anchor the "
+                                         "detect window on")
+                    t0 = float(t[first]) + (plan["n_chirp"] + plan["n_dead"]) \
+                        / plan["rate_eff"]
+                cut = phasecycle.split_cycles(
+                    t, v, plan["n_cycles"], plan["t_cycle"], win_s,
+                    t_first=t0, carrier_hz=self._mid_freq(plan, src_ch or sig_ch))
+                res = phasecycle.combine(cut["analytic"], emitted)
+                print("\n".join(phasecycle.summary_lines(res)) + "\n")
+                self.root.after(0, self._set_pc_info, res)
+                self.root.after(0, self._draw_phasecycle, t, v, cut, res, plan)
+            except Exception as e:
+                print(f"Phase cycling error: {e}\n")
+            finally:
+                self._set_busy(False)
+
+        self._thread(run)
+
+    @staticmethod
+    def _mid_freq(plan, ch):
+        """Mid-band output frequency, for the samples-per-cycle check."""
+        info = plan.get("channels", {}).get(ch, {})
+        car = 0.0
+        for e in plan.get("coherent_grid", []):
+            if e.get("channel") == ch:
+                car = float(e.get("carrier_hz", 0.0))
+        if "f_start_hz" in info:
+            return car + 0.5 * (info["f_start_hz"] + info["f_stop_hz"])
+        return car + float(info.get("freq_actual_hz", 0.0))
+
+    def _set_pc_info(self, res):
+        worst = max(abs(e) for e in res["error_deg"])
+        self._pc_info.config(
+            text=f"gain {res['gain']:.2f}× of {res['ideal_gain']:.0f}   "
+                 f"artifacts {res['artifact_db']:+.1f} dB\n"
+                 f"worst phase error {worst:.1f}°   "
+                 f"corr {min(res['correlation']):+.3f}..{max(res['correlation']):+.3f}",
+            foreground='#0a0' if worst < 5 else 'red')
+
+    def _draw_phasecycle(self, t, v, cut, res, plan):
+        """Main thread only — see _draw_sweep_step."""
+        self._fig.clear()
+        n_k = len(res["phases_rad"])
+        dt, t0, n_win = cut["dt"], cut["t0"], cut["n_win"]
+
+        ax1 = self._fig.add_subplot(211)
+        ax1.plot(t * 1e6, v * 1e3, lw=0.3, color='0.3')
+        for k in range(n_k):
+            a = t0 + k * plan["t_cycle"]
+            ax1.axvspan(a * 1e6, (a + n_win * dt) * 1e6, alpha=0.2,
+                        color=f"C{k % 10}")
+            ax1.text((a + n_win * dt / 2) * 1e6, v.max() * 1e3,
+                     f"{res['programmed_deg'][k]:.0f}°", ha='center',
+                     fontsize=8, color=f"C{k % 10}")
+        ax1.set_xlabel("Time from trigger (µs)")
+        ax1.set_ylabel("mV")
+        ax1.set_title(f"{n_k} cycles × {plan['t_cycle']*1e6:.3f} µs",
+                      fontsize=9)
+        ax1.grid(True, alpha=0.3)
+
+        ax2 = self._fig.add_subplot(212)
+        tw = np.arange(n_win) * dt * 1e6
+        ax2.plot(tw, np.real(res["cycled_w"]) * 1e3, lw=0.6, color='tab:green',
+                 label=f"phase-cycled  ({res['cycled']*1e3:.0f} mV, "
+                       f"{res['gain']:.2f}×)")
+        ax2.plot(tw, np.real(res["straight_w"]) * 1e3, lw=0.8, color='tab:red',
+                 label=f"straight  ({res['straight']*1e3:.0f} mV, "
+                       f"{res['artifact_db']:.0f} dB)")
+        ax2.set_xlabel("Time within the cycle (µs)")
+        ax2.set_ylabel("mV")
+        ax2.set_title("cycling adds what followed the chirp, cancels what "
+                      "did not", fontsize=9)
+        ax2.legend(fontsize=7)
+        ax2.grid(True, alpha=0.3)
+        self._fig.tight_layout()
+        self._canvas.draw_idle()
 
     # ── Live view ─────────────────────────────────────────────────
 

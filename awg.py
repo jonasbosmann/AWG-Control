@@ -665,25 +665,45 @@ class AWG:
         The granularity round-up lands AFTER the detect window, so the chirp
         and the detect window both start exactly where the requested timing
         says they do; `pad_s` reports the leftover tail.
+
+        timing["n_cycles"] = K repeats that chirp|dead|detect cycle K times
+        inside ONE buffer, which is the CP-FTMW architecture: a gas pulse
+        lasts hundreds of µs but a chirp/FID cycle only ~11 µs, so K cycles
+        fit inside one pulse and the scope pays its ~21 ms rearm once per
+        pulse instead of once per FID. One marker still fires per buffer.
+        The round-up is applied to ONE cycle, not to the whole buffer, so
+        every cycle starts on a granularity boundary and the cycle period is
+        exactly n_cycle/rate — see _build_channel, which places cycle k at
+        k*n_cycle, and phasecycle.split_cycles, which cuts there.
+
+        With K > 1 the carrier's achievable coherent grid changes, because
+        coherent_step_hz keys off the 2-adic valuation of n_total and
+        n_total = K * n_cycle. That is handled where it belongs (the carrier
+        is snapped against plan["n_total"]), but it does mean the usable
+        carrier step moves when K does.
         """
         t = timing or {}
         chirp_us  = float(t.get("chirp_us",  1.0))
         dead_us   = float(t.get("dead_us",   0.1))
         detect_us = float(t.get("detect_us", 10.0))
+        n_cycles  = max(int(t.get("n_cycles", 1) or 1), 1)
         n_chirp  = round(chirp_us  * 1e-6 * rate_eff)
         n_dead   = round(dead_us   * 1e-6 * rate_eff)
         n_detect = round(detect_us * 1e-6 * rate_eff)
         gran    = self.GRAN_DUC if mode == "duc" else self.GRAN_DIRECT
         floor_n = 64 if mode == "duc" else 128
-        n_total = max(int(np.ceil((n_chirp + n_dead + n_detect) / gran)) * gran, floor_n)
+        n_cycle = max(int(np.ceil((n_chirp + n_dead + n_detect) / gran)) * gran, floor_n)
+        n_total = n_cycle * n_cycles
         return {
             "mode": mode, "rate_eff": rate_eff,
             "n_chirp": n_chirp, "n_dead": n_dead, "n_detect": n_detect,
+            "n_cycles": n_cycles, "n_cycle": n_cycle,
+            "t_cycle": n_cycle / rate_eff,
             "n_total": n_total,
             "period_s": n_total / rate_eff,
-            "pad_s": (n_total - n_chirp - n_dead - n_detect) / rate_eff,
+            "pad_s": (n_cycle - n_chirp - n_dead - n_detect) / rate_eff,
             "windows": {
-                "continuous": (0, n_total),
+                "continuous": (0, n_cycle),
                 "chirp":      (0, max(n_chirp, 1)),
                 "detect":     (n_chirp + n_dead, max(n_detect, 1)),
             },
@@ -717,40 +737,93 @@ class AWG:
             phase = 2 * np.pi * f_act * t
             info.update(freq_hz=f, freq_actual_hz=f_act)
 
-        if kind in ("cw", "chirp"):
-            z = (np.exp(1j * phase) if mode == "duc" else np.sin(phase)) * env
-        elif kind == "square":
-            real = np.where(np.sin(phase) >= 0, 1.0, -1.0)
-            z = (self._analytic(real) if mode == "duc" else real) * env
-        elif kind == "ramp":
-            real = 2.0 * ((phase / (2 * np.pi)) % 1.0) - 1.0
-            z = (self._analytic(real) if mode == "duc" else real) * env
-        else:
+        def shape(phi):
+            """One cycle's samples with the whole waveform advanced by phi.
+
+            phi goes INSIDE the phase argument rather than multiplying the
+            finished waveform. For a complex baseband the two are the same,
+            but a real direct-mode waveform multiplied by exp(i.phi) and
+            then taken real is just scaled by cos(phi) -- an amplitude
+            error wearing a phase's clothes. Inside the argument it is exact
+            for every kind and both modes.
+            """
+            p = phase + phi if phi else phase
+            if kind in ("cw", "chirp"):
+                return (np.exp(1j * p) if mode == "duc" else np.sin(p)) * env
+            if kind == "square":
+                real = np.where(np.sin(p) >= 0, 1.0, -1.0)
+                return (self._analytic(real) if mode == "duc" else real) * env
+            if kind == "ramp":
+                real = 2.0 * ((p / (2 * np.pi)) % 1.0) - 1.0
+                return (self._analytic(real) if mode == "duc" else real) * env
             raise ValueError(f"unknown signal kind {kind!r} "
                              f"(expected one of {self.SIGNAL_KINDS})")
 
+        n_cycles = plan.get("n_cycles", 1)
+        n_cycle  = plan.get("n_cycle", plan["n_total"])
+        phases   = spec.get("phases") or [0.0]
+        carrier  = float(spec.get("carrier_hz", 0.0))
+        sideband = spec.get("sideband", "upper")
+        if mode == "duc" and sideband not in ("upper", "lower", "both"):
+            raise ValueError(f"unknown sideband {sideband!r}")
+
+        def cycle_phase(k):
+            """Programmed phase for cycle k, with the NCO's advance removed.
+
+            The DUC NCO free-runs across the whole buffer and is not reset at
+            a cycle boundary, so by cycle k the carrier has already turned
+            f_c * k * t_cycle times on top of whatever the baseband carries.
+            Subtracting it here makes the phase actually EMITTED by cycle k
+            the phase that was asked for. Measured 2026-10-20: without this
+            the per-cycle phases come out as an arbitrary ramp.
+
+            The advance is reduced to a fraction of a turn before becoming
+            radians -- f_c * k * t_cycle reaches ~1e5 turns, and carrying
+            that in radians throws away precision for no reason.
+            """
+            phi = float(phases[k % len(phases)])
+            if mode == "duc" and carrier:
+                phi -= 2 * np.pi * ((carrier * (k * plan["t_cycle"])) % 1.0)
+            return phi
+
+        emitted = [float(phases[k % len(phases)]) for k in range(n_cycles)]
+        if mode == "duc" and sideband == "lower":
+            # conj() mirrors the baseband, which inverts the phase sense: a
+            # cycle programmed +90 deg is emitted at -90. Whoever recombines
+            # the cycles needs the emitted phase, not the programmed one.
+            emitted = [-p for p in emitted]
+        info["phases_rad"] = [float(phases[k % len(phases)])
+                              for k in range(n_cycles)]
+        info["phases_emitted_rad"] = (None if (mode == "duc" and
+                                               sideband == "both") else emitted)
+        info["n_cycles"] = n_cycles
+
         if mode == "duc":
-            sideband = spec.get("sideband", "upper")
-            if sideband == "lower":
-                z = np.conj(z)
-            elif sideband == "both":
-                z = np.real(z).astype(np.complex128)   # DSB: carrier ± f
-            elif sideband != "upper":
-                raise ValueError(f"unknown sideband {sideband!r}")
-            I, Q = np.real(z).copy(), np.imag(z).copy()
+            I_full = np.zeros(plan["n_total"])
+            Q_full = np.zeros(plan["n_total"])
+            for k in range(n_cycles):
+                z = shape(cycle_phase(k))
+                if sideband == "lower":
+                    z = np.conj(z)
+                elif sideband == "both":
+                    z = np.real(z).astype(np.complex128)   # DSB: carrier ± f
+                s = start + k * n_cycle
+                I_full[s:s + n_win] = np.real(z)
+                Q_full[s:s + n_win] = np.imag(z)
             # The analytic square/ramp overshoots ±1 (Gibbs); scale it back so
             # _iq_to_u16 does not clip the peaks into a flat top.
-            peak = max(np.abs(I).max(initial=0.0), np.abs(Q).max(initial=0.0))
+            peak = max(np.abs(I_full).max(initial=0.0),
+                       np.abs(Q_full).max(initial=0.0))
             if peak > 1.0:
-                I, Q = I / peak, Q / peak
+                I_full, Q_full = I_full / peak, Q_full / peak
                 info["scaled_by"] = 1.0 / peak
-            I_full = np.zeros(plan["n_total"]); I_full[start:start + n_win] = I
-            Q_full = np.zeros(plan["n_total"]); Q_full[start:start + n_win] = Q
             info["sideband"] = sideband
             return self._iq_to_u16(I_full, Q_full), info
 
         full = np.zeros(plan["n_total"])
-        full[start:start + n_win] = np.real(z)
+        for k in range(n_cycles):
+            s = start + k * n_cycle
+            full[s:s + n_win] = np.real(shape(cycle_phase(k)))
         return self._real_to_u16(full), info
 
     def _check_limits(self, mode, specs, rate_eff):
