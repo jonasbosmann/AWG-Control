@@ -1178,6 +1178,23 @@ and `tests/test_phasecycle_build.py` part 6 now covers it.
   `tests/`.
 - Stale docstrings: marker format, and the scope "sample-rate tiers" that
   section 20 disproved.
+- GUI Retune wrote the carrier shown on screen straight to the NCO. After a
+  Send that snapped the carrier, the uploaded baseband is shifted by the grid
+  residual, so a retune — even one that only changed the level — moved the
+  whole output by that residual, up to 17.6 MHz with the default timing. It
+  now writes carrier minus residual. With K > 1 it refuses a carrier change
+  outright: each cycle's phase is tied to the carrier that was sent.
+- GUI Plot waveform takes a fresh acquisition whenever Averages > 1 or the
+  trigger mode is NORMal.
+- `specan.line_level()`: a harmonic level read as the maximum of a narrow
+  trace is noise when no line is there. Re-reading the saved `x6_chain/`
+  traces, that was the case for 16 of the 27 F1 readings behind the tripler's
+  high-pass filter (peak 7–9 dB over the median, more than one RBW from 1×),
+  4 of 27 for the doubler's H10, and one or two points each for tripler F2/F4
+  and doubler H4. Every other harmonic series is a resolved line throughout.
+  So the F1-after-HPF figures are **lower limits on the rejection**, not
+  measurements of it; the three ×6 output scripts now say so per point and
+  save the floor with each trace.
 
 **Bench checks these changes still need.**
 

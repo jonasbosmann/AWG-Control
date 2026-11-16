@@ -901,19 +901,51 @@ class LabGUI:
         if not self._sent_baseband:
             print("Nothing uploaded yet — press Send to AWG first.\n")
             return
-        carriers, amps, stale = {}, {}, []
+        # Two things Send baked into the baseband that a carrier-only write
+        # cannot undo (review 2026-11-16):
+        #
+        #  * the coherent-grid residual. Send snapped the NCO and moved the
+        #    baseband by the same amount, so the uploaded baseband is NOT the
+        #    one on screen. Writing the on-screen carrier to the NCO would
+        #    shift the whole output by that residual -- up to half a carrier
+        #    step, 17.6 MHz with the default timing -- even for a retune that
+        #    only meant to change the level. The NCO has to be given the
+        #    carrier MINUS the residual, so the output lands where it reads.
+        #  * with K > 1, each cycle's phase has the NCO's advance at the SENT
+        #    carrier removed. At any other carrier the cycles come out with
+        #    an arbitrary phase ramp, so a carrier change needs a re-send.
+        plan = self._last_plan or {}
+        shift = {e["channel"]: float(e["residual_hz"])
+                 for e in plan.get("coherent_grid", []) if e.get("compensated")}
+        carriers, amps, stale, moved_k = {}, {}, [], []
         for ch, s in specs.items():
             if s["kind"] == "off":
                 continue
             if self._baseband_signature(ch, s) != self._sent_baseband.get(ch):
                 stale.append(ch)
-            carriers[ch] = s["carrier_hz"]
+            carriers[ch] = s["carrier_hz"] - shift.get(ch, 0.0)
             amps[ch] = s["amplitude_vpp"]
+            sent = plan.get("channels", {}).get(ch, {}).get("carrier_hz")
+            if (plan.get("n_cycles", 1) > 1 and sent is not None
+                    and abs(carriers[ch] - float(sent)) > AWG.GRID_TOL_HZ):
+                moved_k.append(ch)
         if stale:
             print(f"CH{', CH'.join(str(c) for c in stale)}: baseband parameters "
                   f"changed since the last Send — press Send to AWG (a retune "
                   f"only moves the carrier and would play the old shape).\n")
             return
+        if moved_k:
+            print(f"CH{', CH'.join(str(c) for c in moved_k)}: the buffer holds "
+                  f"{plan['n_cycles']} cycles whose phases were set for the "
+                  f"carrier that was sent. Moving the carrier needs Send to "
+                  f"AWG, not Retune — a retune would leave every cycle at a "
+                  f"different phase.\n")
+            return
+        for ch, r in shift.items():
+            if ch in carriers:
+                print(f"CH{ch}: NCO set {r:+.1f} Hz below the carrier shown, "
+                      f"to match the baseband shift Send applied for the "
+                      f"coherent grid.\n")
         if not carriers:
             print("Both channels are Off — nothing to retune.\n")
             return
@@ -1599,8 +1631,25 @@ class LabGUI:
             self._set_busy(True)
             try:
                 self._apply_timebase()
-                t, v = self.scope.get_waveform(channel=ch,
-                                               max_points=self._scope_max_pts())
+                # A plot of an AVERAGED or NORMal-triggered acquisition has
+                # to be a fresh one. Reading the buffer as it stands returns
+                # a part-built average, or -- if the scope is not triggering
+                # -- the previous frame with no error at all, which is the
+                # stale-frame trap (LABBOOK 2026-10-19 section 4). Free-running
+                # single-shot AUTO keeps the quick read. width=2 because an
+                # averaged record read at 8 bits loses what averaging bought.
+                try:
+                    n_avg = max(int(self._fnum(self._avg_var, 1.0, 1)), 1)
+                except Exception:
+                    n_avg = 1
+                if n_avg > 1 or self._trigmode_var.get().upper().startswith("NORM"):
+                    t, v = self.scope.get_waveform(
+                        channel=ch, max_points=self._scope_max_pts(),
+                        fresh=True, width=2,
+                        acq_timeout=max(10.0, 5.0 + 0.2 * n_avg))
+                else:
+                    t, v = self.scope.get_waveform(
+                        channel=ch, max_points=self._scope_max_pts())
                 try:
                     spec = self._spectrum(t, v)
                 except Exception as e:
