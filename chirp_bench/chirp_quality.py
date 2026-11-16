@@ -141,9 +141,25 @@ def refine_t0(t, v, f_start, f_stop, duration, t0_guess=None, window_frac=0.05,
         return t0_guess   # not enough room to refine -- fall back to the guess
 
     corr = _correlate(seg, ref, mode="valid", method="fft")
-    peak = int(np.argmax(np.abs(corr)))
-    if 0 < peak < len(corr) - 1:
-        y0, y1, y2 = np.abs(corr[peak - 1]), np.abs(corr[peak]), np.abs(corr[peak + 1])
+    # Peak of the correlation's ENVELOPE, not of |corr| itself.
+    #
+    # The real correlation of two bandpass signals is envelope(tau) *
+    # cos(2.pi.f_c.tau + phi), and phi is the capture's carrier phase
+    # relative to the reference's -- arbitrary for a DUC chirp, whose NCO is
+    # not tied to the baseband's start. The maximum of |corr| is whichever
+    # carrier extremum happens to sit nearest the envelope's peak, so it
+    # moved with phi: on a PERFECT synthetic 1.8-2.6 GHz chirp the start came
+    # out anywhere within +-280 ps depending on carrier phase alone. Since
+    # every downstream metric compares against a reference placed at this
+    # t0, that error became a phase slope across the sweep and evm_score()
+    # read 7-38 % for a flawless waveform (review 2026-11-16,
+    # tests/test_chirp_quality_align.py). The envelope peaks at the group
+    # delay whatever the carrier phase is; same reasoning as the Hilbert
+    # envelope in matched_filter_score().
+    env = np.abs(hilbert(corr))
+    peak = int(np.argmax(env))
+    if 0 < peak < len(env) - 1:
+        y0, y1, y2 = env[peak - 1], env[peak], env[peak + 1]
         denom = y0 - 2 * y1 + y2
         frac = 0.5 * (y0 - y2) / denom if denom != 0 else 0.0
     else:
@@ -211,12 +227,71 @@ def demodulate_raw(t, v):
 # unlike smoothing a single shot (see demodulate_raw()'s docstring).
 # ---------------------------------------------------------------------------
 
+def _shot_delay(v_i, v_ref, upsample=8):
+    """How many samples v_i lags v_ref by, to a fraction of a sample.
+
+    The SIGNED cross-correlation, interpolated band-limited before the peak
+    is taken. Both halves matter for an RF burst:
+
+      * signed, not |corr|. The correlation of two bandpass signals is an
+        envelope times a carrier-frequency cosine, so it has a negative
+        extremum half a carrier cycle either side of the true peak that is
+        almost as large. Taking the maximum of |corr| lands on one of those
+        about as often as not, and that shot is then added half a cycle out
+        -- in ANTIPHASE.
+      * interpolated first. At a few samples per carrier cycle the sampled
+        correlation rarely has a sample on the true peak, and a neighbouring
+        cycle's peak that happens to be sampled nearer its top wins instead.
+    """
+    n = len(v_ref)
+    nfft = 1 << int(np.ceil(np.log2(2 * n)))
+    if nfft > 2 ** 18:
+        upsample = min(upsample, 2)              # keep the buffer reasonable
+    spec = np.fft.rfft(v_i, nfft) * np.conj(np.fft.rfft(v_ref, nfft))
+    big = nfft * upsample
+    corr = np.fft.irfft(spec, n=big)             # zero-padded -> interpolated
+    k = int(np.argmax(corr))
+    if 0 < k < big - 1:                          # last fraction of a step
+        y0, y1, y2 = corr[k - 1], corr[k], corr[k + 1]
+        denom = y0 - 2 * y1 + y2
+        k = k + (0.5 * (y0 - y2) / denom if denom != 0 else 0.0)
+    lag = k / upsample
+    return lag if lag < nfft / 2 else lag - nfft  # circular -> signed
+
+
+def _advance(v, shift):
+    """v advanced by `shift` samples (fractional), band-limited.
+
+    A linear phase across the spectrum, exact below Nyquist. np.interp is
+    not: near 6 samples per carrier cycle its own error is percent-level in
+    amplitude and phase (LABBOOK 2026-10-20 section 21). The shift is
+    circular, which is harmless for a burst with dead time at both ends.
+    """
+    f = np.fft.rfftfreq(len(v))
+    return np.fft.irfft(np.fft.rfft(v) * np.exp(2j * np.pi * f * shift),
+                        n=len(v))
+
+
 def align_and_average(shots):
     """Align single-shot (t, v) captures to sub-sample precision via
     cross-correlation against the first shot, then average.
 
     shots: list of (t, v) tuples, all at the same dt (from the same scope
     setup). Returns (t, v_avg) on the first shot's time base.
+
+    Rewritten 2026-11-16. The previous version took the peak of |corr| on
+    the raw sample grid and re-sampled with np.interp; on synthetic shots of
+    one chirp with sub-nanosecond trigger offsets it kept 0.37 of the
+    amplitude, because a third of the shots were aligned half a carrier
+    cycle out and added in antiphase (tests/test_chirp_quality_align.py).
+    Anything averaged with it and N_SHOTS_AVG > 1 before that date has an
+    under-read amplitude. See _shot_delay for what changed.
+
+    What this still cannot do: if the CARRIER phase differs from shot to
+    shot (a DUC carrier off the coherent grid), no time shift lines up both
+    the carrier and the chirp underneath it. The carrier wins, the sweep is
+    left up to half a carrier period out, and the average is only as good
+    as that. Put the carrier on the grid and trigger on the marker instead.
     """
     if len(shots) == 1:
         return shots[0]
@@ -229,26 +304,7 @@ def align_and_average(shots):
     for t_i, v_i in shots[1:]:
         v_i = np.asarray(v_i, dtype=np.float64) - np.mean(v_i)
         v_i = v_i[:n] if len(v_i) >= n else np.pad(v_i, (0, n - len(v_i)))
-
-        corr = _correlate(v_i, v_ref, mode="full", method="fft")
-        peak = int(np.argmax(np.abs(corr)))
-        # Parabolic interpolation of the 3 samples around the peak for a
-        # sub-sample-precision estimate of the true correlation maximum.
-        if 0 < peak < len(corr) - 1:
-            y0, y1, y2 = np.abs(corr[peak - 1]), np.abs(corr[peak]), np.abs(corr[peak + 1])
-            denom = y0 - 2 * y1 + y2
-            frac = 0.5 * (y0 - y2) / denom if denom != 0 else 0.0
-        else:
-            frac = 0.0
-        # np.correlate(v_i, v_ref, 'full')'s peak sits at index (n-1) + shift,
-        # where shift is how many samples v_i leads v_ref by.
-        shift = (peak - (n - 1)) + frac
-
-        # Resample v_i onto v_ref's sample grid, undoing that shift.
-        src_idx = np.arange(len(v_i))
-        want_idx = np.arange(n) + shift
-        v_aligned = np.interp(want_idx, src_idx, v_i, left=0.0, right=0.0)
-        aligned.append(v_aligned)
+        aligned.append(_advance(v_i, _shot_delay(v_i, v_ref)))
 
     return t_ref, np.mean(aligned, axis=0)
 
