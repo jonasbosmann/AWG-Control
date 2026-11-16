@@ -1119,8 +1119,11 @@ and `tests/test_phasecycle_build.py` part 6 now covers it.
 
 - Section 24: "about 9 cm each" should read about **9 cm in total, 4.4 cm
   each** — 0.89 ns of round trip at VF 0.66 is 8.8 cm one way.
-- Section 25.1: "about 1.4 dB of slope across the chirp band" should read
-  **1.7 dB** (3.42 dB/GHz × 0.5 GHz).
+- Section 25.1: "about 1.4 dB of slope across the chirp band" is right for
+  the band the chain will actually be driven over, **2.152–2.570 GHz**
+  (0.418 GHz × 3.42 dB/GHz = 1.43 dB), but the sentence sits next to the
+  2.0–2.5 GHz measurement, over which the same slope is 1.7 dB. The text
+  should have said which band it meant.
 - Section 21: the test line says "scope 12.5 GS/s"; the table and the sums
   under it are the **50 GS/s** re-run, as the following paragraph says.
 - Section 27: the stale-frame trap is section **4** of 2026-10-19, not

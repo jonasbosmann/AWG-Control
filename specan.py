@@ -398,6 +398,37 @@ class SpecAn:
         self._dev.close()
 
 
+def line_level(freqs, amps, expected_hz=None, tol_hz=None,
+               min_above_floor_db=12.0):
+    """Level of a CW line in a narrow trace, and whether there IS a line.
+
+    Taking max(amps) always returns a number. When the line is absent that
+    number is the highest noise point of the trace -- 8-9 dB above the median
+    floor for a 401-point trace -- and it then goes into a dBc figure as if it
+    were a measured spur. Re-reading the saved x6_chain traces (2026-11-16):
+    16 of the 27 "F1" levels behind the tripler's high-pass filter were
+    exactly that, with the peak more than one RBW away from where F1 must be.
+
+    floor_dbm is the trace median. `resolved` is True when the peak stands at
+    least min_above_floor_db over it and, if expected_hz is given, sits within
+    tol_hz of it. An unresolved reading is an UPPER LIMIT on the line, so a
+    dBc built from it is a lower limit on the rejection.
+
+    Returns a dict: peak_hz, peak_dbm, floor_dbm, above_floor_db, resolved.
+    """
+    freqs = np.asarray(freqs, dtype=float)
+    amps = np.asarray(amps, dtype=float)
+    i = int(np.argmax(amps))
+    floor = float(np.median(amps))
+    above = float(amps[i]) - floor
+    resolved = above >= min_above_floor_db
+    if resolved and expected_hz is not None and tol_hz is not None:
+        resolved = abs(float(freqs[i]) - expected_hz) <= tol_hz
+    return {"peak_hz": float(freqs[i]), "peak_dbm": float(amps[i]),
+            "floor_dbm": floor, "above_floor_db": above,
+            "resolved": bool(resolved)}
+
+
 def find_peaks(freqs, amps, exclude_hz=None, exclude_width_hz=0.0,
                 min_prominence_db=10.0, min_spacing_hz=0.0):
     """Local-maximum peak finder for a swept SA trace (no scipy dependency).

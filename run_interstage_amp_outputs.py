@@ -65,7 +65,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from awg import AWG
-from specan import SpecAn, find_peaks
+from specan import SpecAn, find_peaks, line_level
 import specanlog
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -152,9 +152,16 @@ def refine_point(specan, run_dir, f_in, n, freq_hz, first):
     time.sleep(SETTLE_S)
     freqs, amps = specan.sweep_once()
 
-    i = int(np.argmax(amps))
-    peak_dbm = float(amps[i]) + EXTERNAL_ATTEN_DB
-    peak_hz = float(freqs[i])
+    # The source is a DUC NCO, so the harmonic is at freq_hz exactly; a peak
+    # anywhere else in the span, or one barely over the floor, is noise.
+    lv = line_level(freqs, amps, expected_hz=freq_hz,
+                    tol_hz=3 * REFINE_RBW_HZ)
+    peak_dbm = lv["peak_dbm"] + EXTERNAL_ATTEN_DB
+    peak_hz = lv["peak_hz"]
+    if not lv["resolved"]:
+        print(f"    (F{n} at {freq_hz/1e9:.3f} GHz: no line resolved -- "
+              f"peak only {lv['above_floor_db']:.1f} dB over the floor; "
+              f"{peak_dbm:.1f} dBm is an UPPER LIMIT)")
 
     specanlog.save_trace(
         f"F{n}_{f_in/1e9:.3f}GHz".replace(".", "p"), NOTES,
@@ -163,7 +170,10 @@ def refine_point(specan, run_dir, f_in, n, freq_hz, first):
          "points": REFINE_POINTS, "trace_mode": "NORM",
          "cw_input_freq_hz": f_in, "harmonic_n": n,
          "predicted_hz": freq_hz, "amp_vpp": AMP_VPP,
-         "external_atten_db": EXTERNAL_ATTEN_DB, "role": f"F{n} refine"},
+         "external_atten_db": EXTERNAL_ATTEN_DB, "role": f"F{n} refine",
+         "floor_dbm": lv["floor_dbm"],
+         "above_floor_db": lv["above_floor_db"],
+         "line_resolved": lv["resolved"]},
         freqs, amps, subdir=run_dir)
     return peak_hz, peak_dbm
 

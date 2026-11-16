@@ -1,5 +1,19 @@
 # x8_chain — bench measurements for the multiplier-only transmit chain
 
+> **Status, 2026-11-16 — this folder describes the ×8 route, which is no
+> longer the chain being built.** The transmit chain is now ×3 then ×2 into
+> the ×24 AMC (×144 in total, AWG 2.152–2.570 GHz); its bench scripts are
+> `run_frontend_cw_scan.py`, `run_tripler_outputs.py`,
+> `run_interstage_amp_outputs.py` and `run_doubler_outputs.py` in the project
+> root, with data under `x6_chain/`. What still applies from here is the
+> method: the fixed pad recorded in `config.py`, thru-then-amp subtraction,
+> repeats with scatter. Read the rest with three things in mind:
+>
+> - "multiply by 192" is the ×8 figure; for the ×6 chain it is 144.
+> - The file table below lists 6 of the 16 scripts now in this folder.
+> - Open question 4 (the 1.500 GHz "ambient line") was later traced to the
+>   scope's own comb, not to anything in the environment.
+
 Measurements for the chain **as physically built**:
 
 ```
