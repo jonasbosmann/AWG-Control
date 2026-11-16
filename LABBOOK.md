@@ -1233,9 +1233,9 @@ contribution is real and small: `awg.py` ends the sweep at sample n−1 and
 for a 1 µs chirp, 89 kHz at the end of a 100 MHz sweep. Whether that accounts
 for it is untested.
 
-So: the July conclusion drawn from EVM by band is not supported by those
-numbers, and a timing-fitted re-run is needed before anything is said about
-which bands are better. The other 60 saved captures are cropped to the chirp
+So any band-to-band or span-to-span comparison that rests on the July EVM
+figures needs redoing with the timing fitted before it is relied on; I have
+not gone back through which statements those were. The other 60 saved captures are cropped to the chirp
 length and cannot be re-timed.
 
 Changes: `refine_t0()` uses the peak of the correlation's envelope (exact on
