@@ -1186,6 +1186,15 @@ and `tests/test_phasecycle_build.py` part 6 now covers it.
   outright: each cycle's phase is tied to the carrier that was sent.
 - GUI Plot waveform takes a fresh acquisition whenever Averages > 1 or the
   trigger mode is NORMal.
+- `phasecycle.split_cycles()` re-samples each cycle band-limited (an FFT
+  phase shift with guard samples) instead of by linear interpolation. On a
+  synthetic 4-cycle 1.99-2.49 GHz record with no artifacts in it, linear
+  interpolation at 12.5 GS/s reports a straight-sum floor of -23.6 dB, which
+  is section 21's false -23.9 dB reproduced offline; band-limited gives
+  -93 dB at 12.5 GS/s and -89 dB even at 6.25 GS/s. So the 50 GS/s that
+  section 21 prescribed for the split is no longer needed for the split.
+  Whether a lower rate is acceptable for the scope's own averaging is the
+  separate question of section 20, and still open. Synthetic only.
 - `specan.line_level()`: a harmonic level read as the maximum of a narrow
   trace is noise when no line is there. Re-reading the saved `x6_chain/`
   traces, that was the case for 16 of the 27 F1 readings behind the tripler's

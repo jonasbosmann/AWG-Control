@@ -39,6 +39,8 @@ Two traps, both of which cost a measurement on 2026-10-20 (LABBOOK 21):
     as a dead-straight phase ramp that dragged a 4-cycle sum from 4.00x to
     3.40x. split_cycles() interpolates onto the exact grid instead.
 
+  (No longer a constraint by default -- split_cycles() re-samples
+  band-limited since 2026-11-16, see its `interp` argument -- but it is why.)
   SAMPLE FAST ENOUGH TO INTERPOLATE. np.interp is linear, and at 5.6
     samples per carrier cycle (2.24 GHz at 12.5 GS/s) its own error is
     percent-level -- enough to fake a -23.9 dB artifact floor where the
@@ -48,7 +50,31 @@ Two traps, both of which cost a measurement on 2026-10-20 (LABBOOK 21):
 import numpy as np
 from scipy import signal as sig
 
-MIN_SAMPLES_PER_CARRIER_CYCLE = 20.0
+MIN_SAMPLES_PER_CARRIER_CYCLE = 20.0   # for interp="linear" only
+FFT_GUARD = 64          # samples either side that absorb the shift's wrap-around
+
+
+def _cut_fft(v, pos, n_win):
+    """n_win samples of v starting at the FRACTIONAL index `pos`.
+
+    Band-limited: the sub-sample part of `pos` is applied as a linear phase
+    across the spectrum, which is exact for anything below Nyquist, where
+    linear interpolation is only good far below it. A block with FFT_GUARD
+    spare samples at each end is shifted and the guards discarded, because an
+    FFT shift wraps the block's ends round onto each other.
+    Returns None if the guards do not fit inside the record.
+    """
+    i0 = int(np.floor(pos))
+    frac = pos - i0
+    a, b_ = i0 - FFT_GUARD, i0 + n_win + FFT_GUARD
+    if a < 0 or b_ > len(v):
+        return None
+    blk = v[a:b_]
+    if frac:
+        f = np.fft.rfftfreq(blk.size)                 # cycles per sample
+        blk = np.fft.irfft(np.fft.rfft(blk) * np.exp(2j * np.pi * f * frac),
+                           n=blk.size)
+    return blk[FFT_GUARD:FFT_GUARD + n_win]
 
 
 def find_first(t, v, smooth=151, thresh=0.5):
@@ -62,7 +88,7 @@ def find_first(t, v, smooth=151, thresh=0.5):
 
 
 def split_cycles(t, v, n_cycles, t_cycle, win_s, t_first=None,
-                 carrier_hz=None, warn=print):
+                 carrier_hz=None, warn=print, interp="fft"):
     """Cut a K-cycle record into K segments of `win_s` seconds each.
 
     t, v        one captured record (absolute_time=True, so t is referenced
@@ -72,6 +98,13 @@ def split_cycles(t, v, n_cycles, t_cycle, win_s, t_first=None,
     win_s       how much of each cycle to analyse, from its start
     t_first     where cycle 0 begins; found from the envelope if None
     carrier_hz  only used to check the sample rate is high enough
+    interp      "fft" (default) re-samples each cycle band-limited, which is
+                exact below Nyquist: on a synthetic 2.24 GHz, 4-cycle record
+                at 12.5 GS/s the straight-sum floor is -93 dB where linear
+                interpolation gives -24 dB (the artifact of LABBOOK 21; see
+                tests/test_phasecycle_split.py). "linear" is the old np.interp and needs >= 20 samples
+                per carrier cycle. A cycle too close to the record's ends for
+                the FFT guard falls back to linear, with a warning.
 
     Returns a dict: raw (K x n, mean-removed real), analytic (K x n complex),
     t0, dt, n_win.  Raises ValueError if the cycles do not fit the record.
@@ -84,9 +117,16 @@ def split_cycles(t, v, n_cycles, t_cycle, win_s, t_first=None,
         raise ValueError(f"analysis window {win_s*1e9:.1f} ns is only "
                          f"{n_win} samples at {1/dt/1e9:.1f} GS/s")
 
+    if interp not in ("fft", "linear"):
+        raise ValueError(f"interp must be 'fft' or 'linear', not {interp!r}")
     if carrier_hz and warn:
         per_cycle = 1.0 / (carrier_hz * dt)
-        if per_cycle < MIN_SAMPLES_PER_CARRIER_CYCLE:
+        if per_cycle <= 2.0:
+            warn(f"  WARNING {per_cycle:.2f} samples per carrier cycle at "
+                 f"{carrier_hz/1e9:.3f} GHz and {1/dt/1e9:.1f} GS/s -- at or "
+                 f"beyond Nyquist, the record is aliased and no interpolation "
+                 f"recovers it.")
+        elif interp == "linear" and per_cycle < MIN_SAMPLES_PER_CARRIER_CYCLE:
             warn(f"  WARNING {per_cycle:.1f} samples per carrier cycle at "
                  f"{carrier_hz/1e9:.3f} GHz and {1/dt/1e9:.1f} GS/s. Linear "
                  f"interpolation needs >= {MIN_SAMPLES_PER_CARRIER_CYCLE:.0f}; "
@@ -107,7 +147,15 @@ def split_cycles(t, v, n_cycles, t_cycle, win_s, t_first=None,
                 f"cycle {k} ends at {grid[-1]*1e6:.3f} us but the record "
                 f"stops at {t[-1]*1e6:.3f} us -- lengthen the record or "
                 f"shorten the detect window")
-        seg = np.interp(grid, t, v)
+        seg = None
+        if interp == "fft":
+            seg = _cut_fft(v, (grid[0] - t[0]) / dt, n_win)
+            if seg is None and warn:
+                warn(f"  WARNING cycle {k}: too close to the end of the "
+                     f"record for band-limited re-sampling; using linear "
+                     f"interpolation for this cycle.")
+        if seg is None:
+            seg = np.interp(grid, t, v)
         seg = seg - seg.mean()
         raw.append(seg)
         analytic.append(sig.hilbert(seg))
