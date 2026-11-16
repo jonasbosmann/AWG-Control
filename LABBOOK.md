@@ -1205,6 +1205,11 @@ and `tests/test_phasecycle_build.py` part 6 now covers it.
   measurements of it; the three ×6 output scripts now say so per point and
   save the floor with each trace.
 
+- `x8_chain/config.py` had the scope's bandwidth as 8 GHz; section 20 measured
+  4 GHz. Its `safety_check()` would have passed stage C (6.5-7.7 GHz) onto
+  the scope. Only stage A was ever measured with it, so no saved data is
+  affected. Corrected, and stage C now points at the EXA.
+
 **Second pass, same day: `chirp_bench/`.** Offline again, but this time
 against the 108 captures saved under `chirp_bench/chirp_captures/` in July.
 

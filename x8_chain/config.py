@@ -96,11 +96,15 @@ SCOPE_MAX_VRMS_50R = 2.3
 # this campaign uses. 2.3 Vrms into 50 ohm = +20.24 dBm. Larger V/div settings
 # permit more, but there is no reason to lean on that -- treat this as THE
 # limit and keep margin against it.
-SCOPE_BW_HZ = 8.0e9
-# Nominal. NOT verified against this unit's actual option set -- if a stage-C
-# (6.5-7.7 GHz) measurement reads low, suspect the scope's own rolloff before
-# suspecting the chain. Stage D (12.9-15.4 GHz) is out of reach either way and
-# has to go to the EXA.
+# 4 GHz, not 8: `CONFIGuration:ANALOg:BANDWidth?` on this MSO64B returns 4 GHz
+# (LABBOOK 2026-10-20 section 20). This constant read 8.0e9 until 2026-11-16,
+# which would have let safety_check() pass stage C (6.5-7.7 GHz) onto the
+# scope at nearly twice its bandwidth. Only stage A (1.6-1.9 GHz) was ever
+# measured with it, so no saved data is affected.
+SCOPE_BW_HZ = 4.0e9
+# Stages B, C and D therefore all go to the EXA. Even inside the bandwidth the
+# scope's own rolloff is part of any level it reports: band A sits at 40-48 %
+# of it.
 
 EXA_DAMAGE_DBM = 30.0        # absolute maximum at the RF input
 EXA_MAX_MIXER_DBM = -10.0    # level at the first mixer for spec'd linearity;
@@ -269,7 +273,7 @@ STAGES = {
         # correct one to design against.
         p1db_dbm=17.2,
         supply=None,
-        # EXA, not scope: band B is inside the scope's 8 GHz bandwidth, but the
+        # EXA, not scope: band B (3.2-3.9 GHz) is at the edge of the scope's 4 GHz bandwidth, but the
         # measurement that matters here is harmonic content (F1/F3/F4 through
         # the amp), and the scope's AC-RMS reading cannot separate tones.
         instrument="exa",
@@ -284,7 +288,7 @@ STAGES = {
         gain_min_db=None,
         p1db_dbm=None,
         supply=None,
-        instrument="scope",   # near the scope's BW limit -- see SCOPE_BW_HZ
+        instrument="exa",     # 6.5-7.7 GHz is far above the scope's 4 GHz
     ),
     "D": dict(
         part="ZX60-04183LN+ (12.9-15.4 GHz slot)",
