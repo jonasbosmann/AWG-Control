@@ -80,6 +80,9 @@ class LabGUI:
               "9 GS/s  (CH1 only)":  SAMPLE_RATE_SINGLE}
     WINDOWS = ("Rectangular", "Hann", "Hamming", "Blackman", "Kaiser")
     MAGNITUDES = ("dBV", "dBm (50 Ω)", "Linear (V)")
+    # Extra capture beyond one buffer period for a phase-cycled acquisition:
+    # marker-to-RF skew (0.55 us measured) plus slack.
+    PC_RECORD_MARGIN_S = 1.0e-6
     # Phase patterns, in degrees; the list repeats if K is longer than it.
     PHASE_PATTERNS = {"None (all 0°)": [0.0],
                       "2-step  0,180": [0.0, 180.0],
@@ -449,7 +452,15 @@ class LabGUI:
         per FID — its ~21 ms rearm is the measured throughput ceiling. Each
         cycle's chirp carries a programmed phase; combining with the
         conjugate phases adds whatever followed the chirp and cancels
-        whatever ignored it (breakthrough, ringing, DC offset, pickup).
+        whatever ignored it (DC offset, pickup, spurs, even-order overload
+        recovery). Chirp breakthrough and linear ringing FOLLOW the chirp
+        phase and are not removed -- see phasecycle.py.
+
+        "Chain xN" is the frequency multiplication between the AWG and the
+        point where the phase matters. Phase multiplies with frequency, so
+        the pattern is what arrives AFTER the chain and the AWG is given
+        1/N of it: 144 for the x6 chain into the x24 ACST stage, 1 for the
+        AWG cabled straight to the scope.
         """
         f = ttk.LabelFrame(parent, text="Phase cycling  (K chirps per buffer)",
                            padding=6)
@@ -474,6 +485,7 @@ class LabGUI:
         self._pc_window = tk.StringVar(value="chirp")
         self._pc_avg = tk.StringVar(value="16")
         self._pc_rate = tk.StringVar(value="50")
+        self._pc_mult = tk.StringVar(value="1")
 
         field(0, 0, "Cycles K", self._pc_n, width=6)
         field(0, 2, "Pattern", self._pc_pattern,
@@ -498,18 +510,20 @@ class LabGUI:
               values=["chirp", "detect"], width=16)
         field(0, 4, "Averages", self._pc_avg, width=6)
         field(1, 4, "GS/s", self._pc_rate, values=["50", "25"], width=6)
+        field(2, 0, "Chain ×N", self._pc_mult, width=6)
 
         self._pc_btn = ttk.Button(f, text="Acquire + combine",
                                   command=self._acquire_phasecycle)
-        self._pc_btn.grid(row=2, column=0, columnspan=2, sticky='w', pady=(6, 0))
+        self._pc_btn.grid(row=3, column=0, columnspan=2, sticky='w', pady=(6, 0))
         self._action_btns.append(self._pc_btn)
 
         self._pc_info = ttk.Label(f, text="", foreground='gray',
                                   font=('Courier', 8), justify='left')
-        self._pc_info.grid(row=2, column=2, columnspan=4, sticky='w',
-                           pady=(6, 0))
+        self._pc_info.grid(row=2, column=2, columnspan=4, rowspan=2,
+                           sticky='w', pady=(6, 0))
 
         self._pc_n.trace_add('write', lambda *_: self._update_awg_info())
+        self._pc_mult.trace_add('write', lambda *_: self._update_awg_info())
         self._pc_pattern.trace_add('write', lambda *_: self._sync_pattern())
         self._pc_custom.trace_add('write', lambda *_: self._update_awg_info())
         self._sync_pattern()
@@ -644,6 +658,14 @@ class LabGUI:
                 return [0.0]
         return [float(np.radians(d)) for d in pat]
 
+    def _phase_mult(self):
+        """Chain multiplication factor N (>= 1); 1 if the field is unreadable."""
+        try:
+            n = float(self._pc_mult.get())
+        except (ValueError, tk.TclError):
+            return 1.0
+        return n if n >= 1 else 1.0
+
     def _phase_cfg(self):
         return {"n_cycles": self._n_cycles(),
                 "phases_rad": self._phase_list(),
@@ -678,6 +700,7 @@ class LabGUI:
             spec["sideband"] = self.SIDEBANDS.get(d["sideband"].get(), "upper")
         if self._pc_apply[ch].get():
             spec["phases"] = self._phase_list()
+            spec["phase_multiplier"] = self._phase_mult()
         return spec
 
     def _specs(self, strict=True):
@@ -696,6 +719,7 @@ class LabGUI:
                 # The phase pattern IS the baseband: changing it rewrites
                 # every cycle's samples, so Retune must refuse.
                 tuple(spec.get("phases") or ()),
+                spec.get("phase_multiplier"),
                 tuple(sorted(self._timing().items())), self._window_frac(),
                 None if self._mode() == "duc" else self._clock_rate())
 
@@ -773,11 +797,18 @@ class LabGUI:
             ph = self._phase_list()
             deg = ", ".join(f"{np.degrees(p):.0f}" for p in
                             (ph * ((k // len(ph)) + 1))[:k])
+            n_mult = self._phase_mult()
+            awg_deg = ("" if n_mult == 1 else "   (AWG emits 1/%g: %s°)" % (
+                n_mult, ", ".join(f"{np.degrees(p) / n_mult:.3f}"
+                                  for p in ph[:4])))
             self._pc_info.config(
-                text=(f"phases  {deg}°\n"
+                text=(f"phases  {deg}° after ×{n_mult:g}{awg_deg}\n"
                       f"on      {', '.join('CH%d' % c for c in cycled) or '—'}"
                       if k > 1 else "single cycle — K=1"),
                 foreground='gray')
+            if k > 1 and cycled and self._pc_mult.get().strip() not in (
+                    "", "%g" % n_mult):
+                warn.append("Chain ×N unreadable or below 1 — using 1.")
             if k > 1 and not cycled:
                 warn.append(f"Cycles is {k} but no channel is phase-cycled — "
                             f"every cycle would be identical.")
@@ -1637,7 +1668,14 @@ class LabGUI:
             try:
                 import phasecycle
                 rate, n_avg = cfg["rate"], cfg["n_avg"]
-                npts = int(round(plan["period_s"] * rate))
+                # One buffer period is NOT enough. The RF leaves the AWG
+                # ~0.55 us after the marker (LABBOOK 2026-10-20 section 8)
+                # and 2% of the record is pretrigger, so the last cycle's
+                # detect window ran off the end of a one-period record and
+                # split_cycles refused it. The buffer repeats, so the extra
+                # just shows the start of the next one.
+                npts = int(round((plan["period_s"] + self.PC_RECORD_MARGIN_S)
+                                 / 0.98 * rate))
                 with self.scope._lock:
                     self.scope._dev.write("HORizontal:MODE MANual")
                     self.scope._dev.write(
@@ -1693,10 +1731,11 @@ class LabGUI:
     def _mid_freq(plan, ch):
         """Mid-band output frequency, for the samples-per-cycle check."""
         info = plan.get("channels", {}).get(ch, {})
-        car = 0.0
-        for e in plan.get("coherent_grid", []):
-            if e.get("channel") == ch:
-                car = float(e.get("carrier_hz", 0.0))
+        # From the channel info, which carries the carrier whether or not
+        # grid snapping moved it. Reading it from plan["coherent_grid"] gave
+        # 0 for a carrier that was already on the grid, which passed
+        # carrier_hz=0 to split_cycles and switched its warning off.
+        car = float(info.get("carrier_hz", 0.0))
         if "f_start_hz" in info:
             return car + 0.5 * (info["f_start_hz"] + info["f_stop_hz"])
         return car + float(info.get("freq_actual_hz", 0.0))

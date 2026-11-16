@@ -137,7 +137,7 @@ def test_duc_chirp_lo():
         ok &= check(f"chirp {f0/1e6:+.0f}..{f1/1e6:+.0f} MHz, {ch_us} us "
                     f"({ln//2:,} cx samp)", m1 == 0, f"max|d|={m1}")
         ok &= check(f"LO gate {dt_us} us", m2 == 0, f"max|d|={m2}")
-    return ok
+    assert ok, "see the FAIL lines printed above"
 
 
 def test_direct_chirp_lo():
@@ -164,7 +164,7 @@ def test_direct_chirp_lo():
                     f"max|d|={m1}, {n1}/{ln} samples differ")
         ok &= check(f"LO {lo/1e6:.3f} MHz exact (gated)", m2 <= 1,
                     f"max|d|={m2}, {n2}/{ln} samples differ")
-    return ok
+    assert ok, "see the FAIL lines printed above"
 
 
 def test_gated_lo_is_exact_and_continuous_is_snapped():
@@ -188,7 +188,7 @@ def test_gated_lo_is_exact_and_continuous_is_snapped():
                 abs(cont["freq_actual_hz"] - 333.333e6) <= SAMPLE_RATE_DUAL / n / 2,
                 f"err {(cont['freq_actual_hz']-333.333e6)/1e3:+.1f} kHz, "
                 f"step {SAMPLE_RATE_DUAL/n/1e3:.1f} kHz")
-    return ok
+    assert ok, "see the FAIL lines printed above"
 
 
 def test_duc_sidebands():
@@ -223,7 +223,7 @@ def test_duc_sidebands():
     ok &= check("both gives a symmetric pair (DSB / two-tone)",
                 abs(out["both"][0] - out["both"][1]) < 0.01 * out["both"][0],
                 f"{out['both'][0]:.1f} vs {out['both'][1]:.1f}")
-    return ok
+    assert ok, "see the FAIL lines printed above"
 
 
 def ref_analytic(x):
@@ -275,7 +275,7 @@ def test_no_clipping():
                     abs(info.get("scaled_by", 1.0) - 1.0 / raw_peak) < 1e-9,
                     f"scaled_by {info.get('scaled_by', 1.0):.4f} "
                     f"({20*np.log10(info.get('scaled_by', 1.0)):.1f} dB of range used)")
-    return ok
+    assert ok, "see the FAIL lines printed above"
 
 
 def test_limits_rejected():
@@ -302,7 +302,7 @@ def test_limits_rejected():
             ok &= check(label, False, "no exception raised")
         except ValueError as e:
             ok &= check(label, True, f"-> {e}")
-    return ok
+    assert ok, "see the FAIL lines printed above"
 
 
 def test_plan_timing():
@@ -326,11 +326,14 @@ def test_plan_timing():
                                        "detect_us": 10.0}, SAMPLE_RATE_DUAL)
     ok &= check("direct period is a multiple of 64 samples",
                 direct["n_total"] % 64 == 0, f"n_total={direct['n_total']:,}")
-    return ok
+    assert ok, "see the FAIL lines printed above"
 
 
 if __name__ == "__main__":
-    results = [t() for t in (
+    # The groups assert (so pytest can fail them -- they used to `return ok`,
+    # which pytest ignores, so no failure could ever turn the run red).
+    results = []
+    for t in (
         test_duc_chirp_lo,
         test_direct_chirp_lo,
         test_gated_lo_is_exact_and_continuous_is_snapped,
@@ -338,6 +341,11 @@ if __name__ == "__main__":
         test_no_clipping,
         test_limits_rejected,
         test_plan_timing,
-    )]
+    ):
+        try:
+            t()
+            results.append(True)
+        except AssertionError:
+            results.append(False)
     print(f"\n{sum(results)}/{len(results)} groups passed")
     sys.exit(0 if all(results) else 1)

@@ -302,8 +302,6 @@ class AWG:
         print("  OK    TRAC:DATA")
 
     # ── markers ───────────────────────────────────────────────────────
-    MARKER_POINTS_PER_BYTE = 8      # 9 GS/s model: 1 marker byte per 8 points
-
     @staticmethod
     def _marker_format(rate, marker):
         """(waveform points per marker byte, byte value for 'high').
@@ -349,15 +347,11 @@ class AWG:
         same channel as the signal, or configure both channels inside one
         reset so their segments stay aligned.
 
-        n_wave_points is the segment length in the units :TRAC:DEF was given.
-        Format (Desktop Manual ch.8, 9 GS/s model): one marker byte per eight
-        waveform points, bit0=M1, bit1=M2, bit2=M3, bit3=M4, bits 4-7 unused.
-
-        UNVERIFIED IN DUC MODE: a DUC/IQM-ONE segment is defined with
-        2*n_total uint16 (interleaved I/Q), and the manual does not say
-        whether "waveform points" there means the complex samples or the
-        uint16 count. That is a factor of two in pulse position and width.
-        Override `points_per_byte` (8 or 16) once the bench says which.
+        n_wave_points is the segment length in the units :TRAC:DEF was given
+        -- 2*n_total uint16 for a DUC/IQM-ONE segment, n_total in direct
+        mode. The byte format is the bench-determined one in _marker_format
+        (4 points per byte, two marker points per byte), NOT the manual's;
+        `points_per_byte` overrides it only for a future model or firmware.
 
         high_frac: fraction of the segment the pulse stays high.
         delay_bytes: whole marker-bytes of delay from segment start; each is
@@ -422,7 +416,22 @@ class AWG:
             return
         self._apply_reference_locked(*self._ref_cfg)
 
+    def _check_amp(self, amp, ch=None):
+        """Raise for a level the instrument would refuse.
+
+        :VOLT above MAX_VPP answers '204, data out of range' and silently
+        KEEPS THE PREVIOUS LEVEL (LABBOOK 2026-10-20 section 14), so the
+        output is live at an amplitude nobody asked for.
+        """
+        if not 0 < float(amp) <= self.MAX_VPP:
+            where = f"CH{ch} " if ch is not None else ""
+            raise ValueError(
+                f"{where}amplitude {float(amp):.3f} Vpp is outside this "
+                f"unit's 0.001-{self.MAX_VPP} Vpp range; the instrument would "
+                f"reject the write and silently keep the previous level")
+
     def _play(self, amplitude_vpp=0.5, segnum=1):
+        self._check_amp(amplitude_vpp)
         self._cmd(f":FUNC:MODE:SEGM {segnum}")
         self._cmd(f":VOLT {amplitude_vpp:.3f}")
         self._cmd(":OUTP ON")
@@ -766,6 +775,17 @@ class AWG:
         sideband = spec.get("sideband", "upper")
         if mode == "duc" and sideband not in ("upper", "lower", "both"):
             raise ValueError(f"unknown sideband {sideband!r}")
+        # Frequency multiplication between this channel and the place the
+        # phase is wanted. A xN chain multiplies phase by N as well as
+        # frequency, so a phase phi programmed here arrives as N*phi: with
+        # the x6 chain into the x24 ACST stage (N = 144) an AWG step of 180
+        # deg arrives as 72 whole turns -- no step at all -- and recombining
+        # with the programmed phases would cancel the signal. `phases` are
+        # therefore the phases wanted AT THE OUTPUT of the chain, and each is
+        # divided by N on its way into the waveform. N = 1 is the bare bench.
+        phase_mult = float(spec.get("phase_multiplier", 1) or 1)
+        if phase_mult < 1:
+            raise ValueError(f"phase_multiplier {phase_mult} must be >= 1")
 
         def cycle_phase(k):
             """Programmed phase for cycle k, with the NCO's advance removed.
@@ -781,9 +801,16 @@ class AWG:
             radians -- f_c * k * t_cycle reaches ~1e5 turns, and carrying
             that in radians throws away precision for no reason.
             """
-            phi = float(phases[k % len(phases)])
+            phi = float(phases[k % len(phases)]) / phase_mult
             if mode == "duc" and carrier:
-                phi -= 2 * np.pi * ((carrier * (k * plan["t_cycle"])) % 1.0)
+                nco = 2 * np.pi * ((carrier * (k * plan["t_cycle"])) % 1.0)
+                # The lower sideband is built as conj(z), which flips the
+                # sign of everything inside the phase argument -- including
+                # this correction. Applied with the upper-sideband sign it
+                # came out as -phi + 2*nco: a programmed 0/180 was emitted as
+                # 0/0 on a carrier with 0.75 turns per cycle (found by
+                # review 2026-11-16, tests/test_phasecycle_build.py part 6).
+                phi = phi + nco if sideband == "lower" else phi - nco
             return phi
 
         emitted = [float(phases[k % len(phases)]) for k in range(n_cycles)]
@@ -797,6 +824,14 @@ class AWG:
         info["phases_emitted_rad"] = (None if (mode == "duc" and
                                                sideband == "both") else emitted)
         info["n_cycles"] = n_cycles
+        # phases_rad / phases_emitted_rad are AFTER the chain (x phase_mult);
+        # phases_awg_rad is what this channel itself emits.
+        info["phase_multiplier"] = phase_mult
+        info["phases_awg_rad"] = (None if info["phases_emitted_rad"] is None
+                                  else [p / phase_mult for p in
+                                        info["phases_emitted_rad"]])
+        if mode == "duc":
+            info["carrier_hz"] = carrier
 
         if mode == "duc":
             I_full = np.zeros(plan["n_total"])
@@ -908,6 +943,8 @@ class AWG:
             raise ValueError(f"mode must be 'duc' or 'direct', not {mode!r}")
 
         self._check_limits(mode, active, rate_eff)
+        for ch, s in active.items():
+            self._check_amp(s.get("amplitude_vpp", 0.5), ch)
         plan = self._plan_timing(mode, timing, rate_eff)
         # Must run AFTER the period is known and BEFORE the samples are
         # built, so a shifted baseband is actually the one uploaded.
@@ -1029,8 +1066,9 @@ class AWG:
            LO frequency is floating-point exact (no integer-cycles quantization).
            Always runs at SAMPLE_RATE_DUAL (2.5 GS/s).
 
-           Thin wrapper over send_waveforms(mode='direct') — kept because the
-           GUI and the bench scripts call it by name."""
+           Thin wrapper over send_waveforms(mode='direct'). Nothing in the
+           repo calls it any more (checked 2026-11-16); kept for the
+           equivalence test in tests/test_awg_builder.py."""
         plan = self.send_waveforms(
             {1: {"kind": "chirp", "f_start_hz": f_start_hz, "f_stop_hz": f_stop_hz,
                  "gate": "chirp", "amplitude_vpp": amplitude_vpp},
@@ -1049,9 +1087,12 @@ class AWG:
         f_carrier_chirp_hz, so the RF output sweeps carrier+start → carrier+stop.
         CH2 is a gated carrier at exactly f_lo_hz (constant baseband, I=1 Q=0).
 
-        Thin wrapper over send_waveforms(mode='duc') — kept because the GUI and
-        the bench scripts call it by name. The samples it produces are identical
-        to the pre-refactor implementation (see tests/test_awg_builder.py).
+        Thin wrapper over send_waveforms(mode='duc'). Nothing in the repo
+        calls it any more (checked 2026-11-16). The builder's samples are
+        identical to the pre-refactor implementation (see
+        tests/test_awg_builder.py) for a carrier already on the coherent
+        grid; off it, send_waveforms' default coherent=True snaps the carrier
+        and shifts the baseband.
         """
         plan = self.send_waveforms(
             {1: {"kind": "chirp", "carrier_hz": f_carrier_chirp_hz,
@@ -1166,6 +1207,7 @@ class AWG:
              garbled multi-tone real waveform instead of a clean carrier.
         """
         int_kw = {2: "X2", 4: "X4", 8: "X8"}[round(rate / rate_cx)]
+        self._check_amp(amp, ch)     # before the channel is touched at all
         # One warning site covering every DUC path; silent when on grid.
         self._warn_off_grid(ncof, len(data_u16) // 2, rate,
                             round(rate / rate_cx), ch)
@@ -1185,11 +1227,6 @@ class AWG:
         self._cmd(":INIT:CONT ON")
         self._upload(data_u16, segnum=segnum)
         self._cmd(f":FUNC:MODE:SEGM {segnum}")
-        if not 0 < amp <= self.MAX_VPP:
-            raise ValueError(
-                f"CH{ch} amplitude {amp:.3f} Vpp is outside this unit's "
-                f"0.001-{self.MAX_VPP} Vpp range; the instrument would reject "
-                f"the write and silently keep the previous level")
         self._cmd(f":VOLT {amp:.3f}")
         self._duc_n_total[ch] = len(data_u16) // 2
         self._cmd(":NCO:SIXD1 ON")
@@ -1495,7 +1532,9 @@ class AWG:
                     # A continuous tone gets rounded to a whole cycle count by
                     # _build_channel; that rounding is the only error left.
                     err = 0.0 if gated else (
-                        self.snap_continuous(f_new, n_total, rate_eff) - f_new)
+                        self.snap_continuous(
+                            f_new, plan["windows"]["continuous"][1],
+                            rate_eff) - f_new)
             report.append({"channel": ch, "carrier_asked_hz": carrier,
                            "carrier_hz": snapped, "residual_hz": residual,
                            "compensated": shift != 0.0,

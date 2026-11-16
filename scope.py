@@ -190,13 +190,13 @@ class Scope:
     def set_active_channels(self, channels, n_channels=4):
         """Turn ON the given channels and OFF all others.
 
-        This scope's real-time sample rate is tiered by how many channels
-        are active (e.g. 1 active -> fastest tier, 2 -> half that, 4 ->
-        quarter) -- leaving unused channels switched on from an earlier
-        session silently caps the achievable rate well below spec even
-        with HORizontal:MODE:SAMPLERate MAX requested. `channels`: iterable
-        of channel numbers to enable (e.g. [1, 2]); everything else in
-        1..n_channels is turned off.
+        NOT needed for sample rate. This was written on the belief that the
+        real-time rate is tiered by the number of active channels; measured
+        2026-10-20 (LABBOOK section 20) it is not -- 50 GS/s with one, two,
+        three or all four channels on. The low rate that prompted it was
+        set_max_sample_rate() silently failing. Use this only to tidy the
+        display. `channels`: iterable of channel numbers to enable (e.g.
+        [1, 2]); everything else in 1..n_channels is turned off.
         """
         self._pre.clear()
         wanted = set(channels)
@@ -235,9 +235,8 @@ class Scope:
         `capture_seconds` at whatever that maximum turns out to be --
         so every capture runs as fast as the hardware allows regardless of
         what's on the input, without capturing far more time than needed
-        (a fixed large record length overshoots badly once the achieved
-        rate is known: 100000 samples at this scope's actual 12.5 GS/s is
-        8 us of data for a 1 us chirp). Crop to the exact region of interest
+        (a fixed large record length overshoots or truncates once the
+        achieved rate is known). Crop to the exact region of interest
         afterward in software (chirp_quality.py's find_burst_window())
         rather than trading sample rate for a specific on-screen window.
 
@@ -435,7 +434,15 @@ class Scope:
                     break
                 time.sleep(0.005)
             else:
-                print("measure_vpp: acquisition timeout — reading buffer anyway\n")
+                # Same rule as get_waveform(fresh=True): a frame that was not
+                # acquired for this call is the previous point's data, and a
+                # sweep that silently repeats a point looks like a flat
+                # response. Hand the scope back running, then refuse.
+                self._dev.write("ACQuire:STOPAfter RUNSTop")
+                self._dev.write("ACQuire:STATE RUN")
+                raise RuntimeError(
+                    f"measure_vpp: no completed acquisition within "
+                    f"{acq_timeout:.0f} s — refusing to return a stale frame")
             # Select the data source FIRST — the preamble describes the currently
             # selected source, so querying it before DATa:SOUrce can return another
             # channel's vertical scaling. Always re-query here (cheap per sweep
@@ -443,6 +450,11 @@ class Scope:
             self._dev.write(f"DATa:SOUrce CH{channel}")
             self._dev.write("DATa:ENCdg ASCIi")
             self._dev.write("DATa:STARt 1")
+            # Tag the cache with the source it now describes. Without this,
+            # get_waveform(CH3) -> measure_vpp(CH4) -> get_waveform(CH3) reused
+            # CH4's ymult/yzero for CH3, because the tag still said CH3.
+            self._pre.clear()
+            self._pre['src'] = f"CH{channel}"
             self._pre['xincr'] = float(self._dev.query("WFMOutpre:XINcr?"))
             self._pre['ymult'] = float(self._dev.query("WFMOutpre:YMUlt?"))
             self._pre['yzero'] = float(self._dev.query("WFMOutpre:YZEro?"))

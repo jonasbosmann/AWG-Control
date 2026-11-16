@@ -45,8 +45,14 @@ from scipy import signal
 from awg import SAMPLE_RATE_DUAL
 
 # A clock error this large or larger means the AWG is not on the reference.
-# The internal TCXO is 1-2.5 ppm, so 0.3 ppm separates the two cases cleanly
-# while staying well above the estimator's own noise on a decent capture.
+#
+# WHAT THIS CAN AND CANNOT DECIDE ON THIS UNIT (LABBOOK 2026-10-19 section 1):
+# the TCXO's 1-2.5 ppm is a spec bound, not where this one sits. Measured, it
+# is 0.007-0.044 ppm from the Wenzel, against a noise floor of ~0.03 ppm. So
+# a result under the threshold does NOT distinguish "locked" from "running on
+# the internal TCXO" -- both read ~0 ppm. What the threshold does catch is the
+# state that actually hurts: :ROSC:SOUR EXT with no cable on REF IN, which
+# measured +3.33 ppm. `locked` below therefore means "not in that state".
 UNLOCKED_PPM = 0.3
 
 
@@ -107,7 +113,7 @@ def fractional_error(t, v, f_nominal):
 
 def check_lock(awg, scope, f_test_hz=500e6, amp_vpp=0.5, awg_channel=1,
                scope_channel=1, capture_seconds=20e-6, n_reps=5,
-               max_points=200000, verbose=True, leave_output_on=False):
+               max_points=None, verbose=True, leave_output_on=False):
     """Measure the AWG's clock error against the (reference-locked) scope.
 
     Drives a CW tone, captures it n_reps times and returns a dict with the
@@ -119,8 +125,14 @@ def check_lock(awg, scope, f_test_hz=500e6, amp_vpp=0.5, awg_channel=1,
     running on a channel that is supposed to carry something else. Pass
     leave_output_on=True to keep it (e.g. to probe it by hand afterwards).
 
+    max_points=None reads the whole capture. A fixed cap silently shortens
+    it: 200000 points was the full 20 us at 10 GS/s but is only 4 us at the
+    50 GS/s set_max_sample_rate() now reaches, a fifth of the cycles and five
+    times the scatter.
+
     Returns {'ppm', 'ppm_sd', 'cycles', 'f_nominal', 'f_measured',
-             'locked', 'conclusive', 'reps'}.
+             'locked', 'conclusive', 'reps'}. 'locked' means the error is
+    under UNLOCKED_PPM -- see the note there on what that can decide.
     """
     st = scope.reference_status()
     if not (st["external"] and st["locked"]):
@@ -160,13 +172,18 @@ def check_lock(awg, scope, f_test_hz=500e6, amp_vpp=0.5, awg_channel=1,
     # switching off channels somebody is watching is not worth it.
     saved = scope.save_state()
     try:
-        scope.set_max_sample_rate(capture_seconds)
+        rate = scope.set_max_sample_rate(capture_seconds)
+        if max_points is None:
+            max_points = max(int(round(capture_seconds * rate)), 64)
         scope.setup(channel=scope_channel, n_averages=1,
                     trigger_channel=scope_channel, trigger_mode="AUTO")
 
         errs, freqs, cycles = [], [], []
         for i in range(n_reps):
-            t, v = scope.get_waveform(scope_channel, max_points=max_points)
+            # fresh=True: each repeat must be its own acquisition, or the
+            # spread quoted as the error bar is the spread of one frame.
+            t, v = scope.get_waveform(scope_channel, max_points=max_points,
+                                      fresh=True)
             err, f, cyc = fractional_error(t, v, f_nominal)
             errs.append(err)
             freqs.append(f)
@@ -208,10 +225,13 @@ def verdict_text(res):
                 f"(need < {UNLOCKED_PPM} ppm; try a higher test frequency "
                 f"or a longer capture)")
     if res["locked"]:
-        return f"AWG clock {base} — LOCKED to the reference"
-    return (f"AWG clock {base} — NOT LOCKED "
-            f"(internal TCXO is 1–2.5 ppm; at 350 GHz this is "
-            f"{abs(res['ppm']) * 350e3:.0f} kHz of line position)")
+        return (f"AWG clock {base} — within {UNLOCKED_PPM} ppm of the "
+                f"reference. Consistent with locked; this unit's TCXO sits "
+                f"0.01–0.04 ppm away, so it does not exclude INT. It does "
+                f"exclude EXT with no cable (+3.3 ppm).")
+    return (f"AWG clock {base} — NOT ON THE REFERENCE "
+            f"(EXT with no cable on REF IN reads +3.3 ppm; at 350 GHz this "
+            f"is {abs(res['ppm']) * 350e3:.0f} kHz of line position)")
 
 def fit_tone(t, v, f_hz, t_ref=None):
     """Least-squares fit of a known-frequency tone: (amplitude, phase).

@@ -1058,3 +1058,132 @@ Jonas/Promotion/LabBook/26-10-26. Built by `make_phase_cycling_note.py`; the
 selection numbers are computed at build time rather than quoted. The shared
 layout engine was lifted out of `make_nco_note.py` into `notestyle.py`, and
 the NCO note verified to rebuild with byte-identical text.
+
+### 29. Review of code, documentation and measurements — corrections
+
+2026-11-16. No bench time: a read-through of the core code and this lab book,
+with the arithmetic recomputed and the numbers compared against the saved
+JSON in `marker_coherence/`. State before the changes is tagged
+`pre-review-fixes-2026-11-16`. **Nothing below has been re-measured**; the
+code fixes are covered by the offline tests only, and the bench checks they
+still need are listed at the end.
+
+**An on-grid run that was never written up.**
+`marker_coherence_20261020_132058.json` is a fourth 60 s run of the section 1
+measurement, same carrier, on grid. It reads **0.846**, not 0.997. The phase
+sits within a few degrees of 0 for 40 s, reads +53° on one shot at 41 s, and
+then holds at about **−60°** for the remaining 20 s:
+
+| t (s) | 0–40 | 41 | 43–60 |
+|---|---|---|---|
+| phase (°) | −5 … +6 | +53 | −68 … −58 |
+
+A single step, not a drift and not noise. 60° at 808.6 MHz is 206 ps. The
+scope's 64-average in the same run still read 0.990, because it spans about
+2 s and never straddled the step. Cause unknown — a touched cable, a
+reference event and a real AWG phase hop are all open. One event in three
+60 s on-grid runs is not a rate, but it means section 1's "a 1000-shot average
+buys the full √1000" is established for runs without such a step and not
+beyond, and it is the first data on open item 22.4 (longer averages). Needs a
+phase-versus-time log of 10–30 min before a long average is trusted.
+
+**Phase cycling does not remove chirp breakthrough.** Sections 21 and 25.2
+list breakthrough and detector ringing among the things the conjugate-phase
+sum cancels. Breakthrough, and any *linear* ringing of the chirp in filters or
+the receiver, follow the chirp phase exactly as the FID does — order m = +1
+in section 28's own terms — and add at full strength. What cancels is what
+ignores the chirp phase: DC offset, pickup, spurs not derived from the chirp,
+and even-order responses such as an amplifier's overload recovery. So item
+25.2 will not turn the straight-sum residual into a measure of breakthrough.
+Only time separates breakthrough from the FID. `phasecycle.py` and the GUI
+docstring are corrected.
+
+**Phase cycling through the multiplier chain.** A ×N chain multiplies phase by
+N. The transmit chain is ×3 ×2 into the ACST ×24, **N = 144**, so a 180° step
+at the AWG arrives as 72 whole turns, and 90° as 36: neither GUI pattern would
+have cycled anything at 310–370 GHz, and recombining with the programmed
+phases would have cancelled the signal. A channel spec now takes
+`phase_multiplier`; `phases` are the phases wanted after the chain and the
+AWG emits 1/N of each (1.25° and 0.625° steps for N = 144). The GUI has a
+"Chain ×N" field, default 1 for the bare bench. Untested on hardware — one
+doubler is enough: N = 2, a 0/90 pattern at the AWG must come out 0/180.
+
+**Lower-sideband phase cycling was wrong.** The NCO de-rotation was applied
+with the upper-sideband sign before the conjugate, so the emitted phase was
+−φ + 2θ_k instead of −φ. On a carrier with 0.75 turns per cycle a programmed
+0/180 came out 0/0 while `phases_emitted_rad` reported 0/−180. Every bench
+run so far used the upper sideband, so no recorded result is affected. Fixed,
+and `tests/test_phasecycle_build.py` part 6 now covers it.
+
+**Numbers in earlier sections.**
+
+- Section 24: "about 9 cm each" should read about **9 cm in total, 4.4 cm
+  each** — 0.89 ns of round trip at VF 0.66 is 8.8 cm one way.
+- Section 25.1: "about 1.4 dB of slope across the chirp band" should read
+  **1.7 dB** (3.42 dB/GHz × 0.5 GHz).
+- Section 21: the test line says "scope 12.5 GS/s"; the table and the sums
+  under it are the **50 GS/s** re-run, as the following paragraph says.
+- Section 27: the stale-frame trap is section **4** of 2026-10-19, not
+  section 5.
+- Throughput: section 20 measured 39 shots/s. Section 21's "~32/s (78 with
+  FastFrame, §20)" and "~21 ms rearm", and section 26's "32 shots/s", have no
+  source section — section 20 contains no FastFrame figure and section 22.6
+  calls throughput unmeasured. Treat 39/s at a 1 µs record as the only
+  recorded number until `run_acq_throughput.py` is written up.
+- There is no section 12 or 23 (item 23 is the reflection work of sections
+  18–19 and 24), and the entries dated 23 and 26 Oct sit under the 20 Oct
+  heading.
+
+**Claims that rest on less than they read as.**
+
+- Section 20's 50 / 25 / 12.5 GS/s coherence of 0.9860 / 0.9612 / 0.8660 is
+  **seven phase pairs per rate, one run** (`run_rate_tradeoff.py`, N_SHOTS 8).
+  The sinc model that matched at 808 MHz in section 5 predicts about 0.997 /
+  0.987 / 0.947. The direction is as expected; the size of the 50-over-25
+  advantage is not established.
+- Sections 25 and 28 call the −3.42 dB/GHz tilt the AWG's own output
+  response. Both measurements go through the same cable and the same scope
+  front end (4 GHz bandwidth), so they are independent in method and not in
+  path. The DAC sinc accounts for about 0.83 dB/GHz over 2.0–2.5 GHz. Until
+  the EXA has looked at it, the tilt is "AWG plus scope".
+- Section 24 calls the equal delay with and without the pad the strongest
+  evidence. An in-line pad adds its own length, roughly 0.15–0.25 ns of round
+  trip, unless it replaced a barrel of equal length. Which it was is not
+  recorded.
+
+**Code, besides the two phase-cycling fixes.**
+
+- `scope.measure_vpp()` raises on an acquisition timeout instead of reading
+  the old frame — the section 4 trap, still open on the path every gain sweep
+  uses — and tags the preamble cache with its source. Before,
+  `get_waveform(CH3)` → `measure_vpp(CH4)` → `get_waveform(CH3)` scaled CH3
+  with CH4's volts per code.
+- `reflock.check_lock()` takes fresh acquisitions and reads the whole capture
+  (a 200 000-point cap had cut the 20 µs record to 4 µs at 50 GS/s). Its
+  verdict no longer says "LOCKED": this unit's TCXO sits 0.01–0.04 ppm from
+  the Wenzel (2026-10-19 section 1), so a result under 0.3 ppm cannot tell
+  locked from internal. It does catch EXT with no cable.
+- The 0.55 Vpp guard of section 14 now covers direct mode and runs before
+  anything is uploaded.
+- GUI phase-cycling acquire: the record is one buffer period plus 1 µs. One
+  period exactly put the last cycle's detect window past the end of the
+  record, because the RF trails the marker by 0.55 µs. The
+  samples-per-carrier-cycle warning was silently off for a carrier already on
+  the grid.
+- The offline tests returned a bool, which pytest ignores, so no failure
+  could fail the run. They assert now; `pytest.ini` limits collection to
+  `tests/`.
+- Stale docstrings: marker format, and the scope "sample-rate tiers" that
+  section 20 disproved.
+
+**Bench checks these changes still need.**
+
+1. Phase cycling through one doubler with Chain ×N = 2.
+2. Lower-sideband phase cycling, 2-step and 4-step, on the bare bench.
+3. GUI Acquire with Analyse = detect, K = 4.
+4. `check_lock()` once in each of EXT, INT and EXT-without-cable.
+5. The long phase-versus-time log.
+
+**Not reviewed in depth:** `x8_chain/`, `chirp_bench/`, `specan.py`,
+`specan_gui.py`, `power_budget.py`, `multiplier_chain.py`, the spreadsheets
+and the PDFs. Those had the automated checks only.

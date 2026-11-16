@@ -18,6 +18,10 @@ What it checks
    actually emitted at the start of cycle k equals the phase programmed for
    cycle k. This is the trap from LABBOOK 21 that cost a measurement, and it
    is testable without a scope.
+6. The same for the LOWER sideband, on a carrier with a fractional number of
+   turns per cycle. Until 2026-11-16 the correction had the upper-sideband
+   sign there and a programmed 0/180 was emitted as 0/0.
+7. phase_multiplier: for a xN chain the AWG emits phase/N.
 """
 import sys
 from pathlib import Path
@@ -170,8 +174,73 @@ def main():
     ok &= check("0,pi wraps to 0,pi,0,pi", alt,
                 " ".join(f"{s:.1f}" for s in same))
 
+    def rf_phases(spec_x, gate="chirp"):
+        """RF phase of each cycle relative to cycle 0, in degrees, plus info.
+
+        Compares whole windows (complex inner product) with the NCO's advance
+        to each cycle start put back on, so it works for either sideband.
+        """
+        d, inf = a._build_channel("duc", spec_x, pl, 0.0)
+        zz = (d.astype(np.float64)[0::2] - 32768.0) + \
+            1j * (d.astype(np.float64)[1::2] - 32768.0)
+        st, nw = pl["windows"][gate]
+        fc = spec_x["carrier_hz"]
+        z0 = zz[st:st + nw]
+        out = []
+        for k in range(K):
+            s0 = st + k * pl["n_cycle"]
+            zk = zz[s0:s0 + nw] * np.exp(
+                2j * np.pi * ((fc * k * pl["t_cycle"]) % 1.0))
+            out.append(float(np.degrees(np.angle(np.vdot(z0, zk)))))
+        return out, inf
+
+    def worst_err(got_deg, want_rad):
+        want = [np.degrees(w - want_rad[0]) for w in want_rad]
+        return max(abs((g - w + 180.0) % 360.0 - 180.0)
+                   for g, w in zip(got_deg, want))
+
+    print("\n6. lower sideband: emitted phase == info['phases_emitted_rad']")
+    # Needs a carrier with a FRACTIONAL number of turns per cycle, or the NCO
+    # correction is zero and its sign cannot be wrong. Step down the coherent
+    # grid from 2.25 GHz until there is one.
+    step = a.coherent_step_hz(pl["n_total"], 9e9, 8)
+    car_f = carrier
+    for _ in range(64):
+        if 0.05 < (car_f * pl["t_cycle"]) % 1.0 < 0.95:
+            break
+        car_f -= step
+    frac = (car_f * pl["t_cycle"]) % 1.0
+    ok &= check("found a carrier with fractional turns per cycle",
+                0.05 < frac < 0.95, f"{car_f/1e6:.6f} MHz, {frac:.4f} turns")
+    for pat_deg in ([0.0, 180.0], [0.0, 90.0, 180.0, 270.0]):
+        pat = [np.radians(x) for x in pat_deg]
+        for sb in ("upper", "lower"):
+            sp = dict(spec, carrier_hz=car_f, sideband=sb, phases=pat)
+            got, inf = rf_phases(sp)
+            e = worst_err(got, inf["phases_emitted_rad"])
+            ok &= check(f"{sb:5s} {len(pat)}-step", e < 0.05,
+                        f"emitted {' '.join(f'{g:+.1f}' for g in got)}  "
+                        f"worst error {e:.4f} deg")
+
+    print("\n7. chain multiplier: the AWG emits phase/N, info reports x N")
+    for n_mult in (1, 2, 144):
+        pat = [0.0, np.pi / 2, np.pi, 3 * np.pi / 2]
+        sp = dict(spec, carrier_hz=car_f, phases=pat, phase_multiplier=n_mult)
+        got, inf = rf_phases(sp)
+        e_awg = worst_err(got, [x / n_mult for x in pat])
+        e_out = worst_err([g * n_mult for g in got], inf["phases_emitted_rad"])
+        ok &= check(f"N={n_mult}", e_awg < 0.02 and e_out < 0.5,
+                    f"AWG steps {' '.join(f'{g:+.3f}' for g in got)} deg, "
+                    f"after xN error {e_out:.3f} deg")
+
     print(f"\n{'ALL PASS' if ok else 'FAILURES ABOVE'}\n")
     return 0 if ok else 1
+
+
+def test_phasecycle_build():
+    """pytest entry point: the whole script must report ALL PASS."""
+    assert BASELINE.exists(), f"no baseline at {BASELINE}"
+    assert main() == 0, "see the FAIL lines printed above"
 
 
 if __name__ == "__main__":

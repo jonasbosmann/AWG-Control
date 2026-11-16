@@ -13,11 +13,23 @@ and combines them two ways:
     conjugate-phase sum   sum_k exp(-i.phi_k) z_k    -> the signal
     straight sum          sum_k z_k                  -> the artifacts
 
-Anything that follows the chirp phase (the molecular FID, and with no sample
-present the AWG's own chirp) adds in the first. Anything that ignores it --
-chirp breakthrough into the receiver, detector ringing, DC offset, digital
-pickup -- adds in the second and cancels in the first. Computing both means
-the artifact level is MEASURED rather than assumed.
+Anything that follows the chirp phase adds in the first. Anything that
+ignores it -- DC offset, digital and clock pickup, spurs not derived from the
+chirp, and even-order responses such as an amplifier's overload-recovery
+transient -- adds in the second and cancels in the first. Computing both
+means the artifact level is MEASURED rather than assumed.
+
+WHAT IT DOES NOT REMOVE (corrected 2026-11-16; LABBOOK section 29). Chirp
+breakthrough and any LINEAR ringing of the chirp in filters or the receiver
+follow the chirp phase exactly as the FID does (coherence order m = +1 in
+the terms of LABBOOK section 28), so they add in the conjugate-phase sum at
+full strength. Earlier text here listed them among the things cancelled;
+that was wrong. Only time separates them from the FID.
+
+PHASES ARE THOSE AT THE DETECTOR, NOT AT THE AWG. A xN multiplier chain
+multiplies phase by N. combine() must be given the phases as they arrive --
+info["phases_emitted_rad"] from _build_channel, which already accounts for
+the spec's phase_multiplier and for a lower sideband.
 
 Two traps, both of which cost a measurement on 2026-10-20 (LABBOOK 21):
 
