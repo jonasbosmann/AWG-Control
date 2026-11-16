@@ -577,7 +577,7 @@ def dechirp_residual(t, v, f_start, f_stop, duration, t0=None, window_frac=0.05,
 # ---------------------------------------------------------------------------
 
 def evm_score(t, v, f_start, f_stop, duration, t0=None, window_frac=0.05,
-              edge_frac=0.05):
+              edge_frac=0.05, fit_t0=True, fit_span_s=2e-9):
     """Error Vector Magnitude: direct complex-baseband comparison against
     the known ideal reference, instead of comparing derived quantities
     (instantaneous frequency, envelope) separately as the other metrics do.
@@ -593,38 +593,77 @@ def evm_score(t, v, f_start, f_stop, duration, t0=None, window_frac=0.05,
     away a chirp-rate/span scaling error -- that would be a real defect,
     not an alignment nuisance.
 
+    fit_t0 (default True) also fits the TIMING, within +-fit_span_s of the
+    t0 handed in, by minimising the rms error. Timing alignment is as much
+    a part of standard EVM practice as the gain and phase fit, and without
+    it this number measured the t0 estimate rather than the hardware: a
+    start time that is out by dt leaves a phase slope 2.pi.f(t).dt across
+    the sweep, and that slope was most of the reported error. Re-analysing
+    the 48 saved bench captures that have margin around the chirp
+    (2026-11-16): median 18 % with t0 taken from the matched filter, 3.3 %
+    with t0 fitted (LABBOOK section 29). The returned dict carries the
+    fitted t0, how far it moved (t0_shift_s) and the unfitted figure
+    (evm_rms_pct_unfitted), so nothing is hidden by the fit. A fit that ends
+    AT the edge of the span has not converged -- widen fit_span_s.
+
     Returns EVM as % rms and % peak (both normalized to the aligned
     reference's rms amplitude), the conventional way EVM is quoted.
     """
     if t0 is None:
         t0 = refine_t0(t, v, f_start, f_stop, duration, window_frac=window_frac)
 
-    tau = t - t0
-    tau_c = np.clip(tau, 0, duration)
-    phase_ideal = 2 * np.pi * (f_start * tau_c + (f_stop - f_start) / (2 * duration) * tau_c ** 2)
-    ideal_complex = _gauss_win_continuous(tau, duration, window_frac) * np.exp(1j * phase_ideal)
-
+    analytic = hilbert(v - np.mean(v))
     lo, hi = duration * edge_frac, duration * (1 - edge_frac)
-    mask = (tau >= lo) & (tau <= hi)
-    if not np.any(mask):
+
+    def at(t0_x):
+        tau = t - t0_x
+        tau_c = np.clip(tau, 0, duration)
+        phase_ideal = 2 * np.pi * (f_start * tau_c + (f_stop - f_start)
+                                   / (2 * duration) * tau_c ** 2)
+        ideal_complex = (_gauss_win_continuous(tau, duration, window_frac)
+                         * np.exp(1j * phase_ideal))
+        mask = (tau >= lo) & (tau <= hi)
+        if not np.any(mask):
+            return None
+        meas, ideal = analytic[mask], ideal_complex[mask]
+        c = np.sum(meas * np.conj(ideal)) / np.sum(np.abs(ideal) ** 2)
+        aligned_ideal = c * ideal
+        err = meas - aligned_ideal
+        ref_rms = float(np.sqrt(np.mean(np.abs(aligned_ideal) ** 2)))
+        rms = float(np.sqrt(np.mean(np.abs(err) ** 2)) / ref_rms * 100)
+        return rms, tau[mask], err, c, ref_rms
+
+    first = at(t0)
+    if first is None:
         raise ValueError("no samples fall inside the trimmed chirp window -- "
                           "check t0/duration against the capture's time axis")
+    t0_in, unfitted = t0, first[0]
+    best = first
+    if fit_t0 and fit_span_s > 0:
+        # Coarse scan fine enough not to skip a carrier cycle, then two
+        # rounds of refinement around the best point.
+        f_top = max(abs(f_start), abs(f_stop), 1.0)
+        step = min(1.0 / (8.0 * f_top), fit_span_s / 8.0)
+        centre, span = t0, fit_span_s
+        for _ in range(3):
+            for x in np.arange(centre - span, centre + span + step / 2, step):
+                r = at(float(x))
+                if r is not None and r[0] < best[0]:
+                    best, t0 = r, float(x)
+            centre, span, step = t0, step, step / 10.0
 
-    analytic = hilbert(v - np.mean(v))
-    meas, ideal = analytic[mask], ideal_complex[mask]
-
-    c = np.sum(meas * np.conj(ideal)) / np.sum(np.abs(ideal) ** 2)
-    aligned_ideal = c * ideal
-    err = meas - aligned_ideal
-    ref_rms = float(np.sqrt(np.mean(np.abs(aligned_ideal) ** 2)))
-
+    rms, tau_m, err, c, ref_rms = best
     evm_t_pct = 100 * np.abs(err) / ref_rms
     return {
-        "t": tau[mask], "err": err, "gain": complex(c),
+        "t": tau_m, "err": err, "gain": complex(c),
         "evm_t_pct": evm_t_pct,
-        "evm_rms_pct": float(np.sqrt(np.mean(np.abs(err) ** 2)) / ref_rms * 100),
+        "evm_rms_pct": rms,
         "evm_peak_pct": float(np.max(np.abs(err)) / ref_rms * 100),
         "t0": t0,
+        "t0_shift_s": float(t0 - t0_in),
+        "evm_rms_pct_unfitted": unfitted,
+        "t0_fit_at_edge": bool(fit_t0 and abs(t0 - t0_in)
+                               >= 0.98 * fit_span_s),
     }
 
 

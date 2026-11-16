@@ -72,8 +72,14 @@ def test_t0_and_evm_do_not_depend_on_carrier_phase():
                          + np.radians(deg))
         t0 = cq.refine_t0(t, v, f0, f1, dur)
         assert abs(t0 - t0_true) < 1e-12, (deg, (t0 - t0_true) * 1e12)
-        evm = cq.evm_score(t, v, f0, f1, dur, t0=t0)["evm_rms_pct"]
-        assert evm < 0.5, (deg, evm)
+        evm = cq.evm_score(t, v, f0, f1, dur, t0=t0, fit_t0=False)
+        assert evm["evm_rms_pct"] < 0.5, (deg, evm["evm_rms_pct"])
+        # and the timing fit recovers from a start that is 400 ps out
+        fit = cq.evm_score(t, v, f0, f1, dur, t0=t0 + 0.4e-9)
+        assert fit["evm_rms_pct"] < 0.5, (deg, fit["evm_rms_pct"])
+        assert fit["evm_rms_pct_unfitted"] > 5.0
+        assert abs(fit["t0_shift_s"] + 0.4e-9) < 5e-12, fit["t0_shift_s"]
+        assert not fit["t0_fit_at_edge"]
 
 
 if __name__ == "__main__":

@@ -1205,6 +1205,57 @@ and `tests/test_phasecycle_build.py` part 6 now covers it.
   measurements of it; the three ×6 output scripts now say so per point and
   save the floor with each trace.
 
+**Second pass, same day: `chirp_bench/`.** Offline again, but this time
+against the 108 captures saved under `chirp_bench/chirp_captures/` in July.
+
+*The EVM figures from July measure the timing estimate, not the AWG.*
+`refine_t0()` located the chirp from the peak of |corr|. The real
+correlation of two bandpass signals is an envelope times a carrier cosine
+whose phase is the capture's carrier phase — arbitrary for a DUC chirp — so
+that peak follows the carrier. On a **perfect** synthetic 1.8–2.6 GHz chirp
+it put the start anywhere within ±280 ps and `evm_score()` then read
+**7–38 %**, depending on carrier phase alone. A start time out by δ leaves a
+phase slope 2π·f(t)·δ across the sweep, and EVM counts all of it.
+
+Re-analysed, the 48 saved captures that have margin around the chirp:
+
+| | median | range |
+|---|---|---|
+| EVM as stored in July | 18.2 % | 4.2 – 49.2 % |
+| EVM with the start time fitted | **3.3 %** | 2.1 – 47.8 % |
+
+The upper end of the second range is one 800 MHz-span capture whose fit ran
+to the edge of its search range, so it is not converged; the 100 MHz-span
+captures sit at 2.1–5.1 %. The fitted start is systematically **0.1–1.5 ns
+earlier** than the matched-filter one (median 0.9 ns). I do not know why. One
+contribution is real and small: `awg.py` ends the sweep at sample n−1 and
+`chirp_quality.py` models it ending at n, a rate mismatch of 1 part in 1125
+for a 1 µs chirp, 89 kHz at the end of a 100 MHz sweep. Whether that accounts
+for it is untested.
+
+So: the July conclusion drawn from EVM by band is not supported by those
+numbers, and a timing-fitted re-run is needed before anything is said about
+which bands are better. The other 60 saved captures are cropped to the chirp
+length and cannot be re-timed.
+
+Changes: `refine_t0()` uses the peak of the correlation's envelope (exact on
+the synthetic chirp at every carrier phase). `evm_score()` now fits the
+timing as well as gain and phase, which is standard EVM practice, and returns
+the unfitted figure and the shift alongside so the fit hides nothing. On real
+captures the envelope `t0` alone did **not** reliably lower the EVM (better
+in three of five, worse in two) — it is the fit that matters.
+
+*`align_and_average()` could add shots in antiphase.* Same root cause: the
+peak of |corr|, on the raw sample grid. On sixteen synthetic shots of one
+chirp with sub-nanosecond trigger offsets it kept **0.37** of the amplitude.
+Rewritten (signed correlation, band-limited interpolation, band-limited
+shift): 1.00, noise down as it should be. `N_SHOTS_AVG` defaults to 1, so
+most runs never used it; **six** saved captures of 2026-07-24 were taken with
+20 shots and their amplitudes are suspect.
+
+Both are covered by `tests/test_chirp_quality_align.py`. Synthetic and
+re-analysis only — nothing re-measured.
+
 **Bench checks these changes still need.**
 
 1. Phase cycling through one doubler with Chain ×N = 2.
@@ -1212,7 +1263,13 @@ and `tests/test_phasecycle_build.py` part 6 now covers it.
 3. GUI Acquire with Analyse = detect, K = 4.
 4. `check_lock()` once in each of EXT, INT and EXT-without-cable.
 5. The long phase-versus-time log.
+6. Retune after a Send that snapped the carrier: the output must not move.
+7. `split_cycles()` on a real 12.5 GS/s record against the same record at
+   50 GS/s.
+8. A chirp-quality band scan with the timing-fitted EVM, with margin around
+   the chirp in every saved capture.
 
-**Not reviewed in depth:** `x8_chain/`, `chirp_bench/`, `specan.py`,
+**Not reviewed in depth:** `x8_chain/`, the scan scripts and viewers in
+`chirp_bench/` (only `chirp_quality.py` was read), the IQ half of `specan.py`,
 `specan_gui.py`, `power_budget.py`, `multiplier_chain.py`, the spreadsheets
 and the PDFs. Those had the automated checks only.
